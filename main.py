@@ -1,9 +1,9 @@
 """
 Quant LangChain Agent v2
-- RAG: numpy cosine similarity + Ollama embeddings (nomic-embed-text)
+- RAG: numpy cosine similarity + LM Studio embeddings (Harrier-OSS-v1)
 - Tools: 4 real callable tools wired to quant_api
 - Agent: LangGraph ReAct loop with tool-calling (falls back to manual loop)
-- LLM: ChatOllama → ChatAnthropic → ChatOpenAI
+- LLM: LM Studio (OpenAI-compatible) → ChatAnthropic → ChatOpenAI
 """
 
 import json
@@ -28,29 +28,36 @@ app = FastAPI(title="Quant LangChain Agent v2")
 # =====================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-LOCAL_MODEL_NAME = os.getenv("LOCAL_MODEL_NAME", "qwen3:8b-q4_K_M").strip()
-EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text").strip()
+LOCAL_MODEL_NAME = os.getenv("LOCAL_MODEL_NAME", "qwen3.5-9b").strip()
+EMBED_MODEL = os.getenv("EMBED_MODEL", "harrier-oss-v1-0.6b").strip()
 QUANT_API = os.getenv("QUANT_API", "http://quant_api:8081").strip()
 KNOWLEDGE_PATHS = os.getenv("KNOWLEDGE_PATHS", "/app/knowledge").strip()
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip()
+LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://host.docker.internal:1234/v1").strip()
 
-print(f"[Config] Ollama={OLLAMA_BASE_URL}  model={LOCAL_MODEL_NAME}  embed={EMBED_MODEL}")
+_LM_STUDIO_HEADERS = {"Authorization": "Bearer lm-studio", "Content-Type": "application/json"}
+
+print(f"[Config] LM Studio={LM_STUDIO_URL}  model={LOCAL_MODEL_NAME}  embed={EMBED_MODEL}")
 
 
 # =====================================================
-# LLM: ChatOllama → ChatAnthropic → ChatOpenAI
+# LLM: LM Studio (OpenAI-compatible) → ChatAnthropic → ChatOpenAI
 # =====================================================
 def get_chat_llm(temperature: float = 0.2):
     try:
-        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
-        available = [m["name"] for m in resp.json().get("models", [])]
-        if LOCAL_MODEL_NAME in available:
-            from langchain_community.chat_models import ChatOllama
-            print(f"[LLM] Using ChatOllama: {LOCAL_MODEL_NAME}")
-            return ChatOllama(model=LOCAL_MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=temperature)
-        print(f"[LLM] Model '{LOCAL_MODEL_NAME}' not found in Ollama. Available: {available}")
+        resp = requests.get(f"{LM_STUDIO_URL}/models", headers=_LM_STUDIO_HEADERS, timeout=3)
+        available = [m["id"] for m in resp.json().get("data", [])]
+        match = next((m for m in available if LOCAL_MODEL_NAME.lower() in m.lower()), None)
+        model_id = match or (available[0] if available else LOCAL_MODEL_NAME)
+        from langchain_openai import ChatOpenAI
+        print(f"[LLM] Using LM Studio: {model_id}")
+        return ChatOpenAI(
+            model=model_id,
+            openai_api_key="lm-studio",
+            openai_api_base=LM_STUDIO_URL,
+            temperature=temperature,
+        )
     except Exception as e:
-        print(f"[LLM] Ollama unavailable: {e}")
+        print(f"[LLM] LM Studio unavailable: {e}")
 
     if ANTHROPIC_API_KEY:
         from langchain_anthropic import ChatAnthropic
@@ -67,8 +74,7 @@ def get_chat_llm(temperature: float = 0.2):
         return ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY, temperature=temperature)
 
     raise ValueError(
-        "No LLM available. Start Ollama with the configured model, "
-        "or set ANTHROPIC_API_KEY / OPENAI_API_KEY."
+        "No LLM available. Set LM_STUDIO_URL, ANTHROPIC_API_KEY, or OPENAI_API_KEY."
     )
 
 
@@ -85,14 +91,14 @@ class SimpleVectorStore:
     def _embed_single(self, text: str) -> Optional[np.ndarray]:
         try:
             resp = requests.post(
-                f"{OLLAMA_BASE_URL}/api/embed",
+                f"{LM_STUDIO_URL}/embeddings",
                 json={"model": EMBED_MODEL, "input": text[:2000]},
+                headers=_LM_STUDIO_HEADERS,
                 timeout=15,
             )
             data = resp.json()
-            raw = data.get("embeddings", [data.get("embedding", [])])
-            if raw and raw[0]:
-                return np.array(raw[0], dtype=np.float32)
+            embedding = data["data"][0]["embedding"]
+            return np.array(embedding, dtype=np.float32)
         except Exception as e:
             print(f"[Embed] Error: {e}")
         return None
