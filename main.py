@@ -39,6 +39,17 @@ _LM_STUDIO_HEADERS = {"Authorization": "Bearer lm-studio", "Content-Type": "appl
 print(f"[Config] LM Studio={LM_STUDIO_URL}  model={LOCAL_MODEL_NAME}  embed={EMBED_MODEL}")
 
 
+def _resolve_model_id(name_hint: str) -> str:
+    """Find best-matching model ID from LM Studio's /v1/models list."""
+    try:
+        resp = requests.get(f"{LM_STUDIO_URL}/models", headers=_LM_STUDIO_HEADERS, timeout=3)
+        available = [m["id"] for m in resp.json().get("data", [])]
+        match = next((m for m in available if name_hint.lower() in m.lower()), None)
+        return match or name_hint
+    except Exception:
+        return name_hint
+
+
 # =====================================================
 # LLM: LM Studio (OpenAI-compatible) → ChatAnthropic → ChatOpenAI
 # =====================================================
@@ -90,9 +101,10 @@ class SimpleVectorStore:
 
     def _embed_single(self, text: str) -> Optional[np.ndarray]:
         try:
+            model_id = _resolve_model_id(EMBED_MODEL)
             resp = requests.post(
                 f"{LM_STUDIO_URL}/embeddings",
-                json={"model": EMBED_MODEL, "input": text[:2000]},
+                json={"model": model_id, "input": text[:2000]},
                 headers=_LM_STUDIO_HEADERS,
                 timeout=15,
             )
