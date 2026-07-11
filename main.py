@@ -196,7 +196,7 @@ def retrieve_context(query: str, top_k: int = 4) -> str:
             overlap = len(q_toks & set(re.findall(r"[a-zA-Z0-9_]+", d["text"].lower())))
             if overlap > 0:
                 scored.append((overlap, d))
-        scored.sort(reverse=True)
+        scored.sort(key=lambda x: x[0], reverse=True)
         results = [d for _, d in scored[:top_k]]
 
     if not results:
