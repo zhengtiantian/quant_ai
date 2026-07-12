@@ -1,9 +1,10 @@
 """
-Quant LangChain Agent v2
-- RAG: numpy cosine similarity + LM Studio embeddings (Harrier-OSS-v1)
-- Tools: 4 real callable tools wired to quant_api
-- Agent: LangGraph ReAct loop with tool-calling (falls back to manual loop)
-- LLM: LM Studio (OpenAI-compatible) → ChatAnthropic → ChatOpenAI
+quant_ai — RAG + Local LLM service for the Quant Trade platform.
+
+Architecture:
+  - RAG: numpy cosine similarity over LM Studio embeddings
+  - LLM: LM Studio (OpenAI-compatible) → Anthropic → OpenAI fallback
+  - API: FastAPI endpoints consumed by quant_ui (browser-direct) and quant_api
 """
 
 import json
@@ -17,11 +18,17 @@ from typing import Optional
 import numpy as np
 import requests
 from fastapi import FastAPI
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import tool
+from fastapi.middleware.cors import CORSMiddleware
+from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
 
-app = FastAPI(title="Quant LangChain Agent v2")
+app = FastAPI(title="quant_ai")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # =====================================================
 # Config
@@ -29,7 +36,7 @@ app = FastAPI(title="Quant LangChain Agent v2")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 LOCAL_MODEL_NAME = os.getenv("LOCAL_MODEL_NAME", "qwen3.5-9b").strip()
-EMBED_MODEL = os.getenv("EMBED_MODEL", "harrier-oss-v1-0.6b").strip()
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-nomic-embed-text-v1.5").strip()
 QUANT_API = os.getenv("QUANT_API", "http://quant_api:8081").strip()
 KNOWLEDGE_PATHS = os.getenv("KNOWLEDGE_PATHS", "/app/knowledge").strip()
 LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://host.docker.internal:1234/v1").strip()
@@ -51,7 +58,7 @@ def _resolve_model_id(name_hint: str) -> str:
 
 
 # =====================================================
-# LLM: LM Studio (OpenAI-compatible) → ChatAnthropic → ChatOpenAI
+# LLM: LM Studio (OpenAI-compatible) → Anthropic → OpenAI
 # =====================================================
 def get_chat_llm(temperature: float = 0.2):
     try:
@@ -72,7 +79,7 @@ def get_chat_llm(temperature: float = 0.2):
 
     if ANTHROPIC_API_KEY:
         from langchain_anthropic import ChatAnthropic
-        print("[LLM] Falling back to ChatAnthropic: claude-haiku-4-5-20251001")
+        print("[LLM] Falling back to Anthropic: claude-haiku-4-5-20251001")
         return ChatAnthropic(
             model="claude-haiku-4-5-20251001",
             api_key=ANTHROPIC_API_KEY,
@@ -81,7 +88,7 @@ def get_chat_llm(temperature: float = 0.2):
 
     if OPENAI_API_KEY:
         from langchain_openai import ChatOpenAI
-        print("[LLM] Falling back to ChatOpenAI: gpt-4o-mini")
+        print("[LLM] Falling back to OpenAI: gpt-4o-mini")
         return ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY, temperature=temperature)
 
     raise ValueError(
@@ -90,7 +97,7 @@ def get_chat_llm(temperature: float = 0.2):
 
 
 # =====================================================
-# Vector Store: numpy cosine similarity + Ollama embeddings
+# Vector Store: numpy cosine similarity + LM Studio embeddings
 # Falls back to keyword search if embeddings unavailable
 # =====================================================
 class SimpleVectorStore:
@@ -188,7 +195,7 @@ def retrieve_context(query: str, top_k: int = 4) -> str:
     if _vs.ready:
         results = _vs.search(query, top_k=top_k)
     else:
-        # Keyword fallback
+        # keyword fallback when embedding model is unavailable
         docs = _load_knowledge_docs()
         q_toks = set(re.findall(r"[a-zA-Z0-9_]+", query.lower()))
         scored = []
@@ -205,26 +212,11 @@ def retrieve_context(query: str, top_k: int = 4) -> str:
 
 
 # =====================================================
-# MCP Tools — real callable functions
+# Live data helpers (used to enrich prompts with real-time context)
 # =====================================================
-@tool
-def query_knowledge(query: str) -> str:
-    """Search the quant platform knowledge base. Use to look up factor weights, IC values,
-    strategy patterns, MongoDB schema, signal logic, and system architecture."""
-    return retrieve_context(query)
-
-
-@tool
-def get_latest_signals(limit: int = 10) -> str:
-    """Fetch the latest trading signals from the quant signal system.
-    Returns top-ranked signals with composite_score, signal_type, factor values.
-    Use to understand current market conditions before designing a strategy."""
+def fetch_latest_signals(limit: int = 10) -> str:
     try:
-        resp = requests.get(
-            f"{QUANT_API}/api/signals/latest",
-            params={"limit": limit},
-            timeout=5,
-        )
+        resp = requests.get(f"{QUANT_API}/api/signals/latest", params={"limit": limit}, timeout=5)
         data = resp.json()
         signals = data.get("signals", data) if isinstance(data, dict) else data
         return json.dumps(signals[:limit], ensure_ascii=False, default=str)
@@ -232,10 +224,7 @@ def get_latest_signals(limit: int = 10) -> str:
         return f"Error fetching signals: {e}"
 
 
-@tool
-def get_positions() -> str:
-    """Get current open paper trading positions.
-    Use to check existing exposure and avoid conflicting trades."""
+def fetch_positions() -> str:
     try:
         resp = requests.get(f"{QUANT_API}/api/positions", timeout=5)
         return json.dumps(resp.json(), ensure_ascii=False, default=str)
@@ -243,80 +232,12 @@ def get_positions() -> str:
         return f"Error fetching positions: {e}"
 
 
-@tool
-def get_performance_stats() -> str:
-    """Get live portfolio performance metrics: Sharpe ratio, max drawdown, win rate,
-    annualized return from the paper trading backtest. Use to calibrate risk parameters."""
+def fetch_performance() -> str:
     try:
         resp = requests.get(f"{QUANT_API}/api/performance", timeout=5)
         return json.dumps(resp.json(), ensure_ascii=False, default=str)
     except Exception as e:
         return f"Error fetching performance: {e}"
-
-
-AGENT_TOOLS = [query_knowledge, get_latest_signals, get_positions, get_performance_stats]
-TOOL_MAP = {t.name: t for t in AGENT_TOOLS}
-
-
-# =====================================================
-# Agent Loop
-# Tries LangGraph first (prebuilt ReAct); falls back to manual tool-calling loop.
-# =====================================================
-def _run_with_langgraph(system: str, user_msg: str) -> tuple[str, list[str]]:
-    from langgraph.prebuilt import create_react_agent
-
-    llm = get_chat_llm(temperature=0.2)
-    agent = create_react_agent(llm, AGENT_TOOLS)
-    result = agent.invoke({"messages": [SystemMessage(content=system), HumanMessage(content=user_msg)]})
-
-    tools_used = []
-    for msg in result["messages"]:
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            for tc in msg.tool_calls:
-                tools_used.append(tc.get("name", ""))
-
-    final = result["messages"][-1].content
-    return final, tools_used
-
-
-def _run_manual_loop(system: str, user_msg: str, max_iters: int = 6) -> tuple[str, list[str]]:
-    llm = get_chat_llm(temperature=0.2).bind_tools(AGENT_TOOLS)
-    messages = [SystemMessage(content=system), HumanMessage(content=user_msg)]
-    tools_used: list[str] = []
-
-    for _ in range(max_iters):
-        response = llm.invoke(messages)
-        messages.append(response)
-
-        if not getattr(response, "tool_calls", None):
-            return response.content, tools_used
-
-        for tc in response.tool_calls:
-            name, args, call_id = tc["name"], tc["args"], tc["id"]
-            tools_used.append(name)
-            print(f"[Agent] → {name}({args})")
-            try:
-                result = TOOL_MAP[name].invoke(args) if name in TOOL_MAP else f"Unknown tool: {name}"
-            except Exception as e:
-                result = f"Tool error: {e}"
-            messages.append(ToolMessage(content=str(result), tool_call_id=call_id))
-
-    # Force final answer
-    llm_plain = get_chat_llm(temperature=0.2)
-    messages.append(HumanMessage(content="Generate the final JSON output now based on everything gathered."))
-    final = llm_plain.invoke(messages)
-    return final.content, tools_used
-
-
-def run_agent(system: str, user_msg: str) -> tuple[str, list[str]]:
-    """Run ReAct agent. Tries LangGraph, falls back to manual loop."""
-    try:
-        import langgraph  # noqa: F401
-        print("[Agent] Using LangGraph ReAct agent")
-        return _run_with_langgraph(system, user_msg)
-    except ImportError:
-        print("[Agent] LangGraph not installed — using manual tool-calling loop")
-        return _run_manual_loop(system, user_msg)
 
 
 # =====================================================
@@ -333,6 +254,15 @@ class WorkflowSpecRequest(BaseModel):
 
 
 class WorkflowTasksRequest(BaseModel):
+    strategySpec: dict
+
+
+class SimpleSpecRequest(BaseModel):
+    prompt: str
+    userId: str = "local-user"
+
+
+class SimpleTasksRequest(BaseModel):
     strategySpec: dict
 
 
@@ -358,7 +288,7 @@ def health():
 
 
 @app.post("/api/ask")
-def ask_agent(request: QueryRequest):
+def ask(request: QueryRequest):
     """RAG-augmented Q&A about the quant system."""
     try:
         start = time.time()
@@ -378,32 +308,27 @@ def ask_agent(request: QueryRequest):
 
 @app.post("/api/workflow/generate-spec")
 def generate_workflow_spec(request: WorkflowSpecRequest):
-    """
-    Agent-driven strategy spec generation.
-    The agent uses tools to gather context (knowledge, live signals, positions)
-    then outputs a structured JSON strategy specification.
-    """
+    """RAG + single LLM call: generate a strategy spec JSON from a natural-language prompt."""
     try:
         start = time.time()
+        import datetime
 
-        system = f"""You are a quant strategy planner for an AI-driven equity signal platform.
+        context = retrieve_context(request.prompt, top_k=3)
 
-You have tools to search the knowledge base, retrieve live signals, and check portfolio state.
-Use them to gather context BEFORE generating the strategy spec.
+        prompt = f"""You are a quant strategy planner. Output ONLY a valid JSON object, no markdown, no explanation.
 
-Recommended tool usage:
-1. Call query_knowledge with the user's strategy description to find matching patterns
-2. Call get_latest_signals to understand current market conditions
-3. Call get_positions to check existing exposure (avoid conflicts)
-4. Optionally call get_performance_stats to calibrate risk parameters
+User requirement: {request.prompt}
 
-Then output ONLY a valid JSON object — no markdown, no explanation — with these fields:
+Knowledge context (use these patterns):
+{context}
+
+Output this exact JSON structure:
 {{
   "strategyId": "{request.strategyId}",
   "workflowId": "{request.strategyId}",
   "owner": "{request.userId}",
-  "name": "<short name>",
-  "description": "<1-2 sentences>",
+  "name": "<short strategy name>",
+  "description": "<1-2 sentences describing the strategy>",
   "market": "US_EQUITY",
   "tasks": [
     {{
@@ -411,21 +336,21 @@ Then output ONLY a valid JSON object — no markdown, no explanation — with th
       "type": "data_collection",
       "module": "quant_data.stock_collector.price_collector.collector",
       "dependencies": [],
-      "parameters": {{...}}
+      "parameters": {{"symbols": ["<ticker>"], "timeframe": "1d", "lookback_days": 365}}
     }},
     {{
       "taskId": "task_features",
       "type": "feature_engineering",
       "module": "quant_data.feature_builders.daily_symbol_features",
       "dependencies": ["task_data"],
-      "parameters": {{"indicators": [<list of factor names>]}}
+      "parameters": {{"indicators": ["rsi_14", "macd", "bb_20"]}}
     }},
     {{
       "taskId": "task_signals",
       "type": "signal_generation",
       "module": "quant_data.research.score_daily_signals",
       "dependencies": ["task_features"],
-      "parameters": {{"rule": "<pandas boolean expression>", "min_score": 0.6}}
+      "parameters": {{"rule": "<pandas boolean expression on features>", "min_score": 0.6}}
     }},
     {{
       "taskId": "task_risk",
@@ -444,23 +369,22 @@ Then output ONLY a valid JSON object — no markdown, no explanation — with th
   ],
   "risk": {{"max_position_size": 0.1, "stop_loss": 0.02, "max_drawdown": 0.2}},
   "backtest": {{"initial_cash": 100000, "fee_bps": 5, "window": "2y", "rebalance": "daily"}},
-  "createdAt": "<ISO 8601 timestamp>"
+  "createdAt": "{datetime.datetime.utcnow().isoformat()}Z"
 }}"""
 
-        answer, tools_used = run_agent(system, request.prompt)
+        llm = get_chat_llm(temperature=0.2)
+        answer = llm.invoke([HumanMessage(content=prompt)]).content
 
-        # Extract JSON from model output
         start_j = answer.find("{")
         end_j = answer.rfind("}")
         if start_j < 0 or end_j <= start_j:
-            raise ValueError(f"Agent returned no JSON. Output: {answer[:400]}")
+            raise ValueError(f"LLM returned no JSON. Output: {answer[:400]}")
 
-        spec = json.loads(answer[start_j : end_j + 1])
+        spec = json.loads(answer[start_j: end_j + 1])
         spec["strategyId"] = request.strategyId
         spec["workflowId"] = request.strategyId
         spec["owner"] = request.userId
 
-        # Validate dependency graph
         task_ids = {str(t.get("taskId", "")) for t in spec.get("tasks", [])}
         dep_errors = [
             f"{t['taskId']}: dependency '{d}' not found"
@@ -471,8 +395,7 @@ Then output ONLY a valid JSON object — no markdown, no explanation — with th
 
         return {
             "strategySpec": spec,
-            "source": "agent+rag+tools",
-            "toolsUsed": tools_used,
+            "source": "rag+llm",
             "dependencyCheck": {"valid": not dep_errors, "errors": dep_errors},
             "elapsed_s": round(time.time() - start, 2),
             "model": LOCAL_MODEL_NAME,
@@ -480,20 +403,16 @@ Then output ONLY a valid JSON object — no markdown, no explanation — with th
 
     except Exception as e:
         traceback.print_exc()
-        return {"error": str(e), "source": "agent_failed"}
+        return {"error": str(e), "source": "llm_failed"}
 
 
 @app.post("/api/workflow/generate-tasks")
 def generate_workflow_tasks(request: WorkflowTasksRequest):
-    """
-    Generate executable Python code for each task in the strategy spec.
-    Uses RAG to retrieve relevant code patterns before code generation.
-    """
+    """RAG + single LLM call: generate executable Python code for each task in the spec."""
     try:
         start = time.time()
         spec = request.strategySpec
 
-        # RAG: find relevant code patterns from knowledge base
         query = f"{spec.get('name', '')} {spec.get('description', '')} {json.dumps(spec.get('tasks', []))}"
         context = retrieve_context(query[:500], top_k=3)
 
@@ -531,7 +450,7 @@ Output ONLY the JSON array, no markdown fences, no explanation."""
         end_a = answer.rfind("]")
         tasks: list = []
         if start_a >= 0 and end_a > start_a:
-            tasks = json.loads(answer[start_a : end_a + 1])
+            tasks = json.loads(answer[start_a: end_a + 1])
 
         return {
             "tasks": tasks if isinstance(tasks, list) else [],
@@ -547,7 +466,7 @@ Output ONLY the JSON array, no markdown fences, no explanation."""
 
 @app.post("/api/generate-script")
 def generate_script(request: QueryRequest):
-    """Generate a standalone Python quant script from a description."""
+    """Generate a standalone Python quant script from a plain-text description."""
     try:
         start = time.time()
         context = retrieve_context(request.question, top_k=2)
@@ -565,9 +484,34 @@ def generate_script(request: QueryRequest):
         return {"error": str(e)}
 
 
+@app.post("/api/v1/strategies/generate-spec")
+def api_generate_spec(request: SimpleSpecRequest):
+    """Frontend adapter: accepts {prompt, userId}, auto-generates strategyId, returns flat spec."""
+    import uuid
+    strategy_id = f"strat-{uuid.uuid4().hex[:8]}"
+    inner = generate_workflow_spec(WorkflowSpecRequest(
+        prompt=request.prompt,
+        strategyId=strategy_id,
+        userId=request.userId,
+    ))
+    if "error" in inner:
+        return inner
+    spec = inner.get("strategySpec", {})
+    spec.setdefault("_source", "rag+llm")
+    return spec
+
+
+@app.post("/api/v1/strategies/generate-tasks")
+def api_generate_tasks(request: SimpleTasksRequest):
+    """Frontend adapter: accepts {strategySpec}, returns task list."""
+    inner = generate_workflow_tasks(WorkflowTasksRequest(strategySpec=request.strategySpec))
+    tasks = inner.get("tasks", [])
+    return tasks if isinstance(tasks, list) else inner
+
+
 if __name__ == "__main__":
     import uvicorn
 
     port = int(os.getenv("PORT", 8083))
-    print(f"Starting Quant LangChain Agent v2 on :{port}")
+    print(f"Starting quant_ai on :{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)

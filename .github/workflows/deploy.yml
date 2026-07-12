@@ -1,4 +1,4 @@
-name: Build and Push quant_langchain Image and Create PR
+name: Build and Push quant_ai Image and Create PR
 
 on:
   push:
@@ -12,36 +12,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ======================================================
-      # 1️⃣ 检出代码
-      # ======================================================
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ======================================================
-      # 2️⃣ 获取当前提交短哈希值 (用于镜像 tag)
-      # ======================================================
       - name: Get short Git commit hash
         run: echo "COMMIT_TAG=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
-      # ======================================================
-      # 3️⃣ 配置 Docker 构建环境
-      # ======================================================
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ======================================================
-      # 4️⃣ 登录 DockerHub
-      # ======================================================
       - name: Login to DockerHub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # ======================================================
-      # 5️⃣ 构建并推送镜像到 DockerHub
-      # ======================================================
       - name: Build and Push Docker Image
         uses: docker/build-push-action@v6
         with:
@@ -50,52 +35,41 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            xiz001/langchain_agent:latest
-            xiz001/langchain_agent:${{ env.COMMIT_TAG }}
+            xiz001/quant_ai:latest
+            xiz001/quant_ai:${{ env.COMMIT_TAG }}
 
-      # ======================================================
-      # 6️⃣ 克隆 quant_docker 仓库并更新镜像版本
-      # ======================================================
-      - name: Clone quant_docker repository and update image tag
+      - name: Update image tag in quant_docker
         run: |
-          echo "🚀 Cloning quant_docker..."
           git clone https://zhengtiantian:${{ secrets.MAIN_REPO_PAT }}@github.com/zhengtiantian/quant_docker.git
           cd quant_docker
 
-          echo "🛠 Updating docker-compose.yml image tag..."
-          # 更新 docker-compose.yml 中的 langchain_agent 或 quant_langchain 镜像 tag
-          sed -i "s@xiz001/langchain_agent:[^[:space:]]\\+@xiz001/langchain_agent:${{ env.COMMIT_TAG }}@g" docker-compose.yml
-          sed -i "s@xiz001/quant_langchain:[^[:space:]]\\+@xiz001/quant_langchain:${{ env.COMMIT_TAG }}@g" docker-compose.yml
+          sed -i "s@xiz001/quant_ai:[^[:space:]]\+@xiz001/quant_ai:${{ env.COMMIT_TAG }}@g" docker-compose.yml
+          sed -i "s@xiz001/langchain_agent:[^[:space:]]\+@xiz001/quant_ai:${{ env.COMMIT_TAG }}@g" docker-compose.yml
 
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git checkout -b update-langchain-${{ env.COMMIT_TAG }}
+          git checkout -b update-quant-ai-${{ env.COMMIT_TAG }}
 
-          # 检查是否有变化
           if ! git diff --exit-code; then
             git add docker-compose.yml
-            git commit -m "Update langchain_agent image tag to ${{ env.COMMIT_TAG }}"
-            git push origin update-langchain-${{ env.COMMIT_TAG }}
+            git commit -m "Update quant_ai image tag to ${{ env.COMMIT_TAG }}"
+            git push origin update-quant-ai-${{ env.COMMIT_TAG }}
           else
-            echo "✅ No changes detected in docker-compose.yml, skipping commit."
+            echo "No changes in docker-compose.yml, skipping commit."
           fi
 
-      # ======================================================
-      # 7️⃣ 创建 Pull Request 到 quant_docker
-      # ======================================================
       - name: Create Pull Request
         if: success()
         env:
           GITHUB_TOKEN: ${{ secrets.MAIN_REPO_PAT }}
         run: |
-          echo "📝 Creating Pull Request for image tag ${{ env.COMMIT_TAG }}..."
           curl -s -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/zhengtiantian/quant_docker/pulls \
             -d '{
-              "title": "Update langchain_agent image to '${{ env.COMMIT_TAG }}'",
-              "head": "update-langchain-'${{ env.COMMIT_TAG }}'",
+              "title": "Update quant_ai image to '${{ env.COMMIT_TAG }}'",
+              "head": "update-quant-ai-'${{ env.COMMIT_TAG }}'",
               "base": "main",
-              "body": "This PR updates langchain_agent image tag to '${{ env.COMMIT_TAG }}'."
-            }' || echo "⚠️ No PR created (branch may already exist or no changes)."
+              "body": "Updates quant_ai image tag to '${{ env.COMMIT_TAG }}'."
+            }' || echo "No PR created (branch may already exist or no changes)."
