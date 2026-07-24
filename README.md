@@ -1,42 +1,55 @@
 # quant_ai
 
-RAG + Local LLM assistant service for the AI-Driven Equity Signal Platform.
+RAG + ReAct research agent service for the AI-Driven Equity Signal Platform.
 
 ## Overview
 
-FastAPI service that answers natural language questions about stocks by combining:
-1. **RAG** — cosine similarity search over embedded knowledge documents
-2. **Direct LLM call** — injects retrieved context into a single prompt sent to LM Studio
+FastAPI service with two modes:
 
-No agent loop. No LangGraph. Each request is one retrieval + one LLM call.
+1. **RAG Q&A** — cosine similarity search over embedded knowledge documents,
+   retrieved context injected into a single LLM prompt (one retrieval + one call)
+2. **ReAct research agent** — a hand-written tool-calling loop: the LLM
+   autonomously decides which read-only data tools to call
+   (Thought → Action → Observation), then writes a research note grounded in
+   the numbers it retrieved
 
 ```
-User question
+Research question ("Compare NVDA and AMD news sentiment")
      │
      ▼
-Embed query (nomic-embed-text via LM Studio)
-     │
+ReAct loop (agent.py, no framework)
+     │  LLM (qwen3.5-9b, OpenAI-compatible tools API)
+     │    ├─ tool: get_news_sentiment(symbol, days)
+     │    │    → quant_api /api/agent-data/news/{symbol}/sentiment
+     │    │      (fallback: direct mongo aggregation over 840K labeled articles)
+     │    ├─ tool: get_features(symbol)
+     │    │    → quant_api /api/agent-data/features/{symbol}/latest
+     │    └─ … repeats until the model answers or hits max_steps
      ▼
-Cosine similarity search over knowledge store
-(fallback: keyword search if embedding model unavailable)
-     │
-     ▼
-Build prompt: [system] + [retrieved docs] + [live data] + [question]
-     │
-     ▼
-LM Studio (qwen3.5-9b-mlx) → Anthropic → OpenAI  (fallback chain)
-     │
-     ▼
-Structured JSON response → quant_ui
+Grounded research note + full tool-call trace
+(SSE stream: each tool call pushed live to the UI)
 ```
+
+### Agent guardrails (controlled agency)
+
+- tools are **read-only** — the agent analyzes, it never trades
+- duplicate tool_calls within one step execute once
+- repeated (tool, args) across steps return a cached observation plus a
+  stop-looping nudge (small local models retry empty tools aggressively)
+- hard `max_steps` cap with a forced final synthesis
+- thinking-model fallback: empty `content` falls back to `reasoning_content`
+
+Covered by 6 unit tests (`tests/test_agent.py`) that mock the LLM and mongo.
 
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/api/chat` | Natural language Q&A with RAG context |
-| `POST` | `/api/generate-spec` | Generate signal spec JSON from description |
-| `GET` | `/api/health` | Service health + model connectivity |
+| `POST` | `/api/agent/research` | ReAct agent run (blocking; returns answer + trace) |
+| `POST` | `/api/agent/research/stream` | Same run as SSE: one event per tool call, then final |
+| `POST` | `/api/ask` | Natural language Q&A with RAG context |
+| `POST` | `/api/generate-script` | Generate a quant Python script from description |
+| `GET` | `/health` | Service health + model connectivity |
 | `GET` | `/docs` | FastAPI auto-generated docs |
 
 ## Knowledge Documents
