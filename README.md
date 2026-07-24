@@ -21,7 +21,7 @@ ReAct loop (agent.py, no framework)
      │  LLM (qwen3.5-9b, OpenAI-compatible tools API)
      │    ├─ tool: get_news_sentiment(symbol, days)
      │    │    → quant_api /api/agent-data/news/{symbol}/sentiment
-     │    │      (fallback: direct mongo aggregation over 840K labeled articles)
+     │    │      (fallback: direct mongo aggregation over 845K labeled articles)
      │    ├─ tool: get_features(symbol)
      │    │    → quant_api /api/agent-data/features/{symbol}/latest
      │    └─ … repeats until the model answers or hits max_steps
