@@ -51,3 +51,5 @@ docker-compose.override.yml
 # Jupyter / experiments
 .ipynb_checkpoints/
 *.ipynb
+# vendored linux wheels for the container (pymongo etc.) — runtime artifact, not source
+.vendor_linux/

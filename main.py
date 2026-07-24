@@ -247,6 +247,11 @@ class QueryRequest(BaseModel):
     question: str
 
 
+class AgentRequest(BaseModel):
+    question: str
+    max_steps: int = 5
+
+
 class WorkflowSpecRequest(BaseModel):
     prompt: str
     strategyId: str
@@ -304,6 +309,35 @@ def ask(request: QueryRequest):
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
+
+
+@app.post("/api/agent/research")
+def agent_research(request: AgentRequest):
+    """ReAct tool-calling research agent: LLM autonomously queries platform data tools."""
+    try:
+        from agent import run_research_agent
+        return run_research_agent(request.question, max_steps=min(request.max_steps, 8))
+    except Exception as e:
+        traceback.print_exc()
+        return {"error": str(e)}
+
+
+@app.post("/api/agent/research/stream")
+def agent_research_stream(request: AgentRequest):
+    """SSE stream of the agent run: one `tool_call` event per executed tool, then `final`."""
+    from fastapi.responses import StreamingResponse
+
+    def gen():
+        try:
+            from agent import agent_events
+            for ev in agent_events(request.question, max_steps=min(request.max_steps, 8)):
+                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            traceback.print_exc()
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache"})
 
 
 @app.post("/api/workflow/generate-spec")

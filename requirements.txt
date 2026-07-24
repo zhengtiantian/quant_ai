@@ -18,6 +18,9 @@ anthropic>=0.40.0
 # Vector math (RAG cosine similarity)
 numpy>=1.26.0
 
+# ReAct agent tools read mongo directly (news sentiment aggregation, features)
+pymongo>=4.6.0
+
 # Async / HTTP transitive deps
 aiohttp>=3.9.0,<4.0.0
 PyYAML>=6.0.0
