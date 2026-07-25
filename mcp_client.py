@@ -14,14 +14,16 @@ from __future__ import annotations
 import asyncio
 import atexit
 import os
+import sys
 import threading
+from pathlib import Path
 from typing import Any
 
-QUANT_MCP_PYTHON = os.getenv(
-    "QUANT_MCP_PYTHON", "/Users/xiz/Quant_trade/quant_mcp/.venv/bin/python"
-)
+# The server ships alongside this client, so it runs on the same interpreter
+# and needs no configured path. Both stay overridable for an out-of-tree server.
+QUANT_MCP_PYTHON = os.getenv("QUANT_MCP_PYTHON", sys.executable)
 QUANT_MCP_SERVER = os.getenv(
-    "QUANT_MCP_SERVER", "/Users/xiz/Quant_trade/quant_mcp/server.py"
+    "QUANT_MCP_SERVER", str(Path(__file__).resolve().parent / "mcp_server.py")
 )
 STARTUP_TIMEOUT = float(os.getenv("QUANT_MCP_STARTUP_TIMEOUT", "30"))
 CALL_TIMEOUT = float(os.getenv("QUANT_MCP_CALL_TIMEOUT", "60"))

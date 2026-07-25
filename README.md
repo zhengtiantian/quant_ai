@@ -21,10 +21,10 @@ ReAct loop (agent.py, no framework)
      │  LLM (qwen3.5-9b, OpenAI-compatible tools API)
      │    │
      │    │  tools are discovered at runtime, not implemented here:
-     │    └─ MCP client (mcp_client.py) ──stdio──> quant_mcp server
+     │    └─ MCP client (mcp_client.py) ──stdio──> mcp_server.py
      │         get_news_sentiment · get_stock_features · get_latest_signals
      │         get_positions · get_performance · list_symbols
-     │              └─ quant_api (mongo fallback inside the MCP server)
+     │              └─ quant_api (mongo fallback inside mcp_server.py)
      │
      │    … repeats until the model answers or hits max_steps
      ▼
@@ -54,6 +54,42 @@ tool surface, so they need neither LM Studio nor a database.
 | `POST` | `/api/generate-script` | Generate a quant Python script from description |
 | `GET` | `/health` | Service health + model connectivity |
 | `GET` | `/docs` | FastAPI auto-generated docs |
+
+## MCP Server
+
+`mcp_server.py` exposes the platform over the Model Context Protocol (stdio), so
+any MCP client can query it. It is not a service: each client spawns it as a
+subprocess, so there is no port, container, or launchd entry to manage.
+
+| Tool | Returns |
+|---|---|
+| `get_news_sentiment(symbol, days=90)` | Article count, average sentiment (-1..+1), model disagreement, recent headlines |
+| `get_stock_features(symbol)` | Latest engineered daily feature row |
+| `get_latest_signals(limit=10)` | Ranked signals from the Ridge + LightGBM ensemble |
+| `get_positions()` | Paper positions with entry/current price and P&L |
+| `get_performance()` | Backtest Sharpe, returns, hit rate, drawdown |
+| `list_symbols()` | The covered universe |
+
+Tools read through `quant_api` and fall back to mongo only when it is
+unreachable. All are read-only — the server analyzes, it never trades.
+
+Two clients use it: this service's own agent (above), and Claude Desktop via
+`~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "quant": {
+      "command": "/Users/xiz/Quant_trade/quant_ai/.venv/bin/python",
+      "args": ["/Users/xiz/Quant_trade/quant_ai/mcp_server.py"],
+      "env": { "QUANT_API": "http://localhost:18081" }
+    }
+  }
+}
+```
+
+Absolute paths are required there — Claude Desktop launches from an arbitrary
+working directory. Restart it after editing the config.
 
 ## Knowledge Documents
 
@@ -88,8 +124,8 @@ Runs on port 18000. Logs: `/tmp/quant-ai.log` / `/tmp/quant-ai-err.log`.
 | `QUANT_API` | `http://localhost:18081` | quant_api for live signal data (RAG helpers) |
 | `KNOWLEDGE_PATHS` | `./knowledge` | Comma-separated knowledge dirs |
 | `PORT` | `18000` | Listen port |
-| `QUANT_MCP_PYTHON` | `…/quant_mcp/.venv/bin/python` | Interpreter used to launch the MCP server |
-| `QUANT_MCP_SERVER` | `…/quant_mcp/server.py` | MCP server entry point |
+| `QUANT_MCP_PYTHON` | current interpreter | Override only to run an out-of-tree MCP server |
+| `QUANT_MCP_SERVER` | `./mcp_server.py` | Override only to run an out-of-tree MCP server |
 
 ### Dependencies
 

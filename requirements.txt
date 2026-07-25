@@ -18,9 +18,12 @@ anthropic>=0.40.0
 # Vector math (RAG cosine similarity)
 numpy>=1.26.0
 
-# MCP client — agent tools are discovered from quant_mcp over stdio, not
-# implemented here (see mcp_client.py). Requires fastapi>=0.118 for starlette.
+# MCP — mcp_server.py exposes the platform's tools over stdio; mcp_client.py
+# is how the agent consumes them. Requires fastapi>=0.118 for starlette.
 mcp>=1.28.0
+
+# Mongo fallback inside mcp_server.py, used when quant_api is unreachable
+pymongo>=4.6.0
 
 # Async / HTTP transitive deps
 aiohttp>=3.9.0,<4.0.0
