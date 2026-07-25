@@ -7,11 +7,13 @@ Architecture:
   - API: FastAPI endpoints consumed by quant_ui (browser-direct) and quant_api
 """
 
+import asyncio
 import json
 import os
 import re
 import time
 import traceback
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -274,11 +276,14 @@ class SimpleTasksRequest(BaseModel):
 # =====================================================
 # FastAPI Routes
 # =====================================================
-@app.on_event("startup")
-async def on_startup():
-    import asyncio
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, _ensure_vs)
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Build the RAG vector store off the event loop so startup does not block.
+    asyncio.get_running_loop().run_in_executor(None, _ensure_vs)
+    yield
+
+
+app.router.lifespan_context = lifespan
 
 
 @app.get("/health")

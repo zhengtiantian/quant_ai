@@ -19,12 +19,14 @@ Research question ("Compare NVDA and AMD news sentiment")
      ▼
 ReAct loop (agent.py, no framework)
      │  LLM (qwen3.5-9b, OpenAI-compatible tools API)
-     │    ├─ tool: get_news_sentiment(symbol, days)
-     │    │    → quant_api /api/agent-data/news/{symbol}/sentiment
-     │    │      (fallback: direct mongo aggregation over 845K labeled articles)
-     │    ├─ tool: get_features(symbol)
-     │    │    → quant_api /api/agent-data/features/{symbol}/latest
-     │    └─ … repeats until the model answers or hits max_steps
+     │    │
+     │    │  tools are discovered at runtime, not implemented here:
+     │    └─ MCP client (mcp_client.py) ──stdio──> quant_mcp server
+     │         get_news_sentiment · get_stock_features · get_latest_signals
+     │         get_positions · get_performance · list_symbols
+     │              └─ quant_api (mongo fallback inside the MCP server)
+     │
+     │    … repeats until the model answers or hits max_steps
      ▼
 Grounded research note + full tool-call trace
 (SSE stream: each tool call pushed live to the UI)
@@ -32,14 +34,15 @@ Grounded research note + full tool-call trace
 
 ### Agent guardrails (controlled agency)
 
-- tools are **read-only** — the agent analyzes, it never trades
+- tools are **read-only** — the MCP server exposes no mutating operation
 - duplicate tool_calls within one step execute once
 - repeated (tool, args) across steps return a cached observation plus a
   stop-looping nudge (small local models retry empty tools aggressively)
 - hard `max_steps` cap with a forced final synthesis
 - thinking-model fallback: empty `content` falls back to `reasoning_content`
 
-Covered by 6 unit tests (`tests/test_agent.py`) that mock the LLM and mongo.
+Covered by 7 unit tests (`tests/test_agent.py`) that mock the LLM and the MCP
+tool surface, so they need neither LM Studio nor a database.
 
 ## Endpoints
 
@@ -82,9 +85,11 @@ Runs on port 18000. Logs: `/tmp/quant-ai.log` / `/tmp/quant-ai-err.log`.
 | `LOCAL_MODEL_NAME` | `qwen3.5-9b-mlx` | LM Studio chat model |
 | `EMBED_MODEL` | `text-embedding-nomic-embed-text-v1.5` | LM Studio embedding model |
 | `LM_STUDIO_URL` | `http://127.0.0.1:1234/v1` | LM Studio base URL |
-| `QUANT_API` | `http://localhost:18081` | quant_api for live signal data |
+| `QUANT_API` | `http://localhost:18081` | quant_api for live signal data (RAG helpers) |
 | `KNOWLEDGE_PATHS` | `./knowledge` | Comma-separated knowledge dirs |
 | `PORT` | `18000` | Listen port |
+| `QUANT_MCP_PYTHON` | `…/quant_mcp/.venv/bin/python` | Interpreter used to launch the MCP server |
+| `QUANT_MCP_SERVER` | `…/quant_mcp/server.py` | MCP server entry point |
 
 ### Dependencies
 

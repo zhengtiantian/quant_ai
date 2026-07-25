@@ -1,7 +1,7 @@
 # quant_ai dependencies
 
 # Web framework
-fastapi==0.115.0
+fastapi>=0.118.0
 uvicorn==0.31.0
 requests==2.31.0
 pydantic==2.12.5
@@ -18,8 +18,9 @@ anthropic>=0.40.0
 # Vector math (RAG cosine similarity)
 numpy>=1.26.0
 
-# ReAct agent tools read mongo directly (news sentiment aggregation, features)
-pymongo>=4.6.0
+# MCP client — agent tools are discovered from quant_mcp over stdio, not
+# implemented here (see mcp_client.py). Requires fastapi>=0.118 for starlette.
+mcp>=1.28.0
 
 # Async / HTTP transitive deps
 aiohttp>=3.9.0,<4.0.0

@@ -1,4 +1,8 @@
-"""Unit tests for the ReAct agent loop guardrails (no LLM / no mongo needed)."""
+"""Unit tests for the ReAct agent loop guardrails.
+
+The LLM and the MCP tool surface are both mocked, so these run with no LM Studio,
+no MCP server subprocess, and no database.
+"""
 
 import json
 import unittest
@@ -26,17 +30,17 @@ class AgentLoopTests(unittest.TestCase):
         """27 identical tool_calls in one step -> tool runs once, all ids answered."""
         calls = {"n": 0}
 
-        def fake_tool(args):
+        def fake_exec(name, args):
             calls["n"] += 1
             return json.dumps({"ok": True})
 
-        dup = [_tc("get_features", {"symbol": "AAPL"}, f"id{i}") for i in range(27)]
+        dup = [_tc("get_stock_features", {"symbol": "AAPL"}, f"id{i}") for i in range(27)]
         replies = iter([
             {"content": "", "tool_calls": dup},
             {"content": "done"},
         ])
         with patch.object(agent, "_chat", side_effect=lambda *a, **k: next(replies)), \
-             patch.dict(agent.TOOL_IMPL, {"get_features": fake_tool}):
+             patch.object(agent, "execute_tool", side_effect=fake_exec):
             r = agent.run_research_agent("q")
         self.assertEqual(calls["n"], 1)          # executed once
         self.assertEqual(len(r["trace"]), 1)     # traced once
@@ -46,13 +50,13 @@ class AgentLoopTests(unittest.TestCase):
         """Same (tool,args) on a later step -> cached obs + stop-looping note, no re-execution."""
         calls = {"n": 0}
 
-        def fake_tool(args):
+        def fake_exec(name, args):
             calls["n"] += 1
             return json.dumps({"ok": True})
 
         replies = iter([
-            {"content": "", "tool_calls": [_tc("get_features", {"symbol": "AAPL"}, "a")]},
-            {"content": "", "tool_calls": [_tc("get_features", {"symbol": "AAPL"}, "b")]},
+            {"content": "", "tool_calls": [_tc("get_stock_features", {"symbol": "AAPL"}, "a")]},
+            {"content": "", "tool_calls": [_tc("get_stock_features", {"symbol": "AAPL"}, "b")]},
             {"content": "final"},
         ])
         captured_messages = []
@@ -62,7 +66,7 @@ class AgentLoopTests(unittest.TestCase):
             return next(replies)
 
         with patch.object(agent, "_chat", side_effect=fake_chat), \
-             patch.dict(agent.TOOL_IMPL, {"get_features": fake_tool}):
+             patch.object(agent, "execute_tool", side_effect=fake_exec):
             r = agent.run_research_agent("q")
         self.assertEqual(calls["n"], 1)
         nudges = [m for m in captured_messages
@@ -75,10 +79,10 @@ class AgentLoopTests(unittest.TestCase):
         def fake_chat(messages, use_tools=True):
             if not use_tools:
                 return {"content": "forced summary"}
-            return {"content": "", "tool_calls": [_tc("get_features", {"symbol": "AAPL"}, "x")]}
+            return {"content": "", "tool_calls": [_tc("get_stock_features", {"symbol": "AAPL"}, "x")]}
 
         with patch.object(agent, "_chat", side_effect=fake_chat), \
-             patch.dict(agent.TOOL_IMPL, {"get_features": lambda a: "{}"}):
+             patch.object(agent, "execute_tool", return_value="{}"):
             r = agent.run_research_agent("q", max_steps=3)
         self.assertEqual(r["steps"], 3)
         self.assertEqual(r.get("note"), "hit max_steps")
@@ -91,14 +95,28 @@ class AgentLoopTests(unittest.TestCase):
             r = agent.run_research_agent("q")
         self.assertEqual(r["answer"], "from thinking")
 
-    def test_unknown_tool_returns_error_observation(self):
-        replies = iter([
-            {"content": "", "tool_calls": [_tc("no_such_tool", {}, "z")]},
-            {"content": "ok"},
-        ])
-        with patch.object(agent, "_chat", side_effect=lambda *a, **k: next(replies)):
-            r = agent.run_research_agent("q")
-        self.assertIn("unknown tool", r["trace"][0]["observation"])
+
+class ToolBridgeTests(unittest.TestCase):
+    """execute_tool must turn any MCP failure into an observation, never an exception."""
+
+    def test_tool_failure_becomes_error_observation(self):
+        class Boom:
+            def call_tool(self, name, args):
+                raise RuntimeError("mcp server unreachable")
+
+        with patch.object(agent.mcp_client, "get_client", return_value=Boom()):
+            out = agent.execute_tool("get_positions", {})
+        self.assertIn("error", out)
+        self.assertIn("mcp server unreachable", out)
+
+    def test_tool_specs_come_from_mcp(self):
+        class Fake:
+            def openai_tools(self):
+                return [{"type": "function", "function": {"name": "get_positions"}}]
+
+        with patch.object(agent.mcp_client, "get_client", return_value=Fake()):
+            specs = agent.get_tool_specs()
+        self.assertEqual(specs[0]["function"]["name"], "get_positions")
 
 
 if __name__ == "__main__":
