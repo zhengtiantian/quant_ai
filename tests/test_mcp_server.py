@@ -21,6 +21,7 @@ EXPECTED_TOOLS = {
     "get_news_sentiment",
     "search_news",
     "get_stock_features",
+    "get_feature_history",
     "get_latest_signals",
     "get_positions",
     "get_my_holdings",
@@ -44,6 +45,14 @@ CALL_CHECKS = [
     ("search_news", {"query": "earnings", "symbol": "AAPL", "limit": 3}, "relevance"),
     # Empty query is a valid call: it lists a symbol's coverage by date instead.
     ("search_news", {"symbol": "NVDA", "limit": 3}, "\"rankedby\": \"date\""),
+    # The summary block is the point of this tool — a raw series without it just moves
+    # the work to the caller.
+    ("get_feature_history",
+     {"symbol": "AAPL", "fields": "avg_sentiment_5d,past_ret_20d", "days": 60}, "summary"),
+    # Forward-return labels must be refused, not silently dropped: an agent that asked
+    # for one has to learn it is off limits.
+    ("get_feature_history",
+     {"symbol": "AAPL", "fields": "future_ret_20d"}, "look-ahead leakage"),
 ]
 
 

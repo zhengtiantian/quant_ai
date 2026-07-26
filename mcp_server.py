@@ -49,13 +49,23 @@ def _db():
 
 
 def _get(path: str, params: dict[str, Any] | None = None) -> str | None:
-    """GET from quant_api. Returns pretty JSON, or None if the call did not succeed
-    so the caller can fall back to reading mongo directly."""
+    """GET from quant_api.
+
+    Returns pretty JSON on success. Returns None only when the service could not answer
+    at all — a connection failure or a 5xx — so the caller can fall back to mongo.
+
+    A 4xx is passed through instead. The API rejects a bad ticker, an unknown field, or a
+    forward-looking column with a message explaining why, and that message is exactly what
+    the model needs to correct its next call. Collapsing it into "is the container
+    running?" would send the model chasing an outage that is not happening.
+    """
     try:
         resp = requests.get(f"{QUANT_API}{path}", params=params, timeout=TIMEOUT)
     except requests.RequestException:
         return None
-    if resp.status_code != 200:
+    if resp.status_code >= 500:
+        return None
+    if resp.status_code != 200 and not (400 <= resp.status_code < 500):
         return None
     try:
         return json.dumps(resp.json(), indent=2, ensure_ascii=False, default=str)
@@ -193,6 +203,46 @@ def get_stock_features(symbol: str) -> str:
                           indent=2, ensure_ascii=False, default=str)
     except Exception:
         return _unavailable(f"/api/agent-data/features/{sym}/latest")
+
+
+@mcp.tool()
+def get_feature_history(symbol: str, fields: str, days: int = 90) -> str:
+    """Feature time series for a stock — the trend behind get_stock_features.
+
+    get_stock_features answers "what does this look like now". This answers "which way
+    is it moving", which is usually the question worth asking: a sentiment of +0.29 means
+    something very different when it rose from +0.09 than when it fell from +0.60.
+
+    Returns a date-ordered series plus a per-field summary (first, last, change, min,
+    max, mean), so you can read the direction without walking every row. A field that is
+    entirely empty says so explicitly rather than looking like a flat trend.
+
+    A feature row has 123 columns, so you must name what you want — at most 12 fields per
+    call, and at most 365 days.
+
+    Useful field names:
+      sentiment  avg_sentiment_3d, avg_sentiment_5d, sentiment_shift_5d,
+                 disagreement_avg_5d, high_signal_count_3d
+      news       article_count, news_count_5d, news_burst_20d, quality_score
+      price      close, past_ret_5d, past_ret_20d, past_ret_60d,
+                 volatility_20d, volume_shock_20d, excess_ret_20d
+      analyst    analyst_buy_ratio, analyst_buy_ratio_chg_1m, analyst_consensus_score
+      holdings   inst_holding_pct, inst_holding_pct_chg
+      macro      macro_vix, macro_vix_pctile_252d, macro_risk_on, macro_spy_ret_20d
+      earnings   days_to_earnings, surprise_pct_last, earnings_beat_signal
+
+    Forward-return columns (future_ret_*) are training labels and are refused: returning
+    them would let an analysis of a past date read that date's actual future.
+
+    Args:
+        symbol: Ticker, e.g. AAPL.
+        fields: Comma-separated feature names, e.g. "avg_sentiment_5d,past_ret_20d".
+        days: Lookback in calendar days (default 90, max 365).
+    """
+    sym = symbol.upper().strip()
+    return (_get(f"/api/agent-data/features/{sym}/history",
+                 {"fields": fields, "days": days})
+            or _unavailable(f"/api/agent-data/features/{sym}/history"))
 
 
 @mcp.tool()
