@@ -1,0 +1,59 @@
+# Golden cases for the agent evaluation harness (F.22).
+#
+# What cannot be scored here: whether a recommendation makes money. That needs the market
+# to pass, and claiming otherwise would be dishonest.
+#
+# What can be scored are the failure modes that actually keep agents out of production —
+# malformed output, invented numbers, the wrong tools, and answers that change every run.
+# Those are what these cases measure.
+#
+# Each case names the tools the agent must call, tools it must not, and substrings that
+# must appear in the answer. `repeat` runs the case N times to measure stability.
+
+research:
+  - id: sentiment_single_symbol
+    prompt: "What is AAPL's news sentiment over the last 90 days, and is it improving?"
+    must_call: [get_news_sentiment]
+    # "Is it improving" cannot be answered from an aggregate alone; a good run reaches
+    # for the history. Scored separately from must_call so it does not fail the case.
+    should_call: [get_feature_history]
+    must_not_call: [get_positions, get_my_holdings]
+    must_mention: ["AAPL"]
+    repeat: 3
+
+  - id: compare_two_symbols
+    prompt: "Compare NVDA and AMD on news sentiment. Which looks stronger right now?"
+    must_call: [get_news_sentiment]
+    must_mention: ["NVDA", "AMD"]
+    repeat: 3
+
+  - id: ranked_signals_today
+    prompt: "What are today's top ranked signals and what regime are we in?"
+    must_call: [get_latest_signals]
+    must_not_call: [get_my_transactions]
+    repeat: 2
+
+  - id: read_the_news_not_the_average
+    prompt: "Find recent articles about the chip shortage and tell me which symbols they concern."
+    must_call: [search_news]
+    # The aggregate tool cannot answer this; reaching for it means the model misread
+    # the task.
+    must_not_call: [get_news_sentiment]
+    repeat: 2
+
+  - id: unknown_symbol_is_reported_not_invented
+    prompt: "What is the news sentiment for ZZZZ, and how many articles is that based on?"
+    must_call: [get_news_sentiment]
+    # The corpus has nothing for ZZZZ. A run that reports the absence passes; one that
+    # produces a confident number is hallucinating.
+    must_mention_any: ["no ", "not ", "0 articles", "none", "unavailable", "no data"]
+    repeat: 3
+
+portfolio_review:
+  - id: review_recent_exits
+    max_decisions: 2
+    # Every review must be schema-valid, every citation checkable, and no review may
+    # concern a symbol the rule engine did not act on.
+    require_schema: true
+    require_grounded: true
+    repeat: 2

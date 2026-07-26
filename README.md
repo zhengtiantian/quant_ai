@@ -46,11 +46,61 @@ Grounded research note + full tool-call trace
 Covered by 7 unit tests (`tests/test_agent.py`) that mock the LLM and the MCP
 tool surface, so they need neither LM Studio nor a database.
 
+### Portfolio review agent (F.17)
+
+A second opinion on the rule engine, not a replacement. `track_positions.py` already
+decides entries, exits and stops deterministically; a local 9B model would be worse and
+non-reproducible at that job. This agent reviews those decisions instead, covering the
+two things a per-position rule structurally cannot do — reading *why* a price moved, and
+looking at the portfolio as a whole.
+
+The division of labour is the design:
+
+- **Code** gathers context, picks what to review, fetches evidence, and runs every
+  portfolio-level check. Concentration and weight limits are arithmetic; asking a model
+  to do arithmetic that a comparison operator cannot get wrong is a bad trade.
+- **The model** handles only what needs language: given these articles and this feature
+  trend, was that exit justified?
+- **Code** then validates what came back, through three gates that trust nothing:
+
+| Gate | Enforces | On failure |
+|---|---|---|
+| Schema | valid JSON, known verdict, confidence in 0–1 | one repair round-trip, then the review is dropped rather than emitted malformed |
+| **Grounding** | every cited `(tool, field, value)` appears in a real observation from this run | citation dropped; a `flag` resting on nothing verifiable is demoted to `agree` |
+| Business rules | symbol in the universe, position actually exists | rejected |
+
+Grounding is the point: not asking the model to avoid inventing numbers, but making
+invented numbers non-viable. Numeric citations match with tolerance — a model echoing
+0.2803 as 0.28 is quoting, not fabricating, and failing that would teach it to stop
+citing altogether.
+
+Covered by 25 unit tests (`tests/test_portfolio_agent.py`) with the LLM and MCP mocked.
+
+### Agent evaluation (F.22)
+
+```bash
+.venv/bin/python eval/run_eval.py --suite research
+```
+
+Whether a recommendation makes money cannot be scored without waiting for the market, and
+claiming otherwise would be dishonest. What `eval/` does score are the failure modes that
+actually keep agents out of production: schema validity, **grounding rate**, tool
+recall/precision against the tools a case requires or forbids, run-to-run stability
+(mean pairwise Jaccard over repeated identical runs), and cost in steps and seconds.
+
+Stability matters more than it looks — an agent that answers differently every time cannot
+be trusted even when each answer is defensible, and a demo run once cannot reveal it.
+
+The unit tests mock the LLM, so they prove the loop is correct, not that the decisions
+are. This closes that gap by driving the real model against fixed cases in
+`eval/cases.yaml`.
+
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/api/agent/research` | ReAct agent run (blocking; returns answer + trace) |
+| `POST` | `/api/agent/portfolio` | Portfolio review: rule decisions + deterministic portfolio checks |
 | `POST` | `/api/agent/research/stream` | Same run as SSE: one event per tool call, then final |
 | `POST` | `/api/ask` | Natural language Q&A with RAG context |
 | `POST` | `/api/generate-script` | Generate a quant Python script from description |

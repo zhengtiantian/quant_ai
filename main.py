@@ -327,6 +327,23 @@ def agent_research(request: AgentRequest):
         return {"error": str(e)}
 
 
+@app.post("/api/agent/portfolio")
+def agent_portfolio_review(max_decisions: int = 5):
+    """Review the rule engine's recent decisions and the current portfolio (F.17).
+
+    Not a research question — it takes no prompt. The agent reads the platform's own
+    state, reviews what the rules decided, and returns a machine-consumable decision
+    table. Portfolio-level checks (weight limits, regime exposure, signal alignment) are
+    computed in code rather than asked of the model, because they are arithmetic.
+    """
+    try:
+        from portfolio_agent import run_portfolio_review
+        return run_portfolio_review(max_decisions=max(1, min(max_decisions, 10)))
+    except Exception as e:
+        traceback.print_exc()
+        return {"error": str(e)}
+
+
 @app.post("/api/agent/research/stream")
 def agent_research_stream(request: AgentRequest):
     """SSE stream of the agent run: one `tool_call` event per executed tool, then `final`."""
