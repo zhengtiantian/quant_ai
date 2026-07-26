@@ -2,7 +2,11 @@
 
 # Web framework
 fastapi>=0.118.0
-uvicorn==0.31.0
+# Not pinned exactly: mcp requires uvicorn>=0.31.1, so an exact pin here silently
+# conflicts with any mcp upgrade. The pin at 0.31.0 broke the image build once the
+# MCP dependency landed — the local venv already had a newer uvicorn, so only a
+# clean install surfaced it.
+uvicorn>=0.31.1
 requests==2.31.0
 pydantic==2.12.5
 python-dotenv==1.0.1
