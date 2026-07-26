@@ -22,6 +22,8 @@ EXPECTED_TOOLS = {
     "get_stock_features",
     "get_latest_signals",
     "get_positions",
+    "get_my_holdings",
+    "get_my_transactions",
     "get_performance",
     "list_symbols",
 }
@@ -34,6 +36,9 @@ CALL_CHECKS = [
     ("list_symbols", {}, "aapl"),
     ("get_positions", {}, "symbol"),
     ("get_performance", {}, "sharpe"),
+    # Answers with totals even when the user has recorded no trades yet.
+    ("get_my_holdings", {}, "totals"),
+    ("get_my_transactions", {}, "["),
 ]
 
 
@@ -41,8 +46,18 @@ async def _drive_server():
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 
+    from mcp.client.stdio import get_default_environment
+
+    # stdio_client passes only a safe subset of the environment to the subprocess, so
+    # QUANT_API and friends never reach the server unless forwarded explicitly. Without
+    # this the test can only ever exercise the default endpoint.
+    env = get_default_environment()
+    for key in ("QUANT_API", "LOCAL_MONGO_URI", "FEATURE_DB_NAME", "QUANT_MCP_TIMEOUT"):
+        if os.getenv(key):
+            env[key] = os.environ[key]
+
     params = StdioServerParameters(
-        command=sys.executable, args=[str(PROJECT_ROOT / "mcp_server.py")]
+        command=sys.executable, args=[str(PROJECT_ROOT / "mcp_server.py")], env=env
     )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:

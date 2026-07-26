@@ -8,9 +8,10 @@ which discovers its entire tool surface here — registering a tool below is
 enough for the agent to gain it.
 
 Exposes LLM-labeled news sentiment over 845K+ articles, engineered features,
-ranked daily signals, paper positions, and backtest performance. All tools are
-read-only — this server analyzes, it never trades. Data is read through
-quant_api (:18081), falling back to mongo only when that is unreachable.
+ranked daily signals, rule-generated paper positions, the user's own holdings and
+trade log, and backtest performance. All tools are read-only — this server
+analyzes, it never trades. Data is read through quant_api (:18081), falling back
+to mongo only when that is unreachable.
 
 Smoke test:
     RUN_MCP_E2E=1 .venv/bin/python -m unittest tests.test_mcp_server -v
@@ -167,8 +168,45 @@ def get_latest_signals(limit: int = 10) -> str:
 
 @mcp.tool()
 def get_positions() -> str:
-    """Current paper-trading positions with entry price, current price, and P&L."""
+    """Rule-generated paper positions with entry price, current price, and P&L.
+
+    These are synthetic: the tracker mechanically opens the day's top-5 ranked signals
+    and closes on stop-loss, sentiment reversal, or holding-period rules. For what the
+    user actually owns, use get_my_holdings instead.
+    """
     return _get("/api/positions") or _unavailable("/api/positions")
+
+
+@mcp.tool()
+def get_my_holdings() -> str:
+    """The user's real portfolio: what they actually own, with live prices.
+
+    Returns one row per open holding — quantity, average cost, current price, cost basis,
+    market value, unrealised P&L (absolute and percent), realised P&L, day change, and
+    weight as a share of total capital including cash — plus portfolio totals and the
+    cash balance. Derived from a hand-maintained transaction log, so the average cost
+    reflects every recorded buy.
+
+    Distinct from get_positions, which returns the rule-generated paper positions.
+    Quotes come from Finnhub during US market hours and fall back to the last daily
+    close otherwise; each holding carries the `quoteSource` that produced its price.
+    """
+    return _get("/api/portfolio/holdings") or _unavailable("/api/portfolio/holdings")
+
+
+@mcp.tool()
+def get_my_transactions(symbol: str = "") -> str:
+    """The user's recorded trades, newest first — the log behind get_my_holdings.
+
+    Each entry carries side (BUY/SELL), quantity, price, trade date, fee and note. Use
+    this to see how a position was built up rather than only its current average cost.
+
+    Args:
+        symbol: Optional ticker filter, e.g. AAPL. Empty returns every trade.
+    """
+    params = {"symbol": symbol.upper().strip()} if symbol.strip() else None
+    return (_get("/api/portfolio/transactions", params)
+            or _unavailable("/api/portfolio/transactions"))
 
 
 @mcp.tool()

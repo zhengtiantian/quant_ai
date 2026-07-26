@@ -23,7 +23,8 @@ ReAct loop (agent.py, no framework)
      │    │  tools are discovered at runtime, not implemented here:
      │    └─ MCP client (mcp_client.py) ──stdio──> mcp_server.py
      │         get_news_sentiment · get_stock_features · get_latest_signals
-     │         get_positions · get_performance · list_symbols
+     │         get_positions · get_my_holdings · get_my_transactions
+     │         get_performance · list_symbols
      │              └─ quant_api (mongo fallback inside mcp_server.py)
      │
      │    … repeats until the model answers or hits max_steps
@@ -66,9 +67,15 @@ subprocess, so there is no port, container, or launchd entry to manage.
 | `get_news_sentiment(symbol, days=90)` | Article count, average sentiment (-1..+1), model disagreement, recent headlines |
 | `get_stock_features(symbol)` | Latest engineered daily feature row |
 | `get_latest_signals(limit=10)` | Ranked signals from the Ridge + LightGBM ensemble |
-| `get_positions()` | Paper positions with entry/current price and P&L |
+| `get_positions()` | Rule-generated paper positions with entry/current price and P&L |
+| `get_my_holdings()` | The user's real portfolio — quantity, average cost, live price, unrealised/realised P&L, weight, plus totals and cash |
+| `get_my_transactions(symbol="")` | The trade log behind those holdings, newest first |
 | `get_performance()` | Backtest Sharpe, returns, hit rate, drawdown |
 | `list_symbols()` | The covered universe |
+
+`get_positions` and `get_my_holdings` answer different questions: the first returns the
+synthetic positions the signal tracker opens mechanically from the daily top-5, the second
+returns what the user actually owns.
 
 Tools read through `quant_api` and fall back to mongo only when it is
 unreachable. All are read-only — the server analyzes, it never trades.

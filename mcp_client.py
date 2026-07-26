@@ -78,10 +78,20 @@ class MCPToolClient:
 
     async def _serve(self) -> None:
         from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
+        from mcp.client.stdio import get_default_environment, stdio_client
+
+        # stdio_client hands the subprocess only a safe subset of the environment, so our
+        # own configuration has to be forwarded by name. Without this the server silently
+        # falls back to its defaults — which happen to match ours, so a misconfigured
+        # QUANT_API would look like it worked while reading the wrong instance.
+        env = get_default_environment()
+        for key in ("QUANT_API", "LOCAL_MONGO_URI", "FEATURE_DB_NAME", "QUANT_MCP_TIMEOUT"):
+            value = os.getenv(key)
+            if value:
+                env[key] = value
 
         params = StdioServerParameters(
-            command=QUANT_MCP_PYTHON, args=[QUANT_MCP_SERVER]
+            command=QUANT_MCP_PYTHON, args=[QUANT_MCP_SERVER], env=env
         )
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
