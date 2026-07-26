@@ -19,6 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 EXPECTED_TOOLS = {
     "get_news_sentiment",
+    "search_news",
     "get_stock_features",
     "get_latest_signals",
     "get_positions",
@@ -39,6 +40,10 @@ CALL_CHECKS = [
     # Answers with totals even when the user has recorded no trades yet.
     ("get_my_holdings", {}, "totals"),
     ("get_my_transactions", {}, "["),
+    # Relevance ranking proves the weighted text index is actually being used.
+    ("search_news", {"query": "earnings", "symbol": "AAPL", "limit": 3}, "relevance"),
+    # Empty query is a valid call: it lists a symbol's coverage by date instead.
+    ("search_news", {"symbol": "NVDA", "limit": 3}, "\"rankedby\": \"date\""),
 ]
 
 
@@ -63,12 +68,16 @@ async def _drive_server():
         async with ClientSession(read, write) as session:
             await session.initialize()
             names = {t.name for t in (await session.list_tools()).tools}
-            results = {}
+            # A list, not a dict keyed by tool name: a tool may appear in CALL_CHECKS more
+            # than once (search_news is exercised with and without a query) and keying by
+            # name would let the later case silently overwrite the earlier one, so both
+            # assertions would then run against the same response.
+            results = []
             for tool, args, _ in CALL_CHECKS:
                 out = await session.call_tool(tool, args)
-                results[tool] = "".join(
+                results.append("".join(
                     c.text for c in out.content if getattr(c, "type", "") == "text"
-                )
+                ))
             return names, results
 
 
@@ -87,9 +96,9 @@ class MCPServerEndToEndTests(unittest.TestCase):
         self.assertEqual(EXPECTED_TOOLS, self.names)
 
     def test_every_tool_returns_expected_data(self):
-        for tool, _, expected in CALL_CHECKS:
-            with self.subTest(tool=tool):
-                self.assertIn(expected, self.results[tool].lower())
+        for (tool, args, expected), body in zip(CALL_CHECKS, self.results):
+            with self.subTest(tool=tool, args=args):
+                self.assertIn(expected, body.lower())
 
 
 if __name__ == "__main__":

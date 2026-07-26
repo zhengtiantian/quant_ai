@@ -22,7 +22,8 @@ ReAct loop (agent.py, no framework)
      │    │
      │    │  tools are discovered at runtime, not implemented here:
      │    └─ MCP client (mcp_client.py) ──stdio──> mcp_server.py
-     │         get_news_sentiment · get_stock_features · get_latest_signals
+     │         get_news_sentiment · search_news · get_stock_features
+     │         get_latest_signals
      │         get_positions · get_my_holdings · get_my_transactions
      │         get_performance · list_symbols
      │              └─ quant_api (mongo fallback inside mcp_server.py)
@@ -65,6 +66,7 @@ subprocess, so there is no port, container, or launchd entry to manage.
 | Tool | Returns |
 |---|---|
 | `get_news_sentiment(symbol, days=90)` | Article count, average sentiment (-1..+1), model disagreement, recent headlines |
+| `search_news(query, symbol, from_date, to_date, limit=20)` | The articles themselves — headline, date, excerpt, merged sentiment, model disagreement, event type, URL. Ranked by relevance (headline matches weighted 10x over body) |
 | `get_stock_features(symbol)` | Latest engineered daily feature row |
 | `get_latest_signals(limit=10)` | Ranked signals from the Ridge + LightGBM ensemble |
 | `get_positions()` | Rule-generated paper positions with entry/current price and P&L |
@@ -73,6 +75,10 @@ subprocess, so there is no port, container, or launchd entry to manage.
 | `get_performance()` | Backtest Sharpe, returns, hit rate, drawdown |
 | `list_symbols()` | The covered universe |
 
+`get_news_sentiment` and `search_news` are the aggregate and the evidence behind it: the
+first says a symbol averaged +0.31 over 90 days, the second lets a client read the
+articles that produced it. Backed by a weighted text index over 845K labeled articles.
+
 `get_positions` and `get_my_holdings` answer different questions: the first returns the
 synthetic positions the signal tracker opens mechanically from the daily top-5, the second
 returns what the user actually owns.
@@ -80,7 +86,9 @@ returns what the user actually owns.
 Tools read through `quant_api` and fall back to mongo only when it is
 unreachable. All are read-only — the server analyzes, it never trades.
 
-Two clients use it: this service's own agent (above), and Claude Desktop via
+Three clients use it today, none of which required a change to the server: this
+service's own agent (above), Claude Code via `.mcp.json` in the platform root,
+and Claude Desktop via
 `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json

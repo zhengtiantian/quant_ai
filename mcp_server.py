@@ -123,6 +123,48 @@ def get_news_sentiment(symbol: str, days: int = 90) -> str:
 
 
 @mcp.tool()
+def search_news(
+    query: str = "",
+    symbol: str = "",
+    from_date: str = "",
+    to_date: str = "",
+    limit: int = 20,
+) -> str:
+    """Search the 845K LLM-labeled news articles and read them.
+
+    Every other tool here returns an aggregate. This one returns the articles behind
+    those numbers: headline, date, a bounded excerpt, the merged sentiment label, how
+    much the two labeling models disagreed, the event type, and the source URL. Use it
+    when an aggregate is not enough — to find out *why* sentiment moved, what happened
+    around a specific date, or whether an average rests on three articles or three
+    thousand.
+
+    Results are ranked by relevance, with headline matches weighted 10x over body
+    mentions. Leave `query` empty to list a symbol's coverage by date instead.
+
+    Note that multi-word queries match ANY of the words, so broad terms return many
+    hits and take about a second; specific terms are near-instant.
+
+    Args:
+        query: Keywords, e.g. "chip shortage". Empty lists recent articles by date.
+        symbol: Optional ticker filter, e.g. AMD.
+        from_date: Optional inclusive start, YYYYMMDD or YYYY-MM-DD.
+        to_date: Optional inclusive end, same format.
+        limit: How many articles to return (default 20, capped at 50).
+    """
+    params: dict[str, Any] = {"limit": limit}
+    if query.strip():
+        params["q"] = query.strip()
+    if symbol.strip():
+        params["symbol"] = symbol.upper().strip()
+    if from_date.strip():
+        params["from"] = from_date.strip()
+    if to_date.strip():
+        params["to"] = to_date.strip()
+    return _get("/api/news/search", params) or _unavailable("/api/news/search")
+
+
+@mcp.tool()
 def get_stock_features(symbol: str) -> str:
     """Latest engineered daily features for a stock symbol.
 
