@@ -62,8 +62,21 @@ NAMESPACE = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")
 
 
 def dedupe_key(doc) -> str:
-    raw = f"{doc.get('symbol','')}\x00{doc.get('title','')}\x00{doc.get('date','')}"
+    """Identity of one story. The date is normalised to YYYYMMDD first.
+
+    Keying on the raw `date` was wrong and cost 13,027 redundant points (1.79% of the
+    index): the field carries both YYYYMMDD and YYYYMMDDHHMMSS, so the same story
+    filed under both forms produced two keys. Third time this dual format has caused a
+    defect -- after the null `date_int` and the feature-layer dedupe -- which is the
+    argument for normalising at every boundary rather than remembering to.
+    """
+    raw = f"{doc.get('symbol','')}\x00{doc.get('title','')}\x00{to_date8(doc.get('date'))}"
     return hashlib.blake2b(raw.encode("utf-8", "replace"), digest_size=16).hexdigest()
+
+
+def to_date8(v) -> str:
+    s = str(v or "").strip()
+    return s[:8] if len(s) >= 8 and s[:8].isdigit() else ""
 
 
 def build_text(doc) -> str | None:
