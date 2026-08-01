@@ -43,9 +43,37 @@ QUANT_API = os.getenv("QUANT_API", "http://quant_api:8081").strip()
 KNOWLEDGE_PATHS = os.getenv("KNOWLEDGE_PATHS", "/app/knowledge").strip()
 LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://host.docker.internal:1234/v1").strip()
 
+LOCAL_MONGO_URI = os.getenv(
+    "LOCAL_MONGO_URI", "mongodb://root:root@localhost:37018/?authSource=admin"
+).strip()
+
 _LM_STUDIO_HEADERS = {"Authorization": "Bearer lm-studio", "Content-Type": "application/json"}
 
 print(f"[Config] LM Studio={LM_STUDIO_URL}  model={LOCAL_MODEL_NAME}  embed={EMBED_MODEL}")
+
+_news_coll = None
+
+
+def _news_collection():
+    """Mongo handle for R.10's news RAG, opened once and reused.
+
+    Returns None rather than raising when mongo is unreachable, so the endpoint can
+    report the corpus as unavailable instead of 500-ing — the same reasoning as the
+    quote-service fallback: an honest "unavailable" beats an opaque failure.
+    """
+    global _news_coll
+    if _news_coll is not None:
+        return _news_coll
+    try:
+        from pymongo import MongoClient
+
+        client = MongoClient(LOCAL_MONGO_URI, serverSelectionTimeoutMS=5000)
+        client.admin.command("ping")
+        _news_coll = client["quant_data"]["news_articles_company_matched_v2"]
+        return _news_coll
+    except Exception as e:  # noqa: BLE001 — any connection failure is the same answer here
+        print(f"[news_rag] mongo unavailable: {e}")
+        return None
 
 
 def _resolve_model_id(name_hint: str) -> str:
@@ -254,6 +282,14 @@ class AgentRequest(BaseModel):
     max_steps: int = 5
 
 
+class NewsQueryRequest(BaseModel):
+    question: str
+    symbol: Optional[str] = None
+    since: Optional[int] = None   # YYYYMMDD
+    until: Optional[int] = None   # YYYYMMDD
+    k: int = 8
+
+
 class WorkflowSpecRequest(BaseModel):
     prompt: str
     strategyId: str
@@ -311,6 +347,34 @@ def ask(request: QueryRequest):
         llm = get_chat_llm(temperature=0.7)
         answer = llm.invoke([HumanMessage(content=prompt)]).content
         return {"answer": answer, "elapsed_s": round(time.time() - start, 2)}
+    except Exception as e:
+        traceback.print_exc()
+        return {"error": str(e)}
+
+
+@app.post("/api/ask/news")
+def ask_news(request: NewsQueryRequest):
+    """R.10 — answer from the 716K-article news corpus, with checkable citations.
+
+    Separate from /api/ask rather than replacing it: the knowledge folder answers
+    "how does the regime scorer weight factors" and the news corpus answers "what
+    happened to NVDA on export controls". Different corpora, different questions.
+    """
+    try:
+        from news_rag import answer_from_news
+
+        coll = _news_collection()
+        if coll is None:
+            return {"error": "news corpus unavailable (mongo unreachable)"}
+        return answer_from_news(
+            request.question,
+            llm=get_chat_llm(temperature=0.2),
+            coll=coll,
+            symbol=request.symbol,
+            since=request.since,
+            until=request.until,
+            k=max(1, min(request.k, 20)),
+        )
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}

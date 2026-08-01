@@ -79,6 +79,7 @@ class Hit:
     date: str | None
     title: str | None
     url: str | None
+    mongo_id: str | None = None   # primary key, so bodies are fetched by _id not by title
     dense_rank: int | None = None
     sparse_rank: int | None = None
     dense_score: float | None = None
@@ -128,6 +129,7 @@ def dense_leg(qc, query, symbol, since, until, limit) -> list[Hit]:
             key=_key(pl.get("symbol"), pl.get("title"), pl.get("date")),
             symbol=pl.get("symbol"), date=_norm_date(pl.get("date")),
             title=pl.get("title"), url=pl.get("url"),
+            mongo_id=pl.get("mongo_id"),
             dense_rank=rank, dense_score=float(p.score),
         ))
     return out
@@ -138,24 +140,42 @@ def sparse_leg(coll, query, symbol, since, until, limit) -> list[Hit]:
     if symbol:
         q["symbol"] = symbol
 
-    # Over-fetch, then deduplicate to the same identity the dense index already has.
-    # Without this a syndicated story consumes its full copy count of candidate slots
-    # and the sparse leg is crippled by a data problem rather than a retrieval one.
+    # The date window goes into the query, not into a Python loop afterwards.
+    #
+    # Filtering after the fact made the two legs asymmetric: qdrant filters inside the
+    # search, so it returns the best `limit` results *within* the window, while a
+    # post-hoc filter returns whichever of the best results across all history happen
+    # to land in it. On one NVDA query that was 37 hits instead of 100, and the 37 were
+    # the wrong 37. That corrupts R.4's numbers invisibly -- the sparse leg looks worse
+    # than it is, and hybrid inherits the damage.
+    #
+    # `date` is a string in two formats, YYYYMMDD and YYYYMMDDHHMMSS. Lexicographic
+    # order matches chronological order for both, and "20221001120000" sorts after
+    # "20221001" and before "20230701", so a plain string range is correct for the
+    # mixed field and can still use the (symbol, date) index.
+    if since is not None or until is not None:
+        rng: dict = {}
+        if since is not None:
+            rng["$gte"] = str(since)
+        if until is not None:
+            rng["$lt"] = str(until + 1)   # +1 day-number keeps the whole `until` day
+        q["date"] = rng
+
+    # Over-fetch, then deduplicate to the identity the dense index already has: without
+    # it a syndicated story consumes its full copy count of candidate slots and the
+    # sparse leg is crippled by a data problem rather than a retrieval one. 3x covers
+    # the measured 16% duplicate rate with room to spare.
     cursor = (
-        coll.find(q, {"symbol": 1, "title": 1, "date": 1, "url": 1,
+        coll.find(q, {"symbol": 1, "title": 1, "date": 1, "url": 1, "_id": 1,
                       "score": {"$meta": "textScore"}})
         .sort([("score", {"$meta": "textScore"})])
-        .limit(limit * 8)
+        .limit(limit * 3)
     )
 
     seen: set[str] = set()
     out: list[Hit] = []
     for doc in cursor:
         d = _norm_date(doc.get("date"))
-        if since and (not d or int(d) < since):
-            continue
-        if until and (not d or int(d) > until):
-            continue
         k = _key(doc.get("symbol"), doc.get("title"), doc.get("date"))
         if k in seen:
             continue
@@ -163,6 +183,7 @@ def sparse_leg(coll, query, symbol, since, until, limit) -> list[Hit]:
         out.append(Hit(
             key=k, symbol=doc.get("symbol"), date=d,
             title=doc.get("title"), url=doc.get("url"),
+            mongo_id=str(doc["_id"]),
             sparse_rank=len(out) + 1, sparse_score=float(doc.get("score", 0.0)),
         ))
         if len(out) >= limit:
@@ -198,7 +219,10 @@ def rrf_fuse(dense: list[Hit], sparse: list[Hit], k: int,
             cur = merged.get(h.key)
             if cur is None:
                 cur = merged[h.key] = Hit(key=h.key, symbol=h.symbol, date=h.date,
-                                          title=h.title, url=h.url)
+                                          title=h.title, url=h.url,
+                                          mongo_id=h.mongo_id)
+            elif cur.mongo_id is None:
+                cur.mongo_id = h.mongo_id
             if leg_name == "dense":
                 cur.dense_rank, cur.dense_score = h.dense_rank, h.dense_score
             else:
