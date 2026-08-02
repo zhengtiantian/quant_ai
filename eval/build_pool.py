@@ -41,7 +41,12 @@ from qdrant_client import QdrantClient  # noqa: E402
 QUERIES = Path(__file__).with_name("retrieval_queries.yaml")
 POOL_COLL = "eval_retrieval_pool"
 RUNS_COLL = "eval_retrieval_runs"
-POOL_DEPTH = int(os.getenv("POOL_DEPTH", "30"))
+# 15, not 30. The metrics are recall@10, MRR and nDCG@10, so what matters is that
+# **every document any system ranks in its own top-10 gets judged** -- depth 15
+# guarantees that with room to spare, while depth 30 nearly halves the judging effort
+# for items that will not enter any top-10 and therefore cannot move a single metric.
+# It does widen pool bias slightly, which is stated in the writeup either way.
+POOL_DEPTH = int(os.getenv("POOL_DEPTH", "15"))
 EXCERPT = 600
 
 # The four systems under comparison. K=60/depth 100 is the published RRF default;
