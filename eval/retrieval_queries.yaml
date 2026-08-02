@@ -1,0 +1,261 @@
+# R.4 — labelled query set for retrieval evaluation.
+#
+# Written by hand rather than generated, and grouped by the *retrieval challenge* each
+# query poses rather than by topic. Grouping this way is the point: an aggregate
+# recall@10 hides that sparse wins on tickers and dense wins on paraphrase, and the
+# whole argument for hybrid rests on that split. A query set organised by topic could
+# not show it.
+#
+# challenge:
+#   paraphrase  — deliberately shares no distinctive term with how articles phrase it,
+#                 so lexical matching should fail and only semantics can succeed
+#   literal     — a ticker, product or person; a token with no useful embedding
+#                 neighbourhood, where dense retrieval should struggle
+#   event       — a named corporate event; both legs should do reasonably
+#   thematic    — a theme spanning several companies, where the answer is not one
+#                 article and no single company name appears in the query
+#   temporal    — same as event but with a date window, to exercise filter symmetry
+#
+# `symbol` / `since` / `until` are passed to the retriever, so they define the task, not
+# a hint. Leaving symbol empty means the retriever must find the companies itself.
+
+queries:
+  # ---------- paraphrase: lexical matching should fail here ----------
+  - id: p01
+    query: memory glut pressures chip makers
+    challenge: paraphrase
+    note: articles say "DRAM oversupply", "memory prices fall", rarely "glut"
+
+  - id: p02
+    query: carmaker slashes sticker prices to move inventory
+    challenge: paraphrase
+
+  - id: p03
+    query: streaming service loses subscribers for the first time
+    challenge: paraphrase
+
+  - id: p04
+    query: planemaker under scrutiny after mid-air incident
+    challenge: paraphrase
+
+  - id: p05
+    query: drugmaker's shot wins clearance from health regulators
+    challenge: paraphrase
+
+  - id: p06
+    query: search giant accused of stifling rivals
+    challenge: paraphrase
+
+  - id: p07
+    query: cloud division growth cools as customers tighten budgets
+    challenge: paraphrase
+
+  - id: p08
+    query: handset maker faces sluggish demand in greater China
+    challenge: paraphrase
+
+  - id: p09
+    query: coffee chain workers move to organise
+    challenge: paraphrase
+
+  - id: p10
+    query: bank sets aside more money for souring loans
+    challenge: paraphrase
+
+  # ---------- literal: dense retrieval has no useful neighbourhood ----------
+  - id: l01
+    query: LRCX
+    challenge: literal
+  - id: l02
+    query: H100
+    challenge: literal
+  - id: l03
+    query: Vision Pro
+    challenge: literal
+  - id: l04
+    query: 737 MAX 9
+    challenge: literal
+  - id: l05
+    query: Paxlovid
+    challenge: literal
+  - id: l06
+    query: Cybertruck
+    challenge: literal
+  - id: l07
+    query: Lisa Su
+    challenge: literal
+  - id: l08
+    query: Bard Gemini
+    challenge: literal
+  - id: l09
+    query: Mounjaro
+    challenge: literal
+  - id: l10
+    query: Blackwell
+    challenge: literal
+
+  # ---------- event: named corporate events ----------
+  - id: e01
+    query: Nvidia quarterly earnings beat expectations
+    symbol: NVDA
+    challenge: event
+  - id: e02
+    query: Micron issues weak guidance
+    symbol: MU
+    challenge: event
+  - id: e03
+    query: Boeing CEO steps down
+    symbol: BA
+    challenge: event
+  - id: e04
+    query: Apple announces share buyback and dividend increase
+    symbol: AAPL
+    challenge: event
+  - id: e05
+    query: Tesla vehicle recall over safety defect
+    symbol: TSLA
+    challenge: event
+  - id: e06
+    query: Microsoft acquisition of a gaming company
+    symbol: MSFT
+    challenge: event
+  - id: e07
+    query: Netflix password sharing crackdown
+    symbol: NFLX
+    challenge: event
+  - id: e08
+    query: Pfizer vaccine trial results
+    symbol: PFE
+    challenge: event
+  - id: e09
+    query: Intel foundry business losses
+    symbol: INTC
+    challenge: event
+  - id: e10
+    query: Disney activist investor proxy fight
+    symbol: DIS
+    challenge: event
+  - id: e11
+    query: Uber achieves first profitable quarter
+    symbol: UBER
+    challenge: event
+  - id: e12
+    query: Moderna revenue decline as COVID demand fades
+    symbol: MRNA
+    challenge: event
+  - id: e13
+    query: Starbucks same-store sales miss
+    symbol: SBUX
+    challenge: event
+  - id: e14
+    query: Adobe deal blocked by regulators
+    symbol: ADBE
+    challenge: event
+  - id: e15
+    query: Coinbase regulatory action from the SEC
+    symbol: COIN
+    challenge: event
+
+  # ---------- thematic: spans companies, no company named ----------
+  - id: t01
+    query: US export controls restricting advanced chip sales to China
+    challenge: thematic
+  - id: t02
+    query: AI data centre capital expenditure guidance raised
+    challenge: thematic
+  - id: t03
+    query: GLP-1 weight loss drug competition
+    challenge: thematic
+  - id: t04
+    query: antitrust regulators open investigations into big tech
+    challenge: thematic
+  - id: t05
+    query: supply chain disruption at contract manufacturers
+    challenge: thematic
+  - id: t06
+    query: layoffs across the technology sector
+    challenge: thematic
+  - id: t07
+    query: rising interest rates pressure consumer spending
+    challenge: thematic
+  - id: t08
+    query: semiconductor manufacturing moving to the United States
+    challenge: thematic
+  - id: t09
+    query: streaming profitability push and price increases
+    challenge: thematic
+  - id: t10
+    query: electric vehicle price war margins
+    challenge: thematic
+  - id: t11
+    query: generative AI product launches by incumbents
+    challenge: thematic
+  - id: t12
+    query: pharmaceutical patent expiry and generic competition
+    challenge: thematic
+  - id: t13
+    query: cybersecurity breach disclosed by a large enterprise
+    challenge: thematic
+  - id: t14
+    query: airline and aerospace supply quality problems
+    challenge: thematic
+  - id: t15
+    query: memory chip pricing cycle turns
+    challenge: thematic
+
+  # ---------- temporal: same shape, but the window defines the task ----------
+  - id: d01
+    query: Nvidia China export restrictions
+    symbol: NVDA
+    since: 20221001
+    until: 20230630
+    challenge: temporal
+  - id: d02
+    query: Micron guidance investor reaction
+    symbol: MU
+    since: 20180101
+    until: 20191231
+    challenge: temporal
+  - id: d03
+    query: Boeing safety crisis
+    symbol: BA
+    since: 20240101
+    until: 20241231
+    challenge: temporal
+  - id: d04
+    query: COVID vaccine rollout
+    since: 20201001
+    until: 20210630
+    challenge: temporal
+  - id: d05
+    query: technology sector layoffs
+    since: 20221101
+    until: 20230430
+    challenge: temporal
+  - id: d06
+    query: bank failures and deposit flight
+    since: 20230301
+    until: 20230630
+    challenge: temporal
+  - id: d07
+    query: ChatGPT and the response from large technology companies
+    since: 20221201
+    until: 20230630
+    challenge: temporal
+  - id: d08
+    query: chip shortage affecting car production
+    since: 20210101
+    until: 20211231
+    challenge: temporal
+  - id: d09
+    query: Tesla deliveries miss estimates
+    symbol: TSLA
+    since: 20220101
+    until: 20221231
+    challenge: temporal
+  - id: d10
+    query: Apple services revenue growth
+    symbol: AAPL
+    since: 20230101
+    until: 20231231
+    challenge: temporal

@@ -79,7 +79,7 @@ def _fetch_bodies(hits, coll) -> dict:
         return {}
     cursor = coll.find(
         {"_id": {"$in": ids}},
-        {"content": 1, "url": 1, "date": 1, "llm_sentiment_final": 1, "llm_event_type": 1},
+        {"content": 1, "url": 1, "date": 1, "llm_sentiment_final": 1, "llm_event_type_a": 1},
     )
     return {str(d["_id"]): d for d in cursor}
 
@@ -101,7 +101,7 @@ def build_context(hits, coll) -> tuple[str, list[dict]]:
             "date": h.date,
             "title": h.title,
             "url": doc.get("url") or h.url,
-            "event_type": doc.get("llm_event_type"),
+            "event_type": doc.get("llm_event_type_a"),
             "sentiment": doc.get("llm_sentiment_final"),
             "dense_rank": h.dense_rank,
             "sparse_rank": h.sparse_rank,

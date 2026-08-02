@@ -173,7 +173,7 @@ def main() -> None:
     cursor = coll.find(
         query,
         {"title": 1, "content": 1, "symbol": 1, "date": 1,
-         "llm_event_type": 1, "llm_sentiment_final": 1, "url": 1},
+         "llm_event_type_a": 1, "llm_sentiment_final": 1, "url": 1},
     ).sort("_id", ASCENDING).batch_size(MONGO_BATCH)
 
     n_read = n_dupe = n_empty = n_indexed = 0
@@ -198,7 +198,7 @@ def main() -> None:
                         "date_int": to_int_date(doc.get("date")),
                         "title": doc.get("title"),
                         "url": doc.get("url"),
-                        "event_type": doc.get("llm_event_type"),
+                        "event_type": doc.get("llm_event_type_a"),
                         "sentiment": doc.get("llm_sentiment_final"),
                     },
                 )
