@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import time
 from typing import Any
 
 import requests
@@ -312,6 +313,151 @@ def get_performance() -> str:
 def list_symbols() -> str:
     """List every stock symbol covered by the platform's universe."""
     return _get("/api/market/symbols") or _unavailable("/api/market/symbols")
+
+
+# =====================================================================
+# R.4 — relevance judging.
+#
+# These two tools exist so that judgments come from clients the retriever's author
+# does not control. Whoever tuned the retriever should not also decide what counts
+# as relevant, and "I labelled it myself" is the answer that collapses under one
+# follow-up question. Running the same tool contract against two unrelated clients
+# (Claude Desktop and Codex) gives two independent judges, which in turn gives an
+# inter-annotator agreement figure -- a claim about the *labels*, not just the system.
+#
+# submit_judgment is this server's first tool that writes. Everything before it was
+# read-only, so nothing had to think about idempotency or partial batches.
+# =====================================================================
+
+_LABELS = {
+    "relevant": "directly answers or is squarely about the query",
+    "partial": "related and useful context, but does not answer it",
+    "not_relevant": "off-topic, or only shares words with the query",
+}
+JUDGE_BATCH_MAX = 25
+
+
+@mcp.tool()
+def get_eval_batch(judge_id: str, limit: int = 10) -> str:
+    """Fetch news articles to judge for relevance against a search query (R.4).
+
+    Returns items this judge has not yet judged. Each carries a query and one article;
+    decide whether that article is a good search result for that query.
+
+    Deliberately withheld: the rank the article was given, and which retrieval system
+    found it. Judging is about the article and the query only — knowing that something
+    was "the vector search's top hit" would bias the answer, and the whole purpose of
+    these labels is to compare those systems fairly afterwards.
+
+    Label each item with exactly one of:
+      relevant     — directly answers or is squarely about the query
+      partial      — related and useful context, but does not answer it
+      not_relevant — off-topic, or merely shares words with the query
+
+    Judge the query as written. Several queries deliberately avoid the words an article
+    would use, because that is what they are testing; an article that answers the
+    question in different words is still relevant.
+
+    Args:
+        judge_id: A stable name for you, e.g. "claude-desktop" or "codex". Used to keep
+            each judge's labels separate so their agreement can be measured.
+        limit: How many items to return, 1-25.
+    """
+    limit = max(1, min(int(limit), JUDGE_BATCH_MAX))
+    jid = (judge_id or "").strip()
+    if not jid:
+        return "judge_id is required — use a stable name such as 'claude-desktop'."
+
+    try:
+        db = _db()
+        done = {
+            d["doc_key"] + "\x00" + d["query_id"]
+            for d in db["eval_retrieval_judgments"].find(
+                {"judge_id": jid}, {"doc_key": 1, "query_id": 1, "_id": 0}
+            )
+        }
+        items, remaining = [], 0
+        for d in db["eval_retrieval_pool"].find(
+            {}, {"_id": 0, "query_id": 1, "query": 1, "doc_key": 1,
+                 "symbol": 1, "date": 1, "title": 1, "excerpt": 1}
+        ):
+            if d["doc_key"] + "\x00" + d["query_id"] in done:
+                continue
+            remaining += 1
+            if len(items) < limit:
+                items.append(d)
+        if not items:
+            return json.dumps({"items": [], "remaining": 0,
+                               "message": f"{jid} has judged everything."}, indent=2)
+        return json.dumps({"items": items, "remaining": remaining,
+                           "labels": _LABELS}, indent=2, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        return f"Could not read the evaluation pool: {type(e).__name__}: {e}"
+
+
+@mcp.tool()
+def submit_judgment(judge_id: str, judgments: str) -> str:
+    """Submit relevance labels produced from get_eval_batch (R.4).
+
+    Args:
+        judge_id: The same stable name used with get_eval_batch.
+        judgments: JSON list of objects, each
+            {"query_id": "...", "doc_key": "...", "label": "relevant|partial|not_relevant",
+             "why": "one short clause"}
+            `why` is optional but is what makes a disagreement resolvable later.
+
+    Re-submitting the same (judge_id, query_id, doc_key) overwrites rather than
+    duplicating, so a retry after a dropped connection is safe and cannot inflate one
+    judge's contribution. Rejected items are reported individually and the valid ones in
+    the same call are still written — a single malformed entry should not discard the
+    other twenty-four.
+    """
+    jid = (judge_id or "").strip()
+    if not jid:
+        return "judge_id is required."
+    try:
+        rows = json.loads(judgments)
+        if isinstance(rows, dict):
+            rows = [rows]
+    except json.JSONDecodeError as e:
+        return f"judgments must be a JSON list: {e}"
+    if not isinstance(rows, list):
+        return "judgments must be a JSON list of objects."
+
+    try:
+        from pymongo import UpdateOne
+        coll = _db()["eval_retrieval_judgments"]
+        coll.create_index([("judge_id", 1), ("query_id", 1), ("doc_key", 1)], unique=True)
+
+        ops, rejected = [], []
+        for i, r in enumerate(rows):
+            if not isinstance(r, dict):
+                rejected.append(f"[{i}] not an object")
+                continue
+            qid, dkey, label = r.get("query_id"), r.get("doc_key"), r.get("label")
+            if not qid or not dkey:
+                rejected.append(f"[{i}] missing query_id or doc_key")
+                continue
+            if label not in _LABELS:
+                rejected.append(f"[{i}] label {label!r} not one of {sorted(_LABELS)}")
+                continue
+            ops.append(UpdateOne(
+                {"judge_id": jid, "query_id": qid, "doc_key": dkey},
+                {"$set": {"label": label, "why": str(r.get("why", ""))[:300],
+                          "ts": time.time()}},
+                upsert=True,
+            ))
+        written = 0
+        if ops:
+            res = coll.bulk_write(ops, ordered=False)
+            written = res.upserted_count + res.modified_count
+        total = coll.count_documents({"judge_id": jid})
+        return json.dumps({
+            "accepted": len(ops), "written": written, "rejected": rejected,
+            "total_for_judge": total,
+        }, indent=2)
+    except Exception as e:  # noqa: BLE001
+        return f"Could not write judgments: {type(e).__name__}: {e}"
 
 
 if __name__ == "__main__":
