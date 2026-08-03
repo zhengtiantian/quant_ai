@@ -7,4 +7,9 @@ export QUANT_API="http://localhost:18081"
 export KNOWLEDGE_PATHS="$(pwd)/knowledge"
 export PORT=18000
 
+# R.5 phase 1b — service credentials for quant_api, kept out of this file on purpose.
+# .env is gitignored; without it the service simply calls quant_api anonymously, which
+# still works while the API permits all requests.
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+
 exec .venv/bin/python3 main.py

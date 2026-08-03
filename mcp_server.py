@@ -49,6 +49,21 @@ def _db():
     return _mongo_client[DB_NAME]
 
 
+def _auth_headers() -> dict[str, str]:
+    """Service credentials for quant_api, when they are configured (R.5 phase 1b).
+
+    Imported lazily and tolerantly: this server is also the tool surface for Claude
+    Desktop and Codex, and a missing optional module should not stop ten working tools
+    from loading. While quant_api still permits all requests, no header simply means the
+    call is anonymous — the same as before this existed.
+    """
+    try:
+        from service_auth import auth_headers
+    except ImportError:
+        return {}
+    return auth_headers()
+
+
 def _get(path: str, params: dict[str, Any] | None = None) -> str | None:
     """GET from quant_api.
 
@@ -61,7 +76,10 @@ def _get(path: str, params: dict[str, Any] | None = None) -> str | None:
     running?" would send the model chasing an outage that is not happening.
     """
     try:
-        resp = requests.get(f"{QUANT_API}{path}", params=params, timeout=TIMEOUT)
+        resp = requests.get(
+            f"{QUANT_API}{path}", params=params, timeout=TIMEOUT,
+            headers=_auth_headers(),
+        )
     except requests.RequestException:
         return None
     if resp.status_code >= 500:

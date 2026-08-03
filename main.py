@@ -51,6 +51,20 @@ _LM_STUDIO_HEADERS = {"Authorization": "Bearer lm-studio", "Content-Type": "appl
 
 print(f"[Config] LM Studio={LM_STUDIO_URL}  model={LOCAL_MODEL_NAME}  embed={EMBED_MODEL}")
 
+
+def _service_headers() -> dict:
+    """Service credentials for quant_api calls (R.5 phase 1b).
+
+    Tolerant of the module being absent so the app still starts; while the API permits
+    all requests, no header simply means the call is anonymous, as it was before.
+    """
+    try:
+        from service_auth import auth_headers
+    except ImportError:
+        return {}
+    return auth_headers()
+
+
 _news_coll = None
 
 
@@ -246,7 +260,8 @@ def retrieve_context(query: str, top_k: int = 4) -> str:
 # =====================================================
 def fetch_latest_signals(limit: int = 10) -> str:
     try:
-        resp = requests.get(f"{QUANT_API}/api/signals/latest", params={"limit": limit}, timeout=5)
+        resp = requests.get(f"{QUANT_API}/api/signals/latest", params={"limit": limit},
+                            timeout=5, headers=_service_headers())
         data = resp.json()
         signals = data.get("signals", data) if isinstance(data, dict) else data
         return json.dumps(signals[:limit], ensure_ascii=False, default=str)
@@ -256,7 +271,8 @@ def fetch_latest_signals(limit: int = 10) -> str:
 
 def fetch_positions() -> str:
     try:
-        resp = requests.get(f"{QUANT_API}/api/positions", timeout=5)
+        resp = requests.get(f"{QUANT_API}/api/positions", timeout=5,
+                            headers=_service_headers())
         return json.dumps(resp.json(), ensure_ascii=False, default=str)
     except Exception as e:
         return f"Error fetching positions: {e}"
@@ -264,7 +280,8 @@ def fetch_positions() -> str:
 
 def fetch_performance() -> str:
     try:
-        resp = requests.get(f"{QUANT_API}/api/performance", timeout=5)
+        resp = requests.get(f"{QUANT_API}/api/performance", timeout=5,
+                            headers=_service_headers())
         return json.dumps(resp.json(), ensure_ascii=False, default=str)
     except Exception as e:
         return f"Error fetching performance: {e}"
