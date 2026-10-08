@@ -241,7 +241,8 @@ def main() -> None:
                 break
 
         flush()
-        save_checkpoint(doc["_id"], seen)
+        if n_read:  # nothing new since the last checkpoint -> keep it as is
+            save_checkpoint(doc["_id"], seen)
     except KeyboardInterrupt:
         flush()
         print("\ninterrupted; checkpoint saved, re-run to resume")
