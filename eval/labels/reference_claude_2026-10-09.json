@@ -1,0 +1,902 @@
+[
+{
+"query_id": "p07",
+"doc_key": "CRWD\u0000Google Cloud and CrowdStrike Extend Partnership to Deliver Customers Security Across Hybrid Cloud Environments | #site_titleGoogle Cloud and CrowdStrike Extend Partnership to Deliver Customers Security Across Hybrid Cloud Environments\u000020210511",
+"challenge": "paraphrase",
+"grade": 0
+},
+{
+"query_id": "p07",
+"doc_key": "AMZN\u0000Massive Growth Report on Cloud Computing for Business Operations Market 2019-2025 with Major Key Player: Amazon Web Services, Microsoft Azure, Google Cloud Platform, IBM Cloud, Red Hat, Adobe Cloud &\u000020190527",
+"challenge": "paraphrase",
+"grade": 0
+},
+{
+"query_id": "p08",
+"doc_key": "NVDA\u0000NVIDIA’s H20 AI Accelerators Are Reportedly Facing A Shortage In China, Amid The Massive Demand Prompted Due To DeepSeek\u000020250315",
+"challenge": "paraphrase",
+"grade": 0
+},
+{
+"query_id": "p02",
+"doc_key": "CAT\u0000Caterpillar Q1 sales rise as dealers boost inventory levels\u000020210429",
+"challenge": "paraphrase",
+"grade": 0
+},
+{
+"query_id": "p07",
+"doc_key": "NVDA\u0000Is Nvidia's Increasing Reliance on \"Customer A\" and \"Customer B\" a Red Flag for the AI Growth Stock?\u000020250907",
+"challenge": "paraphrase",
+"grade": 0
+},
+{
+"query_id": "p02",
+"doc_key": "AMD\u0000AMD Ryzen Official Release Date, News, Price & Features: Intel Slash Prices Ahead of Ryzen Launch\u000020170306",
+"challenge": "paraphrase",
+"grade": 0
+},
+{
+"query_id": "p08",
+"doc_key": "ADI\u0000IDT Appoints Andy Lai as Vice President of Sales, Greater China and South Asia Pacific, and Country Manager for China\u000020170628",
+"challenge": "paraphrase",
+"grade": 0
+},
+{
+"query_id": "p09",
+"doc_key": "AAPL\u0000Tim Cook responds to claims of factory worker mistreatment: “We care about every worker in our supply chain”\u000020180513",
+"challenge": "paraphrase",
+"grade": 0
+},
+{
+"query_id": "p08",
+"doc_key": "AAPL\u0000Huawei knocks off Apple to become No. 2 phone seller\u000020180913",
+"challenge": "paraphrase",
+"grade": 1
+},
+{
+"query_id": "p04",
+"doc_key": "NKE\u0000Air Jordan 1 Mid SE Newspaper Air Times 852542-061 Release Date\u000020190816",
+"challenge": "paraphrase",
+"grade": 0
+},
+{
+"query_id": "p01",
+"doc_key": "AAPL\u0000iPhone chip maker TSMC also eyeing Toshiba’s flash memory business\u000020170302",
+"challenge": "paraphrase",
+"grade": 0
+},
+{
+"query_id": "p01",
+"doc_key": "ARM\u0000Micron touts $22 billion in deals for memory chips\u000020260625",
+"challenge": "paraphrase",
+"grade": 1
+},
+{
+"query_id": "p09",
+"doc_key": "SBUX\u0000A Starbucks worker of nearly 20 years says the chain has gone from 'quirky coffee shop' to 'soulless fast-food empire'\u000020240903",
+"challenge": "paraphrase",
+"grade": 1
+},
+{
+"query_id": "p01",
+"doc_key": "TSM\u0000Taiwanese Chipmaker Facing Pressure To Produce Chips In US - Taiwan Semiconductor (NYSE:TSM)\u000020200515",
+"challenge": "paraphrase",
+"grade": 0
+},
+{
+"query_id": "p06",
+"doc_key": "GOOGL\u0000'This Is The First Time In Two Decades That Google Is Extremely Vulnerable:' Perplexity's CEO Breaks Down Search Giant's Margin Trap\u000020250714",
+"challenge": "paraphrase",
+"grade": 1
+},
+{
+"query_id": "p01",
+"doc_key": "TSM\u0000Taiwanese Chipmaker Facing Pressure To Produce Chips In US - Taiwan Semiconductor (NYSE:TSM)\u000020200116",
+"challenge": "paraphrase",
+"grade": 0
+},
+{
+"query_id": "p09",
+"doc_key": "SBUX\u0000Wisconsin Starbucks workers optimistic as labor spotlight put on coffee chain giant\u000020230329",
+"challenge": "paraphrase",
+"grade": 2
+},
+{
+"query_id": "p06",
+"doc_key": "MSFT\u0000ChatGPT maker is set to reveal a new search product to rival Google in the next few days, report says\u000020240510",
+"challenge": "paraphrase",
+"grade": 1
+},
+{
+"query_id": "p01",
+"doc_key": "AMAT\u0000TD Cowen Says This Memory Chip Maker Is One of the Best Stocks to Buy for 2026\u000020251207",
+"challenge": "paraphrase",
+"grade": 1
+},
+{
+"query_id": "p05",
+"doc_key": "MRNA\u0000Why Moderna Stock Jumped Today\u000020211124",
+"challenge": "paraphrase",
+"grade": 2
+},
+{
+"query_id": "p04",
+"doc_key": "BA\u0000US FAA Investigating Boeing 737 Max 9 After Mid-Air Panel Incident\u000020240112",
+"challenge": "paraphrase",
+"grade": 2
+},
+{
+"query_id": "p09",
+"doc_key": "SBUX\u0000Starbucks Workers United scores first-ever union win at big coffee chain\u000020211210",
+"challenge": "paraphrase",
+"grade": 2
+},
+{
+"query_id": "p06",
+"doc_key": "AAPL\u0000U.S. hits Apple with landmark antitrust suit, accusing tech giant of stifling competition\u000020240322",
+"challenge": "paraphrase",
+"grade": 1
+},
+{
+"query_id": "p03",
+"doc_key": "NFLX\u0000For the first time in a decade, Netflix loses subscribers... 2,00,000 in less than 100 days\u000020220420",
+"challenge": "paraphrase",
+"grade": 2
+},
+{
+"query_id": "p09",
+"doc_key": "SBUX\u0000Starbucks Workers United seeks to enlist more customers in unionization drive\u000020230117",
+"challenge": "paraphrase",
+"grade": 2
+},
+{
+"query_id": "p03",
+"doc_key": "NFLX\u0000Netflix shares drop 25pc after losing subscribers for first time in a decade\u000020220420",
+"challenge": "paraphrase",
+"grade": 2
+},
+{
+"query_id": "p09",
+"doc_key": "SBUX\u0000Starbucks union baristas walk out on Red Cup Day in push for contract talks\u000020251114",
+"challenge": "paraphrase",
+"grade": 2
+},
+{
+"query_id": "p03",
+"doc_key": "NFLX\u0000Netflix shares drop 25% after service loses 200,000 subscribers\u000020220420",
+"challenge": "paraphrase",
+"grade": 2
+},
+{
+"query_id": "p09",
+"doc_key": "SBUX\u0000Vestal Starbucks becomes latest in coffee chain to unionize\u000020220825",
+"challenge": "paraphrase",
+"grade": 2
+},
+{
+"query_id": "p04",
+"doc_key": "BA\u0000Mid-air blowout puts Boeing back in the hot seat\u000020240107",
+"challenge": "paraphrase",
+"grade": 2
+},
+{
+"query_id": "l10",
+"doc_key": "NVDA\u0000Nvidia launches Blackwell GPU architecture\u000020250303",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l06",
+"doc_key": "TSLA\u0000Cybertruck: Latest News, Videos and Photos of Cybertruck\u000020250501",
+"challenge": "literal",
+"grade": 1
+},
+{
+"query_id": "l06",
+"doc_key": "TSLA\u0000LEGO Cybertruck, Cybertruck Sporks, & A Cybertruck Snapchat Filter\u000020200128",
+"challenge": "literal",
+"grade": 1
+},
+{
+"query_id": "l06",
+"doc_key": "TSLA\u0000DIY Tesla Cybertruck With Cardboard, + Cybertruck Updates\u000020201121",
+"challenge": "literal",
+"grade": 1
+},
+{
+"query_id": "l09",
+"doc_key": "LLY\u0000Mounjaro weight loss injection coming to Israel\u000020240821",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l02",
+"doc_key": "NVDA\u0000Nvidia’s H200 GPU To One-Up H100 With 141GB Of HBM3e As Memory Race Heats Up\u000020231207",
+"challenge": "literal",
+"grade": 1
+},
+{
+"query_id": "l03",
+"doc_key": "AAPL\u0000Apple fans finally got a proper look at one of the Vision Pro's more bizarre features — and some think it's terrible\u000020240205",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l10",
+"doc_key": "NVDA\u0000Nvidia releases Blackwell platform to go back to the future, extends partnership with AWS for scale\u000020240403",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l04",
+"doc_key": "BA\u0000U.S. grounds Boeing 737 Max 8 and Max 9 aircraft following Ethiopia crash\u000020190313",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l05",
+"doc_key": "PFE\u0000Q&A On Paxlovid, Pfizer's COVID-19 Oral Antiviral\u000020220513",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l07",
+"doc_key": "AMD\u0000CEO of the Year Lisa Su Discusses the Semiconductor Industry\u000020241214",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l07",
+"doc_key": "AMD\u0000Lisa Su is the first woman to become the world's highest paid CEO, according to an Associated Press survey\u000020200601",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l06",
+"doc_key": "TSLA\u0000Cybertruck\u000020210215",
+"challenge": "literal",
+"grade": 1
+},
+{
+"query_id": "l04",
+"doc_key": "BA\u0000Here's how to tell if your next flight is on a Boeing 737 Max 9\u000020240126",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l02",
+"doc_key": "MSFT\u0000Microsoft Still Procuring Nvidia's H100 Despite Rumors: Quanta\u000020230929",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l02",
+"doc_key": "NVDA\u0000xAI Colossus supercomputer with 100K H100 GPUs comes online — Musk lays out plans to double GPU count to 200K with 50K H100 and 50K H200\u000020240904",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l09",
+"doc_key": "LLY\u0000Mounjaro prices may not increase as much as announced\u000020250831",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l07",
+"doc_key": "AMD\u0000Dr. Lisa Su\u000020180912",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l01",
+"doc_key": "LRCX\u0000This Tech Stock Just Hit Another All-Time High\u000020250918",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l05",
+"doc_key": "PFE\u0000Paxlovid, Pfizer's COVID-19 pill, gets full FDA approval\u000020230526",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l09",
+"doc_key": "LLY\u0000Eli Lilly launches Mounjaro in India for anti obesity treatment\u000020250320",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l05",
+"doc_key": "PFE\u0000A Paxlovid primer: what to know about the new oral antiviral treatment for COVID-19\u000020220119",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l04",
+"doc_key": "BA\u0000Boeing 737 Max 9 returns to skies first time after 3-week grounding\u000020240127",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l05",
+"doc_key": "PFE\u0000Paxlovid For COVID-19 Still Free After FDA's Full Approval\u000020230526",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l01",
+"doc_key": "LRCX\u0000Lam Research (LRCX)\u000020250703",
+"challenge": "literal",
+"grade": 1
+},
+{
+"query_id": "l08",
+"doc_key": "GOOGL\u0000ChatGPT finally has competition — Google Bard with Gemini just matched it with a huge upgrade\u000020240129",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l01",
+"doc_key": "LRCX\u0000Check Out What Whales Are Doing With LRCX - Lam Research (NASDAQ:LRCX)\u000020230607",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l01",
+"doc_key": "LRCX\u0000Check Out What Whales Are Doing With LRCX - Lam Research (NASDAQ:LRCX)\u000020250812",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l01",
+"doc_key": "LRCX\u0000Check Out What Whales Are Doing With LRCX - Lam Research (NASDAQ:LRCX)\u000020230927",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "l01",
+"doc_key": "LRCX\u0000Check Out What Whales Are Doing With LRCX - Lam Research (NASDAQ:LRCX)\u000020230509",
+"challenge": "literal",
+"grade": 2
+},
+{
+"query_id": "e02",
+"doc_key": "MU\u0000Pricing And Supply Could Result In A Roller-Coaster Year For Micron Investors - Micron Technology (NASDAQ:MU)\u000020170324",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "e12",
+"doc_key": "MRNA\u0000How Will Moderna Meet The Demand For Its COVID-19 Vaccine?\u000020201217",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "e02",
+"doc_key": "MU\u0000Micron Technology (MU) Hits Fresh Records Fueled by AI Memory Crunch and Blowout Guidance\u000020251224",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "e02",
+"doc_key": "MU\u0000What Is Going On With Micron Stock Wednesday? - Micron Technology (NASDAQ:MU)\u000020250820",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "e02",
+"doc_key": "MU\u0000Micron Gains as Cloud Strength Boosts its Earnings and Guidance\u000020200326",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "e12",
+"doc_key": "MRNA\u0000Moderna Covid Vaccine: Moderna announces start of Covid-19 vaccine trials for children\u000020210316",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "e14",
+"doc_key": "ADBE\u0000Adobe lessons, 1,000s of design assets, and more in the latest deals at Cult of Mac [Deals] | Cult of Mac\u000020160612",
+"challenge": "event",
+"grade": 0
+},
+{
+"query_id": "e14",
+"doc_key": "ADBE\u0000FTC Takes Action Against Adobe and Executives for Hiding Fees, Preventing Consumers from Easily Cancelling Software Subscriptions\u000020240617",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "e09",
+"doc_key": "INTC\u0000Intel's Foundry Business Has $10 Billion Locked In\u000020240206",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "e11",
+"doc_key": "UBER\u0000Uber Shares Rise, Analysts Largely Positive After First Quarterly Print - Uber Technologies (NYSE:UBER)\u000020190531",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "e02",
+"doc_key": "MU\u0000Micron Technology's Risk-Reward 'Skews Positive,' Goldman Sachs Says In Bullish Turn - Micron Technology (NASDAQ:MU)\u000020201228",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "e06",
+"doc_key": "MSFT\u0000Microsoft acquires esports event management company Smash GG\u000020201202",
+"challenge": "event",
+"grade": 2
+},
+{
+"query_id": "e11",
+"doc_key": "UBER\u0000Uber Reports Better-than-Expected Financial Results Despite Economic Slump\u000020230208",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "e12",
+"doc_key": "MRNA\u0000Moderna Covid Vaccine: FDA advisors recommend emergency use authorisation of Moderna Covid-19 vaccine\u000020201218",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "e08",
+"doc_key": "PFE\u0000Early trials of Pfizer vaccine show promising results in adolescents\u000020210209",
+"challenge": "event",
+"grade": 2
+},
+{
+"query_id": "e12",
+"doc_key": "MRNA\u0000Moderna loses less than expected as Covid vaccine sales beat estimates, cost cuts take hold\u000020240502",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "e12",
+"doc_key": "MRNA\u0000Moderna Shares Slump Amid Concerns Over COVID-19 Vaccine Demand\u000020231019",
+"challenge": "event",
+"grade": 2
+},
+{
+"query_id": "e11",
+"doc_key": "UBER\u0000Uber pushes adjusted quarterly profit target to 2021\u000020200508",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "e12",
+"doc_key": "MRNA\u0000COVID Vaccine Sales Are Declining. But Here's How They're Still Driving Growth at Moderna.\u000020230908",
+"challenge": "event",
+"grade": 2
+},
+{
+"query_id": "e03",
+"doc_key": "BA\u0000Boeing CEO Muilenburg steps down amid growing 737 MAX crisis - Xinhua\u000020191223",
+"challenge": "event",
+"grade": 2
+},
+{
+"query_id": "e13",
+"doc_key": "SBUX\u0000Starbucks Stock: Store Sales Slump, but Is a Turnaround Near?\u000020250825",
+"challenge": "event",
+"grade": 2
+},
+{
+"query_id": "e03",
+"doc_key": "BA\u0000Boeing CEO Dennis Muilenburg to step down immediately - Medicine Hat NewsMedicine Hat News\u000020191223",
+"challenge": "event",
+"grade": 2
+},
+{
+"query_id": "e14",
+"doc_key": "ADBE\u0000Adobe acquisition of Figma may be blocked by the DOJ\u000020230224",
+"challenge": "event",
+"grade": 2
+},
+{
+"query_id": "e10",
+"doc_key": "DIS\u0000Disney wins proxy battle against activist investor Nelson Peltz\u000020240403",
+"challenge": "event",
+"grade": 2
+},
+{
+"query_id": "e06",
+"doc_key": "MSFT\u0000FTC Sues to Block Microsoft’s Acquisition of Gaming Giant Activision Blizzard\u000020221228",
+"challenge": "event",
+"grade": 2
+},
+{
+"query_id": "e09",
+"doc_key": "INTC\u0000Intel CEO: Foundry Business Won't be Profitable Until 2030\u000020240404",
+"challenge": "event",
+"grade": 2
+},
+{
+"query_id": "e07",
+"doc_key": "NFLX\u0000Netflix weighs up crackdown on password sharing\u000020210312",
+"challenge": "event",
+"grade": 2
+},
+{
+"query_id": "e10",
+"doc_key": "DIS\u0000Activist investor Peltz reignites proxy battle with Disney | WKZO | Everything Kalamazoo | 590 AM · 106.9 FM\u000020231215",
+"challenge": "event",
+"grade": 2
+},
+{
+"query_id": "e15",
+"doc_key": "COIN\u0000Coinbase Files Court Action To Force SEC To Provide Clarity On Crypto Regulations\u000020230425",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "e01",
+"doc_key": "NVDA\u0000What To Expect From Nvidia’s (NVDA) Q1 Earnings\u000020250527",
+"challenge": "event",
+"grade": 1
+},
+{
+"query_id": "t13",
+"doc_key": "PANW\u0000Greylock’s Asheem Chandna on ‘shifting left’ in cybersecurity and the future of enterprise startups\u000020201111",
+"challenge": "thematic",
+"grade": 0
+},
+{
+"query_id": "t15",
+"doc_key": "TSM\u0000The World Market for Flip Chip Technology (2019-2024): $33.91 Billion-Projected Market Opportunity Analysis & Insights Report\u000020190724",
+"challenge": "thematic",
+"grade": 0
+},
+{
+"query_id": "t06",
+"doc_key": "NVDA\u0000iShares PHLX SOX Semiconductor Sector Index Fund (NASDAQ:SOXX), State Street Technology Select Sector SPDR ETF (ARCA:XLK)\u000020240225",
+"challenge": "thematic",
+"grade": 0
+},
+{
+"query_id": "t02",
+"doc_key": "DELL\u0000Malaysia Data Center Market Investment Report 2021-2026 Featuring Key Investors Such as AIMS Data Centre, Bridge Data Centres, Keppel Data Centres, NTT Global Data Centers, Regal Orion, & VADS\u000020210617",
+"challenge": "thematic",
+"grade": 0
+},
+{
+"query_id": "t06",
+"doc_key": "CSCO\u0000Two ways to invest in the growing technology sector\u000020190827",
+"challenge": "thematic",
+"grade": 0
+},
+{
+"query_id": "t06",
+"doc_key": "MSFT\u0000GitHub - microsoft/mwx-teams-vaccine-attestation: In response to the Covid-19 Attestation mandate for employees across the public sector and the private sector, an open-source Microsoft Teams vaccine\u000020210922",
+"challenge": "thematic",
+"grade": 0
+},
+{
+"query_id": "t06",
+"doc_key": "MCHP\u0000Technology Stocks Outperform After Trump's Tariff Pause: Microchip Technology, AMD Lead Sector Higher - S\u000020250409",
+"challenge": "thematic",
+"grade": 0
+},
+{
+"query_id": "t08",
+"doc_key": "SHOP\u0000Maker Geeks Manufacturing, Inc. is the First and Largest Company to Bring 3D Printer Filament Manufacturing to the United States\u000020180201",
+"challenge": "thematic",
+"grade": 0
+},
+{
+"query_id": "t13",
+"doc_key": "PANW\u00003 Top Cybersecurity Stocks to Consider Buying Right Now\u000020171208",
+"challenge": "thematic",
+"grade": 1
+},
+{
+"query_id": "t04",
+"doc_key": "MSFT\u0000How Microsoft is dodging the move to regulate Big Tech\u000020200722",
+"challenge": "thematic",
+"grade": 1
+},
+{
+"query_id": "t05",
+"doc_key": "TSM\u0000Supply Chain Wars: How US Is Turning The Heat Against China On Semiconductors\u000020221130",
+"challenge": "thematic",
+"grade": 1
+},
+{
+"query_id": "t04",
+"doc_key": "AAPL\u0000Dutch regulators open Apple Pay antitrust investigation\u000020210914",
+"challenge": "thematic",
+"grade": 2
+},
+{
+"query_id": "t08",
+"doc_key": "ADI\u0000United States Gallium Nitride RF Semiconductor Device Market Status and Future Forecast to 2025\u000020180525",
+"challenge": "thematic",
+"grade": 0
+},
+{
+"query_id": "t06",
+"doc_key": "DELL\u0000Report: Layoffs Underway at Dell Technologies\u000020170117",
+"challenge": "thematic",
+"grade": 2
+},
+{
+"query_id": "t08",
+"doc_key": "TSM\u0000What's Happening with These Semiconductor Stocks? -- MaxLinear, Semiconductor Manufacturing, Sequans Communications, and Taiwan Semiconductor Manufacturing\u000020180119",
+"challenge": "thematic",
+"grade": 0
+},
+{
+"query_id": "t02",
+"doc_key": "NOW\u0000ServiceNow Stock Up 4% After Guidance Raise On Agentic AI Growth\u000020250724",
+"challenge": "thematic",
+"grade": 1
+},
+{
+"query_id": "t11",
+"doc_key": "NFLX\u0000Netflix AI in movies: Netflix uses AI to speed up movie production and launch new features\u000020250718",
+"challenge": "thematic",
+"grade": 2
+},
+{
+"query_id": "t10",
+"doc_key": "TSLA\u0000Tesla models, prices, charging, stock: A complete guide to the electric vehicle maker\u000020251002",
+"challenge": "thematic",
+"grade": 1
+},
+{
+"query_id": "t07",
+"doc_key": "MA\u0000Mastercard profit rises on strong card spending by U.S. consumers\u000020240501",
+"challenge": "thematic",
+"grade": 1
+},
+{
+"query_id": "t04",
+"doc_key": "AMZN\u0000The U.S. Government Has Big Tech in Its Crosshairs\u000020200428",
+"challenge": "thematic",
+"grade": 2
+},
+{
+"query_id": "t14",
+"doc_key": "BA\u0000New Boeing 737 Max supplier defect to delay aircraft deliveries\u000020230824",
+"challenge": "thematic",
+"grade": 2
+},
+{
+"query_id": "t01",
+"doc_key": "NVDA\u0000US Is Planning New AI Chip Export Controls Aimed at Nvidia\u000020230628",
+"challenge": "thematic",
+"grade": 2
+},
+{
+"query_id": "t09",
+"doc_key": "NFLX\u0000Netflix price hikes: Streaming giant sees increase in subscribers despite higher cost\u000020240124",
+"challenge": "thematic",
+"grade": 2
+},
+{
+"query_id": "t08",
+"doc_key": "TSM\u0000Intel wants to help US officials boost chipmaking on American soil\u000020200521",
+"challenge": "thematic",
+"grade": 2
+},
+{
+"query_id": "t12",
+"doc_key": "ABBV\u0000Biologics, patents and drug prices\u000020180208",
+"challenge": "thematic",
+"grade": 2
+},
+{
+"query_id": "t13",
+"doc_key": "CRWD\u0000Tech firms defend actions in hearing on major hack\u000020210224",
+"challenge": "thematic",
+"grade": 2
+},
+{
+"query_id": "t08",
+"doc_key": "TSM\u0000U.S. Universities Are Building a New Semiconductor Workforce\u000020230513",
+"challenge": "thematic",
+"grade": 2
+},
+{
+"query_id": "t02",
+"doc_key": "NVDA\u0000AI Spending Could Reach $4 Trillion by 2030. Here Are 3 Must-Own Stocks if It Does.\u000020251012",
+"challenge": "thematic",
+"grade": 1
+},
+{
+"query_id": "t11",
+"doc_key": "SNOW\u0000Informatica launches new generative AI and Snowflake native app offerings on the Snowflake AI data cloud\u000020240605",
+"challenge": "thematic",
+"grade": 2
+},
+{
+"query_id": "t12",
+"doc_key": "ABBV\u0000Allergan loses Restasis patent protections in federal court decision\u000020171016",
+"challenge": "thematic",
+"grade": 2
+},
+{
+"query_id": "d09",
+"doc_key": "TSLA\u0000Tesla soars 10% after smashing estimates to deliver 308,600 vehicles in the 4th quarter\u000020220104",
+"challenge": "temporal",
+"grade": 1
+},
+{
+"query_id": "d09",
+"doc_key": "TSLA\u0000Tesla Offering New Model Y AWD With 4680 Cells, Accelerated Delivery\u000020220607",
+"challenge": "temporal",
+"grade": 1
+},
+{
+"query_id": "d07",
+"doc_key": "RTX\u0000Raytheon Technologies Corporation (NYSE:RTX) is largely controlled by institutional shareholders who own 80% of the company\u000020221230",
+"challenge": "temporal",
+"grade": 0
+},
+{
+"query_id": "d10",
+"doc_key": "AAPL\u0000Apple Card and Apple Pay Services Are Having Problems\u000020231220",
+"challenge": "temporal",
+"grade": 1
+},
+{
+"query_id": "d05",
+"doc_key": "V\u0000ThitsaWorks was awarded the Monetary Authority of Singapore's Financial Sector Technology and Innovation (FSTI) Proof of Concept (POC) grant for Inclusive Cross-Border Remittances\u000020221219",
+"challenge": "temporal",
+"grade": 0
+},
+{
+"query_id": "d05",
+"doc_key": "MSFT\u0000Kastle Names Former Microsoft and Sonos Technology Executive as Chief Technology Officer\u000020230110",
+"challenge": "temporal",
+"grade": 0
+},
+{
+"query_id": "d09",
+"doc_key": "TSLA\u0000Tesla stock price live today - Tesla share price news, Tesla stock share price analysis\u000020221221",
+"challenge": "temporal",
+"grade": 1
+},
+{
+"query_id": "d02",
+"doc_key": "MU\u0000Micron Provides Statement on U.S. Department of Justice Indictments Relating to Theft of Micron Trade Secrets\u000020181102",
+"challenge": "temporal",
+"grade": 1
+},
+{
+"query_id": "d04",
+"doc_key": "MRNA\u0000FDA clears Moderna COVID-19 vaccine for emergency rollout\u000020201218",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d07",
+"doc_key": "NVDA\u0000New Video: What Runs ChatGPT?\u000020230612",
+"challenge": "temporal",
+"grade": 1
+},
+{
+"query_id": "d02",
+"doc_key": "MU\u0000Global chipmakers rally on Micron's upbeat results, Huawei shipments\u000020190626",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d05",
+"doc_key": "INTC\u0000Tech Layoff Wave Continues: Intel Is Cutting Hundreds of Jobs\u000020230125",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d06",
+"doc_key": "JPM\u0000JPMorgan accused of selling $10 million in jewels from bank deposit boxes\u000020230324",
+"challenge": "temporal",
+"grade": 0
+},
+{
+"query_id": "d10",
+"doc_key": "AAPL\u0000Apple reports Q2 2023 earnings: $94.8 billion revenue, new records for Services and iPhone\u000020230505",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d10",
+"doc_key": "AAPL\u0000Apple announces it’s almost hit 1 billion active subscriptions\u000020230712",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d04",
+"doc_key": "MRNA\u0000UK Begins Rollout of Moderna COVID-19 Vaccine in Wales\u000020210407",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d05",
+"doc_key": "CRM\u0000Tech layoffs: Salesforce workers brace for fresh round of layoffs\u000020221212",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d02",
+"doc_key": "MU\u0000How Micron Technology Stock Gained 20.5% in January\u000020190319",
+"challenge": "temporal",
+"grade": 1
+},
+{
+"query_id": "d04",
+"doc_key": "PFE\u0000U.K. Begins Rollout of Pfizer's Covid-19 Vaccine in a First for the West\u000020201208",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d07",
+"doc_key": "GOOGL\u0000Google brings ‘Bard’ to take on Microsoft’s ChatGPT\u000020230207",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d05",
+"doc_key": "GOOGL\u0000Silicon Valley Slump: Google Announces Mass Layoff of 12,000 Workers\u000020230130",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d02",
+"doc_key": "MU\u0000Wall Street analysts are worried about a memory chip downturn as Micron shares keep falling\u000020180924",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d05",
+"doc_key": "GOOGL\u0000Google to slash 12,000 jobs as tech industry layoffs surge\u000020230121",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d01",
+"doc_key": "NVDA\u0000Nvidia Faces Potential Export Restrictions on AI Chips to China\u000020230629",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d01",
+"doc_key": "NVDA\u0000As NVIDIA Touts No Impact From the China AI Chip Ban, ASML Contends That Decoupling the Chip Supply Chain Is “Impossible”\u000020230628",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d05",
+"doc_key": "MSFT\u0000Apple grew more slowly than Google, Amazon, Microsoft and Meta, and has so far dodged major layoffs\u000020230203",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d08",
+"doc_key": "TSM\u0000Taiwan says chipmakers to prioritise auto chips amid global shortage\u000020210128",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d01",
+"doc_key": "NVDA\u0000Nvidia Stock Falls Amid Fears of New Restrictions on China Chip Exports\u000020230628",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d07",
+"doc_key": "AMZN\u0000Amazon plans to reboot its struggling Alexa business by working on its own ChatGPT-like technology, leaked document shows\u000020230504",
+"challenge": "temporal",
+"grade": 2
+},
+{
+"query_id": "d07",
+"doc_key": "MSFT\u0000Microsoft invests '$10 BILLION' in ChatGPT-maker OpenAI to compete with Google\u000020230123",
+"challenge": "temporal",
+"grade": 2
+}
+]

@@ -18,6 +18,11 @@ worth seeing rather than choosing a bar that hides it.
 **nDCG is the graded one** — gain 2^g - 1, ideal taken over the judged pool for that query,
 which is why the middle grade had to exist.
 
+**precision@k at the strict bar** — of the top k, how many answer the query. Added with
+rubric v2 (2026-10-09): about 90% of the pool is at least related (it is the top 15 of four
+retrievers), so with ~27 related documents per query recall@10 at the loose bar cannot
+exceed ~0.37 for any system and says little. Precision does not depend on pool size.
+
 **Per challenge, not only overall.** The aggregate is the least interesting row: the whole
 argument for hybrid retrieval is that sparse wins on literal queries and dense wins on
 paraphrase, and only the split shows whether that held.
@@ -68,6 +73,7 @@ def metrics(ranking, qid, grades, k, bar):
     hits = [key for key in top if grades.get((qid, key), 0) >= bar]
 
     recall = len(hits) / len(rel_in_pool) if rel_in_pool else None
+    precision = len(hits) / k
     rr = 0.0
     for i, key in enumerate(top, 1):
         if grades.get((qid, key), 0) >= bar:
@@ -79,7 +85,7 @@ def metrics(ranking, qid, grades, k, bar):
     ideal = sorted((2 ** g - 1 for (q, _), g in grades.items() if q == qid), reverse=True)[:k]
     idcg = sum(g / math.log2(i + 1) for i, g in enumerate(ideal, 1))
     ndcg = dcg / idcg if idcg else None
-    return recall, rr, ndcg
+    return recall, rr, ndcg, precision
 
 
 def mean(values):
@@ -103,7 +109,7 @@ def table(rows, headers, md: bool) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--k", type=int, default=10)
-    ap.add_argument("--source", default="llm", help="which judge's labels to score against")
+    ap.add_argument("--source", default="llm_v2", help="which judge's labels to score against")
     ap.add_argument("--md", action="store_true")
     a = ap.parse_args()
 
@@ -131,28 +137,29 @@ def main() -> None:
         strict = [metrics(runs[s].get(q, []), q, grades, a.k, 2) for q in qids]
         rows.append([
             s,
-            f"{mean(r for r, _, _ in loose):.3f}",
-            f"{mean(rr for _, rr, _ in loose):.3f}",
-            f"{mean(r for r, _, _ in strict):.3f}",
-            f"{mean(rr for _, rr, _ in strict):.3f}",
-            f"{mean(n for _, _, n in loose):.3f}",
+            f"{mean(r for r, _, _, _ in loose):.3f}",
+            f"{mean(rr for _, rr, _, _ in loose):.3f}",
+            f"{mean(r for r, _, _, _ in strict):.3f}",
+            f"{mean(rr for _, rr, _, _ in strict):.3f}",
+            f"{mean(p for _, _, _, p in strict):.3f}",
+            f"{mean(n for _, _, n, _ in loose):.3f}",
         ])
-        for q, (r, _, n) in zip(qids, loose):
-            per_system_by_challenge[s][challenge.get(q, "?")].append((r, n))
+        for q, (r, _, n, _), (_, _, _, p) in zip(qids, loose, strict):
+            per_system_by_challenge[s][challenge.get(q, "?")].append((r, n, p))
 
     print(table(rows, ["system", f"recall@{a.k}", f"MRR@{a.k}",
-                       f"recall@{a.k} (g=2)", f"MRR@{a.k} (g=2)", f"nDCG@{a.k}"], a.md))
+                       f"recall@{a.k} (g=2)", f"MRR@{a.k} (g=2)", f"P@{a.k} (g=2)", f"nDCG@{a.k}"], a.md))
     print()
 
     # ---- per challenge, recall at the loose bar ----
     challenges = sorted({c for c in challenge.values()})
-    rows = [[s] + [f"{mean(r for r, _ in per_system_by_challenge[s][c]):.3f}" for c in challenges]
+    rows = [[s] + [f"{mean(p for _, _, p in per_system_by_challenge[s][c]):.3f}" for c in challenges]
             for s in systems]
-    print(f"recall@{a.k} by challenge type")
+    print(f"P@{a.k} (g=2) by challenge type")
     print(table(rows, ["system"] + challenges, a.md))
     print()
 
-    rows = [[s] + [f"{mean(n for _, n in per_system_by_challenge[s][c]):.3f}" for c in challenges]
+    rows = [[s] + [f"{mean(n for _, n, _ in per_system_by_challenge[s][c]):.3f}" for c in challenges]
             for s in systems]
     print(f"nDCG@{a.k} by challenge type")
     print(table(rows, ["system"] + challenges, a.md))

@@ -22,10 +22,23 @@ Grades (graded, not binary, because nDCG needs the middle grade to mean anything
   1 — related: same company or theme, but does not answer what was asked
   0 — not relevant
 
-    python eval/judge_pool.py --llm                  # label everything, resumable
+Rubric v2 (2026-10-09). The first run (source "llm", rubric v1 in commit 4633a59) was read
+as grade inflation because 93% of pairs came back relevant. Checked against 150 reference
+labels (stratified by challenge and by the v1 grade) that reading was wrong: about 91% of
+the pool *is* at least related -- it is the top 15 of four retrievers -- and v1's real fault
+was the 1/2 boundary: it graded 29 of 80 answering documents as merely related (kappa 0.41).
+v2 spells out that boundary (opposite outcomes are 1; word overlap, market-research
+reports and stock promotion are 0; a bare name query is answered by a document mainly about
+it): kappa 0.74 on the same pairs, and its estimated pool distribution (10/26/64% for
+0/1/2) matches the reference (9/25/66%). Extracting facts and grading in code reached 0.76
+but put 76% of the pool at grade 2; qwen3.5-4b scored 0.64 either way.
+
+    python eval/judge_pool.py --llm                  # label everything with rubric v2, resumable
     python eval/judge_pool.py --llm --limit 50       # smoke test
     python eval/judge_pool.py --human --sample 100   # stratified sample for kappa
-    python eval/judge_pool.py --kappa                # agreement on overlapping pairs
+    python eval/judge_pool.py --human --sample 30 --among reference_claude   # spot-check the reference
+    python eval/judge_pool.py --kappa human llm_v2   # agreement between any two sources
+    python eval/judge_pool.py --import-labels FILE --as reference_claude
 """
 
 from __future__ import annotations
@@ -55,6 +68,7 @@ LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://127.0.0.1:1234/v1").rstrip("/
 # tokens and returns nothing to parse. Judge quality is not assumed either way --
 # `--kappa` measures it against human labels.
 JUDGE_MODEL = os.getenv("JUDGE_MODEL", "gemma-4-e4b-it-mlx")
+JUDGE_SOURCE = os.getenv("JUDGE_SOURCE", "llm_v2")  # "llm" holds the rubric-v1 run, kept for comparison
 WORKERS = int(os.getenv("JUDGE_WORKERS", "4"))
 EXCERPT = 600
 
@@ -68,13 +82,14 @@ Document
   Date: {date}
   Body: {body}
 
-Grade how well this document serves someone who issued that query:
-  2 = answers the query -- this is what the person was looking for
-  1 = related -- same company or theme, but it does not answer what was asked
-  0 = not relevant
-
-Judge the document on its own merits. Do not reward a document for merely repeating words
-from the query, and do not punish one for using different wording than the query.
+Grades:
+  2 = the document reports the specific thing the query asks for. For a query that is only a
+      name, product or ticker: the document is mainly about that entity.
+  1 = the document is about the same company/entity or the same specific theme, but does not
+      report what was asked -- including the opposite outcome (strong guidance when the query
+      asks for weak guidance, a beat when it asks for a miss).
+  0 = everything else: documents that only share words with the query, generic market-research
+      reports, stock-promotion pages, and documents about a different subject.
 
 Reply with JSON only: {{"grade": 0|1|2, "why": "<one short sentence>"}}"""
 
@@ -129,8 +144,11 @@ def _ask(doc) -> dict | None:
 
 
 def _record(doc, result, source, model):
+    # judge_id = source: the collection's unique index is (judge_id, query_id, doc_key), shared
+    # with the MCP submit_judgment tool, so every judging source needs its own judge_id or the
+    # second source to label a pair collides with the first.
     return UpdateOne(
-        {"query_id": doc["query_id"], "doc_key": doc["doc_key"], "source": source},
+        {"judge_id": source, "query_id": doc["query_id"], "doc_key": doc["doc_key"], "source": source},
         {"$set": {
             "query": doc["query"],
             "challenge": doc["challenge"],
@@ -146,11 +164,11 @@ def _record(doc, result, source, model):
 
 def judge_llm(limit: int | None) -> None:
     db = _db()
-    rows = _pending(db, "llm", limit)
+    rows = _pending(db, JUDGE_SOURCE, limit)
     if not rows:
         print("nothing left to judge")
         return
-    print(f"judging {len(rows)} pairs with {JUDGE_MODEL} ({WORKERS} workers)", flush=True)
+    print(f"judging {len(rows)} pairs with {JUDGE_MODEL} as {JUDGE_SOURCE} ({WORKERS} workers)", flush=True)
 
     ops, errors, dist = [], 0, {0: 0, 1: 0, 2: 0}
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
@@ -159,7 +177,7 @@ def judge_llm(limit: int | None) -> None:
                 errors += 1
             else:
                 dist[res["grade"]] += 1
-            ops.append(_record(doc, res, "llm", JUDGE_MODEL))
+            ops.append(_record(doc, res, JUDGE_SOURCE, JUDGE_MODEL))
             if len(ops) >= 50:
                 db[JUDGE_COLL].bulk_write(ops)
                 ops = []
@@ -170,10 +188,14 @@ def judge_llm(limit: int | None) -> None:
     print(f"done: {sum(dist.values())} judged, {errors} errors -> {DB_NAME}.{JUDGE_COLL}")
 
 
-def judge_human(sample: int, seed: int) -> None:
-    """Stratified over the five challenge types, so kappa is not dominated by one kind."""
+def judge_human(sample: int, seed: int, among: str | None = None) -> None:
+    """Stratified over the five challenge types, so kappa is not dominated by one kind.
+    among: only pairs another source judged, so the two can be compared (e.g. reference_claude)."""
     db = _db()
     rows = _pending(db, "human", None)
+    if among:
+        keep = {(j["query_id"], j["doc_key"]) for j in db[JUDGE_COLL].find({"source": among})}
+        rows = [r for r in rows if (r["query_id"], r["doc_key"]) in keep]
     by_challenge: dict[str, list] = {}
     for r in rows:
         by_challenge.setdefault(r["challenge"], []).append(r)
@@ -208,17 +230,35 @@ def judge_human(sample: int, seed: int) -> None:
     print(f"\nsaved {len(ops)} human judgments")
 
 
-def kappa() -> None:
+def import_labels(path: str, source: str) -> None:
+    """Loads graded pairs judged outside this script, e.g. the 150 reference labels of 2026-10-09.
+    File: JSON list of {"query_id", "doc_key", "grade"}; the source name says who judged them."""
+    db = _db()
+    pool = {(d["query_id"], d["doc_key"]): d for d in db[POOL_COLL].find()}
+    ops, missing = [], 0
+    for row in json.load(open(path)):
+        doc = pool.get((row["query_id"], row["doc_key"]))
+        if doc is None or row.get("grade") not in (0, 1, 2):
+            missing += 1
+            continue
+        ops.append(_record(doc, {"grade": row["grade"], "why": row.get("why", "")}, source, source))
+    if ops:
+        db[JUDGE_COLL].bulk_write(ops)
+    print(f"imported {len(ops)} labels as source={source} ({missing} skipped)")
+
+
+def kappa(a_source: str = "human", b_source: str = JUDGE_SOURCE) -> None:
     """Cohen's kappa on pairs both judges labelled; also the plain agreement rate."""
     db = _db()
     human = {(j["query_id"], j["doc_key"]): j["grade"]
-             for j in db[JUDGE_COLL].find({"source": "human", "grade": {"$ne": None}})}
+             for j in db[JUDGE_COLL].find({"source": a_source, "grade": {"$ne": None}})}
     llm = {(j["query_id"], j["doc_key"]): j["grade"]
-           for j in db[JUDGE_COLL].find({"source": "llm", "grade": {"$ne": None}})}
+           for j in db[JUDGE_COLL].find({"source": b_source, "grade": {"$ne": None}})}
     both = sorted(set(human) & set(llm))
     if not both:
-        print("no overlapping pairs yet -- run --human on pairs the LLM has judged")
+        print(f"no pairs judged by both {a_source} and {b_source}")
         return
+    print(f"{a_source} (rows) vs {b_source} (cols)")
 
     n = len(both)
     agree = sum(1 for k in both if human[k] == llm[k])
@@ -231,28 +271,34 @@ def kappa() -> None:
     print(f"overlapping pairs : {n}")
     print(f"exact agreement   : {po:.3f}  ({agree}/{n})")
     print(f"Cohen's kappa     : {k:.3f}")
-    print("\nconfusion (rows human, cols llm)")
-    print("      llm0  llm1  llm2")
+    print(f"\nconfusion (rows {a_source}, cols {b_source})")
+    print("        0     1     2")
     for g in (0, 1, 2):
         row = [sum(1 for x in both if human[x] == g and llm[x] == c) for c in (0, 1, 2)]
-        print(f"  h{g}  " + "  ".join(f"{v:>4}" for v in row))
+        print(f"  {g}  " + "  ".join(f"{v:>4}" for v in row))
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--llm", action="store_true", help="label the pool with the local model")
     ap.add_argument("--human", action="store_true", help="label a stratified sample by hand")
-    ap.add_argument("--kappa", action="store_true", help="agreement between the two")
+    ap.add_argument("--kappa", nargs="*", metavar="SOURCE",
+                    help="agreement between two sources (default: human vs the current judge)")
+    ap.add_argument("--import-labels", metavar="FILE", help="load externally judged pairs")
+    ap.add_argument("--as", dest="as_source", default="reference", help="source name for --import-labels")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--sample", type=int, default=100)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--among", metavar="SOURCE", help="with --human: sample only pairs this source judged")
     a = ap.parse_args()
     if a.llm:
         judge_llm(a.limit)
     elif a.human:
-        judge_human(a.sample, a.seed)
-    elif a.kappa:
-        kappa()
+        judge_human(a.sample, a.seed, a.among)
+    elif a.kappa is not None:
+        kappa(*(a.kappa[:2] if len(a.kappa) >= 2 else ["human", a.kappa[0] if a.kappa else JUDGE_SOURCE]))
+    elif a.import_labels:
+        import_labels(a.import_labels, a.as_source)
     else:
         ap.print_help()
 
