@@ -158,6 +158,7 @@ def search_news(
     from_date: str = "",
     to_date: str = "",
     limit: int = 20,
+    mode: str = "hybrid",
 ) -> str:
     """Search the 845K LLM-labeled news articles and read them.
 
@@ -168,19 +169,40 @@ def search_news(
     around a specific date, or whether an average rests on three articles or three
     thousand.
 
-    Results are ranked by relevance, with headline matches weighted 10x over body
-    mentions. Leave `query` empty to list a symbol's coverage by date instead.
-
-    Note that multi-word queries match ANY of the words, so broad terms return many
-    hits and take about a second; specific terms are near-instant.
+    mode="hybrid" (default) ranks by meaning as well as words: an embedding search and a
+    keyword search, fused. It finds "DRAM oversupply" for "memory glut". mode="keyword"
+    is the plain full-text search (headline matches weighted 10x); prefer it for an exact
+    phrase or a rare name. Leave `query` empty to list a symbol's coverage by date.
+    Each article says which search found it (`foundBy`).
 
     Args:
-        query: Keywords, e.g. "chip shortage". Empty lists recent articles by date.
+        query: What to look for, e.g. "export controls on AI chips". Empty lists by date.
         symbol: Optional ticker filter, e.g. AMD.
         from_date: Optional inclusive start, YYYYMMDD or YYYY-MM-DD.
         to_date: Optional inclusive end, same format.
         limit: How many articles to return (default 20, capped at 50).
+        mode: "hybrid" (default) or "keyword".
     """
+    mode = (mode or "hybrid").strip().lower()
+    if mode not in ("hybrid", "keyword"):
+        return json.dumps({"error": f"mode must be 'hybrid' or 'keyword', got '{mode}'"})
+
+    # R.12 — hybrid by default since R.4 measured it: nDCG@10 0.797 vs 0.683 for keyword
+    # alone, bootstrap CI excluding zero. Both legs take the symbol and date window.
+    fallback = None
+    if mode == "hybrid" and query.strip():
+        try:
+            from news_rag import search_articles
+            payload = search_articles(query.strip(), symbol=symbol, from_date=from_date,
+                                      to_date=to_date, limit=limit)
+            return _guard_articles(json.dumps(payload, ensure_ascii=False, default=str))
+        except ValueError as e:  # a bad date is the caller's to fix, not an outage
+            return json.dumps({"error": str(e)})
+        except Exception as e:  # noqa: BLE001 — embedding model or qdrant down: degrade, say so
+            fallback = f"hybrid search unavailable ({type(e).__name__}: {str(e)[:160]}); used keyword search"
+    elif mode == "hybrid":
+        fallback = "no query: listed the symbol's coverage by date instead"
+
     params: dict[str, Any] = {"limit": limit}
     if query.strip():
         params["q"] = query.strip()
@@ -193,6 +215,12 @@ def search_news(
     raw = _get("/api/news/search", params)
     if raw is None:
         return _unavailable("/api/news/search")
+    try:
+        payload = json.loads(raw)
+        payload["retrieval"] = {"mode": "keyword", **({"requested": "hybrid", "note": fallback} if fallback else {})}
+        raw = json.dumps(payload, ensure_ascii=False, default=str)
+    except (ValueError, TypeError):
+        pass
     return _guard_articles(raw)
 
 

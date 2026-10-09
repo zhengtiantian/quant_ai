@@ -28,6 +28,9 @@ EXPECTED_TOOLS = {
     "get_my_transactions",
     "get_performance",
     "list_symbols",
+    # R.4: relevance judging over MCP, the server's first write tools
+    "get_eval_batch",
+    "submit_judgment",
 }
 
 # (tool, arguments, substring the response must contain)
@@ -41,8 +44,10 @@ CALL_CHECKS = [
     # Answers with totals even when the user has recorded no trades yet.
     ("get_my_holdings", {}, "totals"),
     ("get_my_transactions", {}, "["),
-    # Relevance ranking proves the weighted text index is actually being used.
-    ("search_news", {"query": "earnings", "symbol": "AAPL", "limit": 3}, "relevance"),
+    # R.12: hybrid by default — each article says which retrieval leg found it.
+    ("search_news", {"query": "earnings", "symbol": "AAPL", "limit": 3}, "foundby"),
+    # Keyword mode is still the weighted text index: relevance ranking proves it is used.
+    ("search_news", {"query": "earnings", "symbol": "AAPL", "limit": 3, "mode": "keyword"}, "relevance"),
     # Empty query is a valid call: it lists a symbol's coverage by date instead.
     ("search_news", {"symbol": "NVDA", "limit": 3}, "\"rankedby\": \"date\""),
     # The summary block is the point of this tool — a raw series without it just moves

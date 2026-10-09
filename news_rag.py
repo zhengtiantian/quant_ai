@@ -90,7 +90,8 @@ def _fetch_bodies(hits, coll) -> dict:
         return {}
     cursor = coll.find(
         {"_id": {"$in": ids}},
-        {"content": 1, "url": 1, "date": 1, "llm_sentiment_final": 1, "llm_event_type_a": 1},
+        {"content": 1, "url": 1, "date": 1, "name": 1, "llm_sentiment_final": 1, "llm_event_type_a": 1,
+         "llm_signal_strength_a": 1, "llm_disagreement": 1},
     )
     return {str(d["_id"]): d for d in cursor}
 
@@ -144,6 +145,83 @@ def build_context(hits, coll) -> tuple[str, list[dict]]:
             "chars_sanitised": body_screen.removed_chars + title_screen.removed_chars,
         })
     return "\n\n".join(blocks), sources
+
+
+ARTICLE_EXCERPT = 400  # same bound as quant_api's NewsSearchService
+
+
+def _date_int(value) -> int | None:
+    """YYYY-MM-DD or YYYYMMDD -> YYYYMMDD as int (the shape both retrieval legs filter on)."""
+    if value is None or str(value).strip() == "":
+        return None
+    digits = str(value).strip().replace("-", "")
+    if not re.fullmatch(r"\d{8}", digits):
+        raise ValueError(f"date must be YYYYMMDD or YYYY-MM-DD, got: {value}")
+    return int(digits)
+
+
+def _excerpt(text: str) -> str:
+    text = (text or "").strip()
+    if len(text) <= ARTICLE_EXCERPT:
+        return text
+    cut = text.rfind(" ", 0, ARTICLE_EXCERPT)
+    return text[:cut if cut > 0 else ARTICLE_EXCERPT] + "…"
+
+
+def search_articles(query: str, symbol: str | None = None, from_date=None, to_date=None,
+                    limit: int = 20, coll=None, rrf_k: int = RRF_K) -> dict:
+    """R.12 — hybrid retrieval returned as articles, not as an answer.
+
+    The same payload shape as quant_api's `/api/news/search`, so every consumer of
+    `search_news` (and S.2's guard in front of them) reads it unchanged; `retrieval`
+    adds which legs found each article. No generation here on purpose: the callers are
+    Claude, Codex and the agents, all stronger models than the local 9B, and a summary
+    in between would only paraphrase the sources away.
+
+    The symbol and date window are applied inside both legs, never after fusion, for the
+    same reason news_rag does: a post-hoc filter lets an out-of-window dense hit take a
+    top-k slot (the M.7 look-ahead error).
+    """
+    if coll is None:
+        from pymongo import MongoClient
+        from hybrid_search import DB_NAME, MONGO_URI, SRC_COLL
+        coll = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)[DB_NAME][SRC_COLL]
+    sym = symbol.upper().strip() if symbol and symbol.strip() else None
+    k = max(1, min(int(limit), 50))
+
+    t0 = time.perf_counter()
+    dense, sparse, fused = search(query, k=k, symbol=sym, since=_date_int(from_date),
+                                  until=_date_int(to_date), rrf_k=rrf_k)
+    retrieval_ms = (time.perf_counter() - t0) * 1000
+    bodies = _fetch_bodies(fused, coll)
+
+    articles = []
+    for h in fused:
+        doc = bodies.get(h.mongo_id) or {}
+        articles.append({
+            "symbol": h.symbol,
+            "company": doc.get("name"),
+            "date": doc.get("date") or h.date,
+            "title": h.title,
+            "excerpt": _excerpt(doc.get("content")),
+            "sentiment": doc.get("llm_sentiment_final"),
+            "modelDisagreement": doc.get("llm_disagreement"),
+            "eventType": doc.get("llm_event_type_a"),
+            "signalStrength": doc.get("llm_signal_strength_a"),
+            "url": doc.get("url") or h.url,
+            "foundBy": list(h.legs),
+            "denseRank": h.dense_rank,
+            "keywordRank": h.sparse_rank,
+        })
+    return {
+        "query": query,
+        "symbol": sym or "",
+        "count": len(articles),
+        "rankedBy": f"hybrid: semantic + keyword, fused by RRF (k={rrf_k})",
+        "articles": articles,
+        "retrieval": {"mode": "hybrid", "dense_candidates": len(dense), "keyword_candidates": len(sparse),
+                      "ms": round(retrieval_ms, 1)},
+    }
 
 
 def cited_ids(answer: str, n_sources: int) -> list[int]:

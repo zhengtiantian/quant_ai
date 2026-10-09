@@ -19,7 +19,7 @@ from typing import Optional
 
 import numpy as np
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
@@ -395,6 +395,28 @@ def ask_news(request: NewsQueryRequest):
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
+
+
+@app.get("/api/retrieve/news")
+def retrieve_news(
+    q: str,
+    symbol: str | None = None,
+    from_date: str | None = Query(None, alias="from"),
+    to_date: str | None = Query(None, alias="to"),
+    limit: int = 20,
+):
+    """R.12 — hybrid retrieval only: articles, no generated answer.
+
+    The one retriever every news consumer uses. quant_ai's MCP server calls
+    `news_rag.search_articles` in-process; quant_api's MCP server (R.5) calls this
+    endpoint. The fusion therefore lives in one place, and the Python and Java tool
+    surfaces cannot drift into two different rankings of the same corpus.
+    """
+    from news_rag import search_articles
+    try:
+        return search_articles(q, symbol=symbol, from_date=from_date, to_date=to_date, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/api/agent/research")
