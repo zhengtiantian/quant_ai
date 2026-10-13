@@ -33,13 +33,16 @@ from bson import ObjectId
 RERANK_MODEL = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANK_DEVICE = os.getenv("RERANK_DEVICE", "mps")
 RERANK_BATCH = int(os.getenv("RERANK_BATCH", "32"))
+# Tokens per (query, document) pair. Cost grows with it; news puts the subject in the lede, so a
+# shorter window may cost little relevance. Measured by eval/rerank_sweep.sh.
+RERANK_MAX_LEN = int(os.getenv("RERANK_MAX_LEN", "512"))
 BODY_CHARS = 1500   # ~350 tokens of lede after the title; the model truncates at 512 anyway
 
 
-@lru_cache(maxsize=1)
-def _model():
+@lru_cache(maxsize=2)
+def _model(max_len: int = RERANK_MAX_LEN):
     from sentence_transformers import CrossEncoder
-    return CrossEncoder(RERANK_MODEL, device=RERANK_DEVICE, max_length=512)
+    return CrossEncoder(RERANK_MODEL, device=RERANK_DEVICE, max_length=max_len)
 
 
 def doc_text(title: str | None, body: str | None) -> str:
@@ -60,13 +63,14 @@ def fetch_bodies(coll, hits) -> dict[str, str]:
     return {str(d["_id"]): d.get("content") or "" for d in coll.find({"_id": {"$in": ids}}, {"content": 1})}
 
 
-def rerank(query: str, hits: list, bodies: dict[str, str], k: int | None = None) -> tuple[list, float]:
+def rerank(query: str, hits: list, bodies: dict[str, str], k: int | None = None,
+           max_len: int | None = None) -> tuple[list, float]:
     """Return (hits sorted by cross-encoder score, seconds spent). Sets h.rerank_score."""
     if not hits:
         return [], 0.0
     pairs = [(query, doc_text(h.title, bodies.get(h.mongo_id or "", ""))) for h in hits]
     t = time.perf_counter()
-    scores = _model().predict(pairs, batch_size=RERANK_BATCH, show_progress_bar=False)
+    scores = _model(max_len or RERANK_MAX_LEN).predict(pairs, batch_size=RERANK_BATCH, show_progress_bar=False)
     spent = time.perf_counter() - t
     for h, s in zip(hits, scores):
         h.rerank_score = float(s)

@@ -6,6 +6,9 @@ export LM_STUDIO_URL="http://127.0.0.1:1234/v1"
 export QUANT_API="http://localhost:18081"
 export KNOWLEDGE_PATHS="$(pwd)/knowledge"
 export PORT=18000
+# R.3: rerank /api/ask/news answers (fused top-30, 256 tokens, ~1 s; see news_rag.py). The host
+# venv has torch via requirements-eval.txt; the Docker image does not, so it stays off there.
+export NEWS_RERANK="${NEWS_RERANK:-1}"
 
 # R.5 phase 1b — service credentials for quant_api, kept out of this file on purpose.
 # .env is gitignored; without it the service simply calls quant_api anonymously, which

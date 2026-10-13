@@ -31,13 +31,16 @@ from hybrid_search import (  # noqa: E402
     DB_NAME, MONGO_URI, QDRANT_URL, SRC_COLL, dense_leg, rrf_fuse, sparse_leg,
 )
 from qdrant_client import QdrantClient  # noqa: E402
-from rerank import RERANK_MODEL, fetch_bodies, rerank  # noqa: E402
+from rerank import RERANK_MAX_LEN, RERANK_MODEL, fetch_bodies, rerank  # noqa: E402
 
 QUERIES = Path(__file__).with_name("retrieval_queries.yaml")
 POOL_COLL = "eval_retrieval_pool"
 RUNS_COLL = "eval_retrieval_runs"
 POOL_DEPTH = int(os.getenv("POOL_DEPTH", "15"))
 CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "100"))
+# Each leg always retrieves LEG_DEPTH, exactly as hybrid_k60 did, so a smaller CANDIDATES only
+# changes how many fused documents the reranker sees -- not the first-stage ranking itself.
+LEG_DEPTH = max(100, CANDIDATES)
 SYSTEM = os.getenv("RERANK_SYSTEM", "hybrid_k60_rerank")
 EXCERPT = 600
 
@@ -52,8 +55,8 @@ def main() -> None:
     for i, sq in enumerate(spec, 1):
         qid, q = sq["id"], sq["query"]
         symbol, since, until = sq.get("symbol"), sq.get("since"), sq.get("until")
-        dense = dense_leg(qc, q, symbol, since, until, CANDIDATES)
-        sparse = sparse_leg(src, q, symbol, since, until, CANDIDATES)
+        dense = dense_leg(qc, q, symbol, since, until, LEG_DEPTH)
+        sparse = sparse_leg(src, q, symbol, since, until, LEG_DEPTH)
         fused = rrf_fuse(dense, sparse, CANDIDATES, 60, 1.0, 1.0)
         bodies = fetch_bodies(src, fused)
         ranked, spent = rerank(q, fused, bodies)
@@ -65,7 +68,7 @@ def main() -> None:
         runs.update_one(
             {"query_id": qid, "system": SYSTEM},
             {"$set": {"ranking": [h.key for h in top], "rerank_model": RERANK_MODEL,
-                      "candidates": len(fused), "rerank_seconds": round(spent, 3)}},
+                      "candidates": len(fused), "max_length": RERANK_MAX_LEN, "rerank_seconds": round(spent, 3)}},
             upsert=True,
         )
 

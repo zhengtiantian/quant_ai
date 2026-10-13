@@ -305,6 +305,7 @@ class NewsQueryRequest(BaseModel):
     since: Optional[int] = None   # YYYYMMDD
     until: Optional[int] = None   # YYYYMMDD
     k: int = 8
+    rerank: Optional[bool] = None  # None = server default (NEWS_RERANK); see news_rag.py
 
 
 class WorkflowSpecRequest(BaseModel):
@@ -333,6 +334,9 @@ class SimpleTasksRequest(BaseModel):
 async def lifespan(_app: FastAPI):
     # Build the RAG vector store off the event loop so startup does not block.
     asyncio.get_running_loop().run_in_executor(None, _ensure_vs)
+    # R.3: preload the reranker when NEWS_RERANK=1, so the first /api/ask/news is not slow.
+    from news_rag import warm_up_reranker
+    asyncio.get_running_loop().run_in_executor(None, warm_up_reranker)
     yield
 
 
@@ -391,6 +395,7 @@ def ask_news(request: NewsQueryRequest):
             since=request.since,
             until=request.until,
             k=max(1, min(request.k, 20)),
+            rerank=request.rerank,
         )
     except Exception as e:
         traceback.print_exc()

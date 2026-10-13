@@ -18,10 +18,27 @@ failure is invisible to whoever asked.
 **It filters by date.** Answering "what did the market think in early 2022" with 2026
 articles is the M.7 look-ahead error with a natural-language interface on top. The
 window is passed to both retrieval legs, not applied afterwards.
+
+**It can rerank (R.3), off by default.** With NEWS_RERANK=1 the fused top-30 is reordered by a
+cross-encoder before the top-k reaches the prompt. The depth was chosen from a measured
+sweep, not a default (60 queries, nDCG@10, median rerank latency on MPS):
+
+    no rerank               0.781   0 s
+    top-20, 512 tokens      0.843   1.05 s
+    top-30, 256 tokens      0.859   0.98 s   <- default: ~80% of the gain at ~20% of the cost
+    top-50, 512 tokens      0.862   2.63 s
+    top-100, 256 tokens     0.878   3.05 s
+    top-100, 512 tokens     0.875   5.02 s
+
+Truncating to 256 tokens costs nothing measurable (news puts its subject in the lede) and
+cuts the cost ~40%. It is off by default because the service image does not carry torch
+(requirements-eval.txt); if the model cannot load, the answer falls back to the fused order
+and says so in `rerank.error` rather than failing.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import time
@@ -36,6 +53,9 @@ from injection_guard import check_answer, screen  # noqa: E402
 
 MAX_SNIPPET = 700
 DEFAULT_K = 8
+RERANK_ENABLED = os.getenv("NEWS_RERANK", "0") == "1"
+RERANK_CANDIDATES = int(os.getenv("NEWS_RERANK_CANDIDATES", "30"))
+RERANK_MAX_LEN = int(os.getenv("NEWS_RERANK_MAX_LEN", "256"))
 
 REFUSAL = (
     "I could not find any articles in the corpus matching that question, so I have "
@@ -152,6 +172,19 @@ def cited_ids(answer: str, n_sources: int) -> list[int]:
     return sorted(i for i in found if 1 <= i <= n_sources)
 
 
+def warm_up_reranker() -> None:
+    """Load the cross-encoder at startup when NEWS_RERANK=1: measured, the first request
+    otherwise pays ~6.7 s of model load on top of the ~1 s rerank."""
+    if not RERANK_ENABLED:
+        return
+    try:
+        from rerank import _model
+        _model(RERANK_MAX_LEN).predict([("warm up", "warm up")], show_progress_bar=False)
+        print(f"[news_rag] reranker warm (top-{RERANK_CANDIDATES}, {RERANK_MAX_LEN} tokens)")
+    except Exception as e:  # noqa: BLE001 - answers fall back to fused order
+        print(f"[news_rag] reranker unavailable, serving without it: {e}")
+
+
 def answer_from_news(
     question: str,
     llm,
@@ -161,14 +194,29 @@ def answer_from_news(
     until: int | None = None,
     k: int = DEFAULT_K,
     rrf_k: int = RRF_K,
+    rerank: bool | None = None,
 ) -> dict:
     from langchain_core.messages import HumanMessage, SystemMessage
 
+    use_rerank = RERANK_ENABLED if rerank is None else rerank
     t0 = time.perf_counter()
     dense, sparse, fused = search(
-        question, k=k, symbol=symbol, since=since, until=until, rrf_k=rrf_k
+        question, k=max(k, RERANK_CANDIDATES) if use_rerank else k,
+        symbol=symbol, since=since, until=until, rrf_k=rrf_k
     )
     t_retrieve = time.perf_counter() - t0
+
+    rerank_info = {"enabled": use_rerank}
+    if use_rerank and fused:
+        try:
+            from rerank import fetch_bodies, rerank as cross_rerank
+            fused, spent = cross_rerank(question, fused, fetch_bodies(coll, fused), k, RERANK_MAX_LEN)
+            rerank_info.update(candidates=RERANK_CANDIDATES, max_len=RERANK_MAX_LEN, ms=round(spent * 1000, 1))
+        except Exception as e:  # noqa: BLE001 - a missing model must not take the answer down
+            fused = fused[:k]
+            rerank_info.update(error=str(e)[:200])
+    else:
+        fused = fused[:k]
 
     if not fused:
         return {
@@ -210,4 +258,5 @@ def answer_from_news(
         "retrieval_ms": round(t_retrieve * 1000, 1),
         "generation_ms": round(t_gen * 1000, 1),
         "legs": {"dense": len(dense), "sparse": len(sparse), "fused": len(fused)},
+        "rerank": rerank_info,
     }
