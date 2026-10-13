@@ -31,6 +31,7 @@ paraphrase, and only the split shows whether that held.
     python eval/score_runs.py --k 5
     python eval/score_runs.py --md      # markdown tables, for the writeup
     python eval/score_runs.py --compare hybrid_k60 hybrid_k60_rerank   # which queries moved
+    python eval/score_runs.py --ci hybrid_k60 hybrid_k60_rerank        # is the gap significant
 """
 
 from __future__ import annotations
@@ -114,6 +115,8 @@ def main() -> None:
     ap.add_argument("--md", action="store_true")
     ap.add_argument("--compare", nargs=2, metavar=("BASE", "NEW"),
                     help="per-query nDCG change from BASE to NEW, largest moves first")
+    ap.add_argument("--ci", nargs=2, metavar=("BASE", "NEW"),
+                    help="paired bootstrap 95%% CI of NEW - BASE for nDCG@k and P@k (g=2)")
     a = ap.parse_args()
 
     grades, runs, challenge = load(a.source)
@@ -167,6 +170,15 @@ def main() -> None:
     print(f"nDCG@{a.k} by challenge type")
     print(table(rows, ["system"] + challenges, a.md))
 
+    for name in (a.ci or []) + (a.compare or []):
+        if name not in runs:
+            raise SystemExit(f"unknown system {name!r}; have: {', '.join(systems)}")
+    if a.ci:
+        base, new = a.ci
+        for name, (d, lo, hi) in paired_ci(runs, qids, grades, a.k, base, new).items():
+            sig = "significant" if lo > 0 or hi < 0 else "not significant"
+            print(f"{new} - {base}  {name}@{a.k}: {d:+.3f}  95% CI [{lo:+.3f}, {hi:+.3f}]  {sig}")
+
     if a.compare:
         base, new = a.compare
         texts = {d["query_id"]: d["query"] for d in
@@ -185,6 +197,25 @@ def main() -> None:
         rows = [[q, challenge.get(q, "?"), f"{nb:.3f}", f"{nn:.3f}", f"{d:+.3f}", texts.get(q, "")[:48]]
                 for d, q, nb, nn in moves[:8] + [m for m in moves[-8:] if m not in moves[:8]]]
         print(table(rows, ["query", "challenge", base, new, "delta", "text"], a.md))
+
+
+def paired_ci(runs, qids, grades, k, base, new, n_boot=10000, seed=7):
+    """Paired bootstrap over queries: resample the 60 queries with replacement, take the mean
+    per-query difference each time, report the 2.5/97.5 percentiles. Paired, because both
+    systems answer the same queries -- the per-query difference is what varies."""
+    import random
+    rnd = random.Random(seed)
+    out = {}
+    for name, idx, bar in (("nDCG", 2, 1), ("P(g=2)", 3, 2)):
+        diffs = []
+        for q in qids:
+            a = metrics(runs[base].get(q, []), q, grades, k, bar)[idx]
+            b = metrics(runs[new].get(q, []), q, grades, k, bar)[idx]
+            if a is not None and b is not None:
+                diffs.append(b - a)
+        means = sorted(sum(rnd.choice(diffs) for _ in diffs) / len(diffs) for _ in range(n_boot))
+        out[name] = (sum(diffs) / len(diffs), means[int(0.025 * n_boot)], means[int(0.975 * n_boot)])
+    return out
 
 
 if __name__ == "__main__":
