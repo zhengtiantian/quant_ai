@@ -39,6 +39,23 @@ but put 76% of the pool at grade 2; qwen3.5-4b scored 0.64 either way.
     python eval/judge_pool.py --human --sample 30 --among reference_claude   # spot-check the reference
     python eval/judge_pool.py --kappa human llm_v2   # agreement between any two sources
     python eval/judge_pool.py --import-labels FILE --as reference_claude
+
+Rubric v3 and a second judge model (2026-10-12/13, merged from another line of work). v3 is
+stricter than v2 at grade 1 and names the two cases a literal reading gets wrong (title-only
+articles, bare ticker/product queries). Run on qwen3.8-27b with reasoning off it was used for
+R.3's rerank evaluation. Same 150 reference pairs, measured with this script's --kappa:
+
+    judge (rubric)            exact   kappa   linear-w   kappa at g=2 bar
+    gemma-4-e4b (v1) "llm"    0.620   0.414
+    gemma-4-e4b (v2) llm_v2   0.793   0.670
+    qwen3.8-27b (v3) llm_v3_qwen27  0.733   0.575
+
+v2/gemma agrees better overall (it places grade 1 better); v3/qwen errs strict -- it never
+promotes a reference-0 pair but sends some reference-1 pairs to 0. Which judge reports a
+table is decided by these numbers, see score_runs.py and PROJECT_PLAN R.4.
+
+    python eval/judge_pool.py --llm --rubric v3 --model qwen/qwen3.8-27b --source llm_v3_qwen27
+    python eval/judge_pool.py --llm --source llm_v2 --subset reference_claude   # only the reference pairs
 """
 
 from __future__ import annotations
@@ -93,26 +110,72 @@ Grades:
 
 Reply with JSON only: {{"grade": 0|1|2, "why": "<one short sentence>"}}"""
 
+PROMPT_V3 = """You are grading search results for a financial news retrieval system. Be strict:
+most retrieved articles do NOT answer the query, and a lenient grade makes the evaluation useless.
+
+Query: {query}
+
+Document
+  Title: {title}
+  Company: {symbol}
+  Date: {date}
+  Body: {body}
+
+Grades:
+  2 = the article is ABOUT what the query asks for: the specific event, development or
+      situation the query describes is the article's subject (not a side mention).
+  1 = the article is about the same specific company AND the same kind of event as the
+      query, but a different occurrence, or it covers the asked-for event only in passing.
+  0 = everything else. In particular, grade 0 when the article:
+      - is about the right company but a different topic (earnings vs. a lawsuit, etc.)
+      - is about the right theme but none of what the query actually asks
+      - only shares keywords with the query
+      - is a listicle, market wrap or stock-price summary that names the company among others
+
+Two cases need care:
+  - Query that is only a name, ticker or product (e.g. "LRCX", "H100", "Paxlovid"): it asks
+    for news about that thing. An article whose main subject is that company or product is
+    a 2; one that mentions it only in passing is a 0.
+  - Title-only article (no body): judge it on the title. If the title clearly states a
+    subject that answers the query, that is a 2; the missing body is not a reason to lower it.
+
+If you hesitate between two grades, choose the lower one.
+
+Reply with JSON only: {{"grade": 0|1|2, "why": "<one short sentence>"}}"""
+
+RUBRICS = {"v2": PROMPT, "v3": PROMPT_V3}
+
 
 def _db():
     return MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)[DB_NAME]
 
 
-def _pending(db, source: str, limit: int | None):
-    """Pool pairs this source has not judged yet, so a killed run resumes where it stopped."""
+def _pending(db, source: str, limit: int | None, subset: str | None = None):
+    """Pool pairs this source has not graded yet, so a killed run resumes where it stopped.
+
+    Errored pairs (LM Studio 500s while a model loads or the GPU is contended) count as not
+    done and are retried. `subset`: only pairs another source covers -- to try a judge on
+    the reference sample before spending a full run on it.
+    """
     done = {(j["query_id"], j["doc_key"]) for j in
-            db[JUDGE_COLL].find({"source": source}, {"query_id": 1, "doc_key": 1})}
-    rows = [d for d in db[POOL_COLL].find() if (d["query_id"], d["doc_key"]) not in done]
+            db[JUDGE_COLL].find({"source": source, "grade": {"$ne": None}}, {"query_id": 1, "doc_key": 1})}
+    keep = None
+    if subset:
+        keep = {(j["query_id"], j["doc_key"]) for j in
+                db[JUDGE_COLL].find({"source": subset}, {"query_id": 1, "doc_key": 1})}
+    rows = [d for d in db[POOL_COLL].find()
+            if (d["query_id"], d["doc_key"]) not in done and (keep is None or (d["query_id"], d["doc_key"]) in keep)]
     return rows[:limit] if limit else rows
 
 
-def _ask(doc) -> dict | None:
+def _ask(doc, model: str | None = None, rubric: str = "v2") -> dict | None:
+    model = model or JUDGE_MODEL
     body = (doc.get("excerpt") or "").strip()
     payload = {
-        "model": JUDGE_MODEL,
+        "model": model,
         "temperature": 0,
         "max_tokens": 200,
-        "messages": [{"role": "user", "content": PROMPT.format(
+        "messages": [{"role": "user", "content": RUBRICS[rubric].format(
             query=doc["query"],
             title=doc.get("title") or "(no title)",
             symbol=doc.get("symbol") or "(unknown)",
@@ -120,6 +183,10 @@ def _ask(doc) -> dict | None:
             body=body[:EXCERPT] if body else "(title only -- this article has no body text)",
         )}],
     }
+    if "qwen" in model:
+        # qwen3.x thinks by default: ~300 reasoning tokens, ~38 s per pair. "none" turns it
+        # off in LM Studio (~4 s per pair).
+        payload["reasoning_effort"] = "none"
     try:
         r = requests.post(f"{LM_STUDIO_URL}/chat/completions", json=payload,
                           headers={"Content-Type": "application/json"}, timeout=180)
@@ -162,22 +229,24 @@ def _record(doc, result, source, model):
     )
 
 
-def judge_llm(limit: int | None) -> None:
+def judge_llm(limit: int | None, model: str | None = None, rubric: str = "v2",
+              source: str = JUDGE_SOURCE, subset: str | None = None) -> None:
+    model = model or JUDGE_MODEL
     db = _db()
-    rows = _pending(db, JUDGE_SOURCE, limit)
+    rows = _pending(db, source, limit, subset)
     if not rows:
         print("nothing left to judge")
         return
-    print(f"judging {len(rows)} pairs with {JUDGE_MODEL} as {JUDGE_SOURCE} ({WORKERS} workers)", flush=True)
+    print(f"judging {len(rows)} pairs with {model}, rubric {rubric}, as {source} ({WORKERS} workers)", flush=True)
 
     ops, errors, dist = [], 0, {0: 0, 1: 0, 2: 0}
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for i, (doc, res) in enumerate(zip(rows, pool.map(_ask, rows)), 1):
+        for i, (doc, res) in enumerate(zip(rows, pool.map(lambda d: _ask(d, model, rubric), rows)), 1):
             if res.get("error"):
                 errors += 1
             else:
                 dist[res["grade"]] += 1
-            ops.append(_record(doc, res, JUDGE_SOURCE, JUDGE_MODEL))
+            ops.append(_record(doc, res, source, f"{model} rubric={rubric}"))
             if len(ops) >= 50:
                 db[JUDGE_COLL].bulk_write(ops)
                 ops = []
@@ -268,9 +337,23 @@ def kappa(a_source: str = "human", b_source: str = JUDGE_SOURCE) -> None:
     po = agree / n
     k = (po - pe) / (1 - pe) if pe < 1 else 0.0
 
+    # Linear-weighted kappa: with ordinal grades 2-vs-1 is a smaller miss than 2-vs-0.
+    w = lambda i, j: abs(i - j) / 2  # noqa: E731
+    do = sum(w(human[x], llm[x]) for x in both) / n
+    de = sum(ph[i] * pl[j] * w(i, j) for i in (0, 1, 2) for j in (0, 1, 2))
+    kw = 1 - do / de if de else 0.0
+    # Binary at the strict bar (grade 2 or not) -- the bar recall/MRR (g=2) are scored at.
+    hb, lb = {x: human[x] == 2 for x in both}, {x: llm[x] == 2 for x in both}
+    pob = sum(hb[x] == lb[x] for x in both) / n
+    p1h, p1l = sum(hb.values()) / n, sum(lb.values()) / n
+    peb = p1h * p1l + (1 - p1h) * (1 - p1l)
+    kb = (pob - peb) / (1 - peb) if peb < 1 else 0.0
+
     print(f"overlapping pairs : {n}")
     print(f"exact agreement   : {po:.3f}  ({agree}/{n})")
     print(f"Cohen's kappa     : {k:.3f}")
+    print(f"linear-weighted   : {kw:.3f}")
+    print(f"kappa at g=2 bar  : {kb:.3f}   (grade-2 share {p1h:.2f} vs {p1l:.2f})")
     print(f"\nconfusion (rows {a_source}, cols {b_source})")
     print("        0     1     2")
     for g in (0, 1, 2):
@@ -290,9 +373,13 @@ def main() -> None:
     ap.add_argument("--sample", type=int, default=100)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--among", metavar="SOURCE", help="with --human: sample only pairs this source judged")
+    ap.add_argument("--model", default=None, help=f"--llm: judge model (default {JUDGE_MODEL})")
+    ap.add_argument("--rubric", default="v2", choices=sorted(RUBRICS), help="--llm: grading rubric")
+    ap.add_argument("--source", default=JUDGE_SOURCE, help="--llm: label set to write")
+    ap.add_argument("--subset", metavar="SOURCE", help="--llm: only pairs this source judged")
     a = ap.parse_args()
     if a.llm:
-        judge_llm(a.limit)
+        judge_llm(a.limit, a.model, a.rubric, a.source, a.subset)
     elif a.human:
         judge_human(a.sample, a.seed, a.among)
     elif a.kappa is not None:

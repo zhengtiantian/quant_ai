@@ -30,6 +30,7 @@ paraphrase, and only the split shows whether that held.
     python eval/score_runs.py
     python eval/score_runs.py --k 5
     python eval/score_runs.py --md      # markdown tables, for the writeup
+    python eval/score_runs.py --compare hybrid_k60 hybrid_k60_rerank   # which queries moved
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ POOL_COLL = "eval_retrieval_pool"
 RUNS_COLL = "eval_retrieval_runs"
 JUDGE_COLL = "eval_retrieval_judgments"
 
-SYSTEM_ORDER = ["sparse", "dense", "hybrid_k60", "hybrid_k5"]
+SYSTEM_ORDER = ["sparse", "dense", "hybrid_k60", "hybrid_k5", "hybrid_k60_rerank"]
 
 
 def load(source: str):
@@ -111,6 +112,8 @@ def main() -> None:
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--source", default="llm_v2", help="which judge's labels to score against")
     ap.add_argument("--md", action="store_true")
+    ap.add_argument("--compare", nargs=2, metavar=("BASE", "NEW"),
+                    help="per-query nDCG change from BASE to NEW, largest moves first")
     a = ap.parse_args()
 
     grades, runs, challenge = load(a.source)
@@ -163,6 +166,25 @@ def main() -> None:
             for s in systems]
     print(f"nDCG@{a.k} by challenge type")
     print(table(rows, ["system"] + challenges, a.md))
+
+    if a.compare:
+        base, new = a.compare
+        texts = {d["query_id"]: d["query"] for d in
+                 MongoClient(MONGO_URI)[DB_NAME][POOL_COLL].find({}, {"query_id": 1, "query": 1})}
+        moves = []
+        for q in qids:
+            nb = metrics(runs[base].get(q, []), q, grades, a.k, 1)[2]
+            nn = metrics(runs[new].get(q, []), q, grades, a.k, 1)[2]
+            if nb is not None and nn is not None:
+                moves.append((nn - nb, q, nb, nn))
+        moves.sort(reverse=True)
+        up = sum(1 for d, *_ in moves if d > 0.01)
+        down = sum(1 for d, *_ in moves if d < -0.01)
+        print(f"\n{base} -> {new}: nDCG@{a.k} up on {up} queries, down on {down}, "
+              f"flat on {len(moves) - up - down}")
+        rows = [[q, challenge.get(q, "?"), f"{nb:.3f}", f"{nn:.3f}", f"{d:+.3f}", texts.get(q, "")[:48]]
+                for d, q, nb, nn in moves[:8] + [m for m in moves[-8:] if m not in moves[:8]]]
+        print(table(rows, ["query", "challenge", base, new, "delta", "text"], a.md))
 
 
 if __name__ == "__main__":
