@@ -1,0 +1,5 @@
+# Evaluation-only dependencies (eval/, tools/rerank.py). Kept out of requirements.txt on
+# purpose: sentence-transformers pulls torch, several GB the quant-ai service image does not
+# need -- the reranker runs in the R.3/R.4 evaluation, not in the request path (yet).
+#   .venv/bin/python -m pip install -r requirements.txt -r requirements-eval.txt
+sentence-transformers>=3,<7
