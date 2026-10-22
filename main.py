@@ -337,10 +337,20 @@ async def lifespan(_app: FastAPI):
     # R.3: preload the reranker when NEWS_RERANK=1, so the first /api/ask/news is not slow.
     from news_rag import warm_up_reranker
     asyncio.get_running_loop().run_in_executor(None, warm_up_reranker)
+    if MARKETS_ENABLED:
+        from markets import background
+        background.start()
     yield
 
 
 app.router.lifespan_context = lifespan
+
+# Portfolio, global markets and daily briefs (markets/). Host only: it keeps personal data in
+# SQLite under ~/Library and calls the claude CLI, neither of which exists in the Docker image.
+MARKETS_ENABLED = os.getenv("MARKETS_ENABLED", "").strip() == "1"
+if MARKETS_ENABLED:
+    from markets.api import router as markets_router
+    app.include_router(markets_router)
 
 
 @app.get("/health")

@@ -29,6 +29,9 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 QUANT_API = os.getenv("QUANT_API", "http://localhost:18081").rstrip("/")
+# The user's own portfolio lives in quant_ai's markets routes on the host since 2026-10-22
+# (it moved there from job_agent's dashboard); quant_api's holdings tables are deprecated.
+MARKETS_URL = os.getenv("MARKETS_URL", "http://127.0.0.1:18000/api/markets").rstrip("/")
 TIMEOUT = float(os.getenv("QUANT_MCP_TIMEOUT", "15"))
 MONGO_URI = os.getenv(
     "LOCAL_MONGO_URI", "mongodb://root:root@127.0.0.1:37018/?authSource=admin"
@@ -374,20 +377,81 @@ def get_positions() -> str:
     return _get("/api/positions") or _unavailable("/api/positions")
 
 
+def _markets_get(path: str) -> dict[str, Any] | None:
+    """GET from quant_ai's markets routes; None when they are not running (e.g. in Docker)."""
+    try:
+        resp = requests.get(f"{MARKETS_URL}{path}", timeout=TIMEOUT)
+        body = resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+    return body if resp.status_code == 200 and body.get("status") == "success" else None
+
+
+def _r(v: Any, nd: int = 4) -> Any:
+    return round(v, nd) if isinstance(v, float) else v
+
+
+def holdings_from_markets(state: dict[str, Any]) -> dict[str, Any]:
+    """quant_ai's portfolio state in the shape get_my_holdings has always returned (camelCase,
+    weightPct, totals.holdingsValue / totalValue), so portfolio_agent's checks keep working.
+    There is no cash ledger any more: totalValue equals holdingsValue and weights are shares
+    of the invested value. Both cost rules are included (avgCost and fifoAvgCost)."""
+    rows = []
+    for h in state.get("holdings") or []:
+        q = h.get("quote") or {}
+        rows.append({
+            "symbol": h["symbol"], "name": q.get("name"), "quantity": _r(h.get("quantity")),
+            "avgCost": _r(h.get("avg_cost")), "fifoAvgCost": _r(h.get("fifo_avg_cost")), "price": _r(q.get("price")),
+            "session": q.get("session"), "regularClose": _r(q.get("regular_price")),
+            "costBasis": _r(h.get("cost")), "marketValue": _r(h.get("market_value")),
+            "unrealisedPnl": _r(h.get("unrealized")), "unrealisedPnlPct": _r(h.get("unrealized_pct")),
+            "fifoUnrealisedPnl": _r(h.get("fifo_unrealized")), "realisedPnl": _r(h.get("realized")),
+            "dayChangePct": _r(h.get("day_change_pct")), "dayPnl": _r(h.get("day_pnl")),
+            "weightPct": _r(h.get("weight")), "tradeCount": h.get("trades"),
+            "quoteSource": "nasdaq" + (" (stale)" if q.get("stale") else ""),
+        })
+    t = state.get("totals") or {}
+    value = t.get("market_value") or 0.0
+    return {
+        "holdings": rows,
+        "totals": {"holdingsValue": _r(value), "cash": None, "totalValue": _r(value), "costBasis": _r(t.get("cost")),
+                   "unrealisedPnl": _r(t.get("unrealized")), "unrealisedPnlPct": _r(t.get("unrealized_pct")),
+                   "fifoCostBasis": _r(t.get("fifo_cost")), "realisedPnl": _r(t.get("realized")),
+                   "dividends": _r(t.get("dividends")), "dayPnl": _r(t.get("day_pnl")), "dayPnlPct": _r(t.get("day_pnl_pct")),
+                   "openPositions": len(rows)},
+        "watchlist": [{"symbol": w["symbol"], "price": _r((w.get("quote") or {}).get("price")),
+                       "dayChangePct": _r(w.get("day_change_pct"))} for w in state.get("watchlist") or []],
+        "currency": "USD", "usSession": state.get("session"), "source": "quant_ai markets",
+    }
+
+
+def transactions_from_markets(state: dict[str, Any], symbol: str = "") -> list[dict[str, Any]]:
+    out = []
+    for t in state.get("transactions") or []:          # already newest first
+        if symbol and t["symbol"] != symbol:
+            continue
+        out.append({"id": t["id"], "symbol": t["symbol"], "side": str(t["side"]).upper(), "quantity": t["quantity"],
+                    "price": t["price"], "tradeDate": t["trade_date"], "fee": t["fee"], "note": t.get("note") or ""})
+    return out
+
+
 @mcp.tool()
 def get_my_holdings() -> str:
     """The user's real portfolio: what they actually own, with live prices.
 
-    Returns one row per open holding — quantity, average cost, current price, cost basis,
-    market value, unrealised P&L (absolute and percent), realised P&L, day change, and
-    weight as a share of total capital including cash — plus portfolio totals and the
-    cash balance. Derived from a hand-maintained transaction log, so the average cost
-    reflects every recorded buy.
+    Returns one row per open holding — quantity, average cost (the user's rule, avgCost, and
+    FIFO, fifoAvgCost), current price and its US session (pre-market / regular / after hours),
+    cost basis, market value, unrealised P&L (absolute and percent), realised P&L, day change,
+    and weight as a share of the invested value — plus portfolio totals and the watchlist.
+    Derived from a hand-maintained transaction log, so the average cost reflects every
+    recorded buy. There is no cash balance: totalValue is the invested value.
 
     Distinct from get_positions, which returns the rule-generated paper positions.
-    Quotes come from Finnhub during US market hours and fall back to the last daily
-    close otherwise; each holding carries the `quoteSource` that produced its price.
+    Quotes come from Nasdaq, including pre-market and after-hours prices.
     """
+    state = _markets_get("/portfolio/state")
+    if state is not None:
+        return json.dumps(holdings_from_markets(state), indent=2, ensure_ascii=False)
     return _get("/api/portfolio/holdings") or _unavailable("/api/portfolio/holdings")
 
 
@@ -395,13 +459,17 @@ def get_my_holdings() -> str:
 def get_my_transactions(symbol: str = "") -> str:
     """The user's recorded trades, newest first — the log behind get_my_holdings.
 
-    Each entry carries side (BUY/SELL), quantity, price, trade date, fee and note. Use
-    this to see how a position was built up rather than only its current average cost.
+    Each entry carries side (BUY/SELL/DIVIDEND/FEE), quantity, price, trade date, fee and note.
+    Use this to see how a position was built up rather than only its current average cost.
 
     Args:
         symbol: Optional ticker filter, e.g. AAPL. Empty returns every trade.
     """
-    params = {"symbol": symbol.upper().strip()} if symbol.strip() else None
+    sym = symbol.upper().strip()
+    state = _markets_get("/portfolio/state")
+    if state is not None:
+        return json.dumps(transactions_from_markets(state, sym), indent=2, ensure_ascii=False)
+    params = {"symbol": sym} if sym else None
     return (_get("/api/portfolio/transactions", params)
             or _unavailable("/api/portfolio/transactions"))
 

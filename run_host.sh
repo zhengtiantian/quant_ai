@@ -9,6 +9,8 @@ export PORT=18000
 # R.3: rerank /api/ask/news answers (fused top-30, 256 tokens, ~1 s; see news_rag.py). The host
 # venv has torch via requirements-eval.txt; the Docker image does not, so it stays off there.
 export NEWS_RERANK="${NEWS_RERANK:-1}"
+# Portfolio, global markets and the daily briefs (markets/): host only, never in the image.
+export MARKETS_ENABLED=1
 
 # R.5 phase 1b — service credentials for quant_api, kept out of this file on purpose.
 # .env is gitignored; without it the service simply calls quant_api anonymously, which
