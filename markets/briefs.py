@@ -441,7 +441,7 @@ def generate(kind: str, session: Optional[str] = None, trigger: str = "schedule"
         raw = out.get("result") or ""
         parsed = parse_reply(raw)
         preds, dropped = predictions.parse_block(parsed.pop("predictions_text"), predictions.universe(_us_symbols(snap)),
-                                                 date.fromisoformat(session))
+                                                 date.fromisoformat(session), issued_ts=started)
         if dropped:
             print(f"[briefs] {kind} {session} {topic}: dropped predictions: {dropped}")
         models = list((out.get("modelUsage") or {}).keys())

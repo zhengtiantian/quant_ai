@@ -10,6 +10,10 @@ satisfies `op threshold`. op is one of >=, <=, abs>= (a move at least this big e
 abs<= (a move at most this big). Only symbols the brief was shown are accepted, so each can be
 scored from CNBC's daily bars without guessing what a name meant.
 
+A call must be about a session that has not opened yet when the brief is written: a US close
+predicted at 14:43 Dublin, with the stock already down 10% at the open, would be half known
+and would flatter the score. Such calls are dropped.
+
 Scoring runs after the target exchange has closed on that date. A prediction whose date had no
 trading (a holiday) is voided after a few days. The scorecard reports the hit rate and the Brier
 score of the stated confidence (0 is perfect, 0.25 is what always saying 50% earns), overall,
@@ -68,8 +72,10 @@ def universe(us_symbols: Iterable[str] = ()) -> Dict[str, Tuple[str, str]]:
     return out
 
 
-def parse_block(text: str, allowed: Dict[str, Tuple[str, str]], issued: date) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Valid predictions and the reasons others were dropped."""
+def parse_block(text: str, allowed: Dict[str, Tuple[str, str]], issued: date,
+                issued_ts: Optional[float] = None) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Valid predictions and the reasons others were dropped. issued_ts: when the brief was
+    written; a call on a session that had already opened by then is dropped."""
     good, dropped = [], []
     for line in (text or "").splitlines():
         line = line.strip().strip(",")
@@ -96,6 +102,8 @@ def parse_block(text: str, allowed: Dict[str, Tuple[str, str]], issued: date) ->
             dropped.append(f"{sym}: date {target} is not within 10 days")
         elif target.weekday() >= 5:
             dropped.append(f"{sym}: {target} is a weekend")
+        elif issued_ts is not None and _open_ts(allowed[sym][1], target) <= issued_ts:
+            dropped.append(f"{sym}: the {target} session had already opened")
         else:
             name, ex = allowed[sym]
             good.append({"symbol": sym, "name": name, "exchange": ex, "target_date": target.isoformat(), "op": op,
@@ -124,14 +132,39 @@ def save(brief_id: int, kind: str, preds: List[Dict[str, Any]], path: Optional[P
 
 # ---------------------------------------------------------------- scoring
 
-def _close_ts(exchange: str, target: date) -> float:
+def _session_ts(exchange: str, target: date, which: str) -> float:
     if exchange == "US":
-        tz, close = ZoneInfo("America/New_York"), "16:00"
+        tz, hours = ZoneInfo("America/New_York"), ("09:30", "16:00")
     else:
-        _, _, tzname, _, close = global_markets.EXCHANGES[exchange]
-        tz = ZoneInfo(tzname)
-    h, m = map(int, close.split(":"))
+        _, _, tzname, o, c = global_markets.EXCHANGES[exchange]
+        tz, hours = ZoneInfo(tzname), (o, c)
+    h, m = map(int, hours[0 if which == "open" else 1].split(":"))
     return datetime(target.year, target.month, target.day, h, m, tzinfo=tz).timestamp()
+
+
+def _open_ts(exchange: str, target: date) -> float:
+    return _session_ts(exchange, target, "open")
+
+
+def _close_ts(exchange: str, target: date) -> float:
+    return _session_ts(exchange, target, "close")
+
+
+def void_already_open(path: Optional[Path] = None) -> int:
+    """Void pending calls on sessions that had opened before their brief was written (for calls
+    stored before parse_block checked it)."""
+    conn = _conn(path)
+    try:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT p.id, p.exchange, p.target_date, b.started_at FROM predictions p JOIN briefs b ON b.id = p.brief_id "
+            "WHERE p.status = 'pending'")]
+        bad = [r["id"] for r in rows if r["started_at"] and _open_ts(r["exchange"], date.fromisoformat(r["target_date"])) <= r["started_at"]]
+        conn.executemany("UPDATE predictions SET status = 'void', note = 'session had already opened when the brief was written' "
+                         "WHERE id = ?", [(i,) for i in bad])
+        conn.commit()
+    finally:
+        conn.close()
+    return len(bad)
 
 
 def day_change(symbol: str, target: date) -> Optional[float]:

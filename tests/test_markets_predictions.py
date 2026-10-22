@@ -34,6 +34,17 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(good[2]["confidence"], 1.0)                     # clamped
         self.assertEqual(len(dropped), 5)                                # korean stock, op, weekend, too far, negative abs
 
+    def test_calls_on_a_session_already_open_are_dropped(self):
+        written = datetime(2026, 10, 22, 14, 43, tzinfo=ZoneInfo("Europe/Dublin")).timestamp()   # US open 14:30 Dublin
+        text = "\n".join([line(symbol="LRCX", date="2026-10-22"), line(symbol="ASML.AS", date="2026-10-22"),
+                           line(symbol="8035.T", date="2026-10-23"), line(symbol="LRCX", date="2026-10-23")])
+        good, dropped = pr.parse_block(text, ALLOWED, ISSUED, issued_ts=written)
+        self.assertEqual([(g["symbol"], g["target_date"]) for g in good], [("8035.T", "2026-10-23"), ("LRCX", "2026-10-23")])
+        self.assertTrue(all("already opened" in d for d in dropped))
+        before_open = datetime(2026, 10, 22, 14, 0, tzinfo=ZoneInfo("Europe/Dublin")).timestamp()
+        good, _ = pr.parse_block(line(symbol="LRCX", date="2026-10-22"), ALLOWED, ISSUED, issued_ts=before_open)
+        self.assertEqual(len(good), 1)
+
     def test_universe_excludes_korean_stocks_but_keeps_indices(self):
         self.assertNotIn("KRX:005930", ALLOWED)
         self.assertIn(".KQ11", ALLOWED)
