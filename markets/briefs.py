@@ -1,17 +1,26 @@
 """Daily market briefs, written by Claude Code in headless mode (`claude -p`) on the user's
 subscription, in Chinese and English.
 
-Two a day:
+Summaries, two a day:
   asia_europe  14:00 Dublin, weekdays: Asia has closed and Europe is mid-session.
   us           20:05 New York, weekdays: after the after-hours session ends.
+Forward-looking:
+  outlook      13:30 Dublin, weekdays: earnings of the holdings, the watchlist and the sector
+               bellwethers, and the main economic releases, over the next five trading days, with
+               what the market expects, the implied move, and both scenarios for each holding.
+  flash        whenever a bellwether moves 5% or more in pre-market or after hours (Lam Research
+               on 2026-10-21): how the move should travel to Asia, Europe and the holdings.
+
+Every brief ends with checkable predictions (markets/predictions.py), scored against real closes,
+so the briefs keep a track record instead of only sounding right.
 
 Each run takes a snapshot of the numbers (global exchanges, the macro board, the user's holdings
-and watchlist), hands it to Claude with web search allowed, and stores the answer. The numbers in
-the brief come from the snapshot; the reasons come from the news Claude finds and cites.
+and watchlist, and per kind the calendar or the trigger), hands it to Claude with web search
+allowed, and stores the answer. The numbers come from the snapshot; the reasons from the news
+Claude finds and cites.
 
-Missed runs (the Mac asleep) are caught up only while the snapshot would still describe that
-session: an Asia/Europe brief until the end of that Dublin day, a US brief until the next US
-pre-market. A failed run is retried a few times, then left failed with its error for the page.
+Missed scheduled runs (the Mac asleep) are caught up only while the snapshot would still describe
+that session. A failed run is retried a few times, then left failed with its error for the page.
 
 No API key on purpose: with ANTHROPIC_API_KEY removed from the environment the CLI uses the
 logged-in claude.ai subscription. That keeps this personal-use only.
@@ -32,7 +41,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from . import global_markets, portfolio
+from . import backup, events, global_markets, portfolio, predictions
 from .config import DATA_DIR, DB_PATH
 
 DUBLIN = ZoneInfo("Europe/Dublin")
@@ -40,11 +49,14 @@ NEW_YORK = ZoneInfo("America/New_York")
 KINDS = {
     "asia_europe": {"title": "Asia & Europe", "zone": DUBLIN, "at": dtime(14, 0)},
     "us": {"title": "US markets", "zone": NEW_YORK, "at": dtime(20, 5)},
+    "outlook": {"title": "Week ahead", "zone": DUBLIN, "at": dtime(13, 30)},
+    "flash": {"title": "Flash", "zone": NEW_YORK, "at": None},          # event-driven, no schedule
 }
 MAX_ATTEMPTS = 3
 RETRY_AFTER = 20 * 60          # seconds between attempts after a failure
 STALE_RUNNING = 30 * 60        # a "running" row older than this was a crashed run
 TIMEOUT = 15 * 60              # one claude run
+SCORE_EVERY = 600              # seconds between prediction scoring passes
 WORK_DIR = DATA_DIR / "briefs_work"   # empty cwd, so no project CLAUDE.md is picked up
 MODEL = os.getenv("BRIEFS_MODEL", "").strip()
 
@@ -56,21 +68,29 @@ US_MEGACAPS = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO", 
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS briefs (
-    id INTEGER PRIMARY KEY, kind TEXT NOT NULL, session_date TEXT NOT NULL,
+    id INTEGER PRIMARY KEY, kind TEXT NOT NULL, session_date TEXT NOT NULL, topic TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, trigger TEXT,
     started_at REAL, finished_at REAL, duration_s REAL,
     headline_zh TEXT, headline_en TEXT, body_zh TEXT, body_en TEXT, sources TEXT,
-    snapshot TEXT, error TEXT, raw TEXT, model TEXT, cost_usd REAL,
-    UNIQUE (kind, session_date));
+    snapshot TEXT, error TEXT, raw TEXT, model TEXT, cost_usd REAL, context TEXT,
+    UNIQUE (kind, session_date, topic));
 """
 _run_lock = threading.Lock()
 _running: Dict[str, bool] = {}
+_last = {"flash_check": 0.0, "score": 0.0}
 
 
 def _conn(path: Optional[Path] = None) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path or DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(briefs)")}
+    if cols and "topic" not in cols:
+        # 2026-10-22: flash briefs are one per company, so (kind, session_date) is no longer unique.
+        shared = ", ".join(sorted(cols))
+        conn.executescript(f"ALTER TABLE briefs RENAME TO briefs_v1; {SCHEMA}"
+                           f"INSERT INTO briefs ({shared}) SELECT {shared} FROM briefs_v1; DROP TABLE briefs_v1;")
+    else:
+        conn.executescript(SCHEMA)
     return conn
 
 
@@ -83,11 +103,13 @@ def _weekday_on_or_before(d: date) -> date:
 
 
 def due_session(kind: str, now: Optional[datetime] = None) -> Optional[str]:
-    """The session date a brief of this kind should exist for right now, or None."""
+    """The session date a scheduled brief of this kind should exist for right now, or None."""
     k = KINDS[kind]
+    if k["at"] is None:
+        return None
     local = (now or datetime.now(ZoneInfo("UTC"))).astimezone(k["zone"])
-    if kind == "asia_europe":
-        # From 14:00 to the end of that Dublin weekday; later the Asian session has moved on.
+    if kind in ("asia_europe", "outlook"):
+        # From the scheduled time to the end of that Dublin weekday.
         return local.date().isoformat() if local.weekday() < 5 and local.time() >= k["at"] else None
     # US: the latest weekday whose 20:05 has passed, until the next weekday's 04:00 pre-market.
     d = local.date() if local.time() >= k["at"] else local.date() - timedelta(days=1)
@@ -105,12 +127,14 @@ def current_session(kind: str, now: Optional[datetime] = None) -> str:
 
 
 def scheduled_at(kind: str, session: str) -> float:
-    """When the scheduled brief of this session is written (UTC timestamp)."""
+    """When the scheduled brief of this session is written (UTC timestamp); 0 for flash."""
     k = KINDS[kind]
+    if k["at"] is None:
+        return 0.0
     return datetime.combine(date.fromisoformat(session), k["at"], k["zone"]).timestamp()
 
 
-def _claim(kind: str, session: str, trigger: str, force: bool, path: Optional[Path]) -> bool:
+def _claim(kind: str, session: str, topic: str, trigger: str, force: bool, path: Optional[Path]) -> bool:
     """Mark this brief as running unless it is done, running, or out of attempts. A brief
     written by hand before the scheduled time does not count as the scheduled one: at the
     scheduled time it is written again, with that later snapshot."""
@@ -118,25 +142,24 @@ def _claim(kind: str, session: str, trigger: str, force: bool, path: Optional[Pa
     conn.isolation_level = None
     try:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT * FROM briefs WHERE kind = ? AND session_date = ?", (kind, session)).fetchone()
+        row = conn.execute("SELECT * FROM briefs WHERE kind = ? AND session_date = ? AND topic = ?",
+                           (kind, session, topic)).fetchone()
         now = time.time()
         if row:
             if row["status"] == "running" and now - (row["started_at"] or 0) < STALE_RUNNING:
                 conn.execute("ROLLBACK")
                 return False
             early = trigger == "schedule" and row["status"] == "done" and (row["finished_at"] or 0) < scheduled_at(kind, session)
-            if early:
-                pass
-            elif not force and (row["status"] == "done" or row["attempts"] >= MAX_ATTEMPTS
-                              or (row["status"] == "failed" and now - (row["finished_at"] or 0) < RETRY_AFTER)):
+            if not early and not force and (row["status"] == "done" or row["attempts"] >= MAX_ATTEMPTS
+                                            or (row["status"] == "failed" and now - (row["finished_at"] or 0) < RETRY_AFTER)):
                 conn.execute("ROLLBACK")
                 return False
             attempts = 1 if force or early else row["attempts"] + 1
             conn.execute("UPDATE briefs SET status = 'running', attempts = ?, trigger = ?, started_at = ?, error = NULL "
                          "WHERE id = ?", (attempts, trigger, now, row["id"]))
         else:
-            conn.execute("INSERT INTO briefs(kind, session_date, status, attempts, trigger, started_at) "
-                         "VALUES (?, ?, 'running', 1, ?, ?)", (kind, session, trigger, now))
+            conn.execute("INSERT INTO briefs(kind, session_date, topic, status, attempts, trigger, started_at) "
+                         "VALUES (?, ?, ?, 'running', 1, ?, ?)", (kind, session, topic, trigger, now))
         conn.execute("COMMIT")
         return True
     except BaseException:
@@ -179,66 +202,105 @@ def _global_snapshot(path: Optional[Path]) -> List[Dict[str, Any]]:
             for e in c["exchanges"]:
                 out.append({"region": r["name"], "country": c["name"], "exchange": e["name"], "open_now": e["open"],
                             "local_time": e["local_time"], "hours": e["hours"],
-                            "indices": [{"name": i["name"], **_slim(i, "price", "change_pct", "currency")} for i in e["indices"]],
-                            "stocks": [{"name": i["name"], **_slim(i, "price", "change_pct", "currency")} for i in e["stocks"]]})
+                            "indices": [{"symbol": i["symbol"], "name": i["name"], **_slim(i, "price", "change_pct", "currency")}
+                                        for i in e["indices"]],
+                            "stocks": [{"symbol": i["symbol"], "name": i["name"], **_slim(i, "price", "change_pct", "currency")}
+                                       for i in e["stocks"]]})
     return out
 
 
 def _macro_snapshot(path: Optional[Path]) -> Dict[str, Any]:
     m = global_markets.macro_state(path, max_age=0)
-    return {g["name"]: [{"name": i["name"], **_slim(i, "price", "change", "change_pct")} for i in g["items"]] for g in m["groups"]}
+    return {g["name"]: [{"symbol": i["symbol"], "name": i["name"], **_slim(i, "price", "change", "change_pct")} for i in g["items"]]
+            for g in m["groups"]}
 
 
-def snapshot(kind: str, path: Optional[Path] = None) -> Dict[str, Any]:
+def _us_symbols(snap: Dict[str, Any]) -> List[str]:
+    p = snap.get("my_portfolio") or {}
+    syms = [h["symbol"] for h in p.get("holdings") or []] + [w["symbol"] for w in p.get("watchlist") or []]
+    return list(dict.fromkeys(syms + list(events.BELLWETHERS) + US_MEGACAPS + [s for s, _ in US_SECTORS]))
+
+
+def snapshot(kind: str, path: Optional[Path] = None, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     now = datetime.now(ZoneInfo("UTC"))
     snap: Dict[str, Any] = {"taken_at_utc": now.strftime("%Y-%m-%d %H:%M"),
-                            "dublin_time": now.astimezone(DUBLIN).strftime("%Y-%m-%d %H:%M %Z"),
-                            "new_york_time": now.astimezone(NEW_YORK).strftime("%Y-%m-%d %H:%M %Z")}
+                            "dublin_time": now.astimezone(DUBLIN).strftime("%Y-%m-%d %H:%M %Z (%a)"),
+                            "new_york_time": now.astimezone(NEW_YORK).strftime("%Y-%m-%d %H:%M %Z (%a)")}
+    if context:
+        snap["trigger"] = context
     for key, fn in (("macro", _macro_snapshot), ("my_portfolio", _portfolio_snapshot)):
         try:
             snap[key] = fn(path)
         except Exception as e:  # noqa: BLE001 - a brief with a gap beats no brief
             snap[key] = {"unavailable": f"{type(e).__name__}: {e}"}
-    if kind == "asia_europe":
+    if kind in ("asia_europe", "flash", "outlook"):
         try:
             snap["exchanges"] = _global_snapshot(path)
         except Exception as e:  # noqa: BLE001
             snap["exchanges"] = {"unavailable": f"{type(e).__name__}: {e}"}
-    else:
+    if kind in ("us", "flash"):
         try:
             q = global_markets.fetch_cnbc([s for s, _ in US_SECTORS] + US_MEGACAPS)
             snap["us_sectors"] = [{"etf": s, "sector": n, **_slim(q.get(s, {}), "price", "change_pct")} for s, n in US_SECTORS]
             snap["us_megacaps"] = [{"symbol": s, **_slim(q.get(s, {}), "price", "change_pct")} for s in US_MEGACAPS]
         except Exception as e:  # noqa: BLE001
             snap["us_sectors"] = {"unavailable": f"{type(e).__name__}: {e}"}
+    if kind == "outlook":
+        prices = {h["symbol"]: (h.get("quote") or {}).get("price") for h in (snap.get("my_portfolio") or {}).get("holdings") or []}
+        try:
+            bw = portfolio.get_quotes(list(events.BELLWETHERS), path=path, cached_only=False)
+            prices.update({s: q.get("price") for s, q in bw.items() if q.get("price")})
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            snap["calendar"] = events.upcoming(_us_symbols(snap), path=path, prices=prices)
+        except Exception as e:  # noqa: BLE001
+            snap["calendar"] = {"unavailable": f"{type(e).__name__}: {e}"}
+        snap["bellwethers"] = {s: {"name": n, "group": g} for s, (n, g) in events.BELLWETHERS.items()}
+    if kind == "flash" and context:
+        try:
+            today = datetime.now(NEW_YORK).date()
+            rows = events.earnings_on(today, path) + events.earnings_on(today - timedelta(days=1), path)
+            snap["trigger_earnings"] = [r for r in rows if r["symbol"] == context.get("symbol")]
+        except Exception:  # noqa: BLE001
+            pass
     return snap
 
 
 # ---------------------------------------------------------------- the prompt
 
-SECTIONS = ("HEADLINE_ZH", "HEADLINE_EN", "BODY_ZH", "BODY_EN", "SOURCES")
+SECTIONS = ("HEADLINE_ZH", "HEADLINE_EN", "BODY_ZH", "BODY_EN", "SOURCES", "PREDICTIONS")
 
-PROMPT = """You are writing the user's daily {title} market brief for {session} (a personal note, not advice
+PROMPT = """You are writing the user's {title} market brief for {session} (a personal note, not advice
 for anyone else). The user is in Dublin, holds the US stocks listed under my_portfolio and follows the
 watchlist there.
 
 Below is a snapshot of the numbers taken just now. Use these numbers as given; do not replace them with
-numbers from the web. Use web search to find out WHY markets moved: the news, data releases, earnings,
-policy decisions and flows behind the biggest moves. Search in a focused way (about 5 to 10 searches),
-prefer reputable financial news from today, and keep track of the pages you rely on.
+numbers from the web. Use web search to find out WHY markets moved or what is expected: the news, data
+releases, earnings, guidance, policy decisions, geopolitics and flows behind it. Search in a focused way
+(about 5 to 10 searches), prefer reputable financial news, and keep track of the pages you rely on.
 
 {focus}
 
-Write the brief twice, the same content in Simplified Chinese and in English. Each version, in Markdown:
-  ## Bottom line            (2-3 sentences: what happened and the main reason)
-  ## What drove it          (the 2-4 main drivers, each tied to the moves it explains)
-  ## Winners and losers     (sectors / regions / stocks that diverged, with the snapshot numbers)
-  ## My holdings            (what today means for each holding and the watchlist that matters; be concrete)
-  ## What to watch next     (events, data, earnings in the next sessions)
-Use the Chinese section titles 一句话结论 / 主要驱动 / 分化：谁涨谁跌 / 对我的持仓 / 接下来关注 in the Chinese version.
-Say plainly when a reason is your inference rather than something a source reports. 300-600 words per version.
+Write the brief twice, the same content in Simplified Chinese and in English, in Markdown, with these
+sections ({sections_note}):
+{sections}
+Say plainly when a reason is your inference rather than something a source reports. 300-700 words per
+version.
 
-Reply with exactly these five blocks and nothing before or after them:
+Then make checkable predictions about the next sessions: {n_preds} of them, the ones you consider most
+informative, each a JSON object on its own line:
+{{"symbol": "<a symbol from the snapshot>", "date": "YYYY-MM-DD", "op": ">=|<=|abs>=|abs<=", "threshold": <percent>,
+ "confidence": <0.5-0.95>, "zh": "<the claim in Chinese>", "en": "<the claim in English>"}}
+meaning: that symbol's change on that trading date (its close against the previous close, in %, in the
+exchange's own calendar) satisfies op threshold; abs>= / abs<= are about the size of the move either way.
+Use only symbols that appear in the snapshot (exchanges indices/stocks by their "symbol", US tickers from
+my_portfolio, the US indices .SPX .IXIC .DJI .SOX .RUT, or a ticker named in the snapshot); Korean
+stocks are not scorable, use .KS11 / .KQ11. Pick dates that are trading days for that exchange. Prefer
+thresholds that make the call informative (not "moves less than 20%"), and state an honest confidence:
+the calls will be scored against real closes.
+
+Reply with exactly these six blocks and nothing before or after them:
 =====HEADLINE_ZH=====
 (one line, at most 40 Chinese characters)
 =====HEADLINE_EN=====
@@ -249,21 +311,58 @@ Reply with exactly these five blocks and nothing before or after them:
 (the English Markdown)
 =====SOURCES=====
 (one per line: - [title](url))
+=====PREDICTIONS=====
+(one JSON object per line)
 
 SNAPSHOT (JSON):
 {snapshot}
 """
+
+SUMMARY_SECTIONS = """  ## Bottom line            (2-3 sentences: what happened and the main reason)
+  ## What drove it          (the 2-4 main drivers, each tied to the moves it explains)
+  ## Winners and losers     (sectors / regions / stocks that diverged, with the snapshot numbers)
+  ## My holdings            (what today means for each holding and the watchlist that matters; be concrete)
+  ## What to watch next     (events, data, earnings in the next sessions)"""
+SUMMARY_ZH = "一句话结论 / 主要驱动 / 分化：谁涨谁跌 / 对我的持仓 / 接下来关注"
+
+OUTLOOK_SECTIONS = """  ## Bottom line            (the 2-3 events of the next five trading days that matter most for this portfolio)
+  ## Earnings calendar      (each relevant report from snapshot.calendar.earnings: date and timing, consensus EPS,
+                             what the market focuses on (guidance, capex, margins...), the implied move when given)
+  ## Scenarios              (for each important report: beat / miss, and what each would likely do to which holdings
+                             and to which Asian / European stocks, through which chain)
+  ## Macro and policy       (the main releases from snapshot.calendar.economic with consensus and previous, central
+                             banks, and geopolitics such as oil or conflicts, and their channel to these holdings)
+  ## Positioning notes      (concentration and exposure of the portfolio to these events; no buy/sell instructions)"""
+OUTLOOK_ZH = "一句话结论 / 财报日历 / 情景推演 / 宏观与政策 / 持仓风险提示"
+
+FLASH_SECTIONS = """  ## What happened          (the trigger: who moved, how much, in which session, and why, from the news)
+  ## How it travels         (the chain: suppliers, customers, competitors, the sector; which Asian and European stocks
+                             and indices should react in their next session, and by roughly how much, with reasons)
+  ## My holdings            (for each holding and relevant watchlist name: likely direction at the next open, size, why)
+  ## What would change this (what could stop or reverse the move: conference call details, peer results, macro)"""
+FLASH_ZH = "发生了什么 / 传导链条 / 对我的持仓 / 什么会改变判断"
 
 FOCUS = {
     "asia_europe": "Focus: today's Asian sessions (closed) and European sessions (still trading), what they "
                    "imply for tonight's US open (see the US futures in macro), and the macro board.",
     "us": "Focus: today's US regular session and the after-hours session that just ended (sectors, megacaps, "
           "earnings released after the close), the macro board, and what it sets up for Asia tomorrow.",
+    "outlook": "Focus: the next five trading days. snapshot.calendar lists the earnings of the holdings, the "
+               "watchlist and the sector bellwethers (snapshot.bellwethers), with consensus EPS and, when the option "
+               "chain gave it, the implied move from the at-the-money straddle; it also lists the main economic "
+               "releases. Search for what each report hinges on and for upcoming geopolitical or policy risks.",
+    "flash": "Focus: snapshot.trigger is a sector bellwether that just moved sharply outside regular hours. Explain "
+             "the move from the news, then trace how it should travel to the Asian and European exchanges in "
+             "snapshot.exchanges (their next sessions) and to the user's holdings at the next US open.",
 }
 
 
-def build_prompt(kind: str, session: str, snap: Dict[str, Any]) -> str:
-    return PROMPT.format(title=KINDS[kind]["title"], session=session, focus=FOCUS[kind],
+def build_prompt(kind: str, session: str, snap: Dict[str, Any], topic: str = "") -> str:
+    sections, zh, n = {"outlook": (OUTLOOK_SECTIONS, OUTLOOK_ZH, "4 to 8"), "flash": (FLASH_SECTIONS, FLASH_ZH, "4 to 8")}.get(
+        kind, (SUMMARY_SECTIONS, SUMMARY_ZH, "2 to 4"))
+    title = f"{KINDS[kind]['title']}: {topic}" if topic else KINDS[kind]["title"]
+    return PROMPT.format(title=title, session=session, focus=FOCUS[kind], sections=sections, n_preds=n,
+                         sections_note=f"in the Chinese version titled {zh}",
                          snapshot=json.dumps(snap, ensure_ascii=False, separators=(",", ":")))
 
 
@@ -276,7 +375,8 @@ def parse_reply(text: str) -> Dict[str, Any]:
     sources = [{"title": m.group(1).strip(), "url": m.group(2).strip()}
                for m in re.finditer(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", blocks.get("SOURCES", ""))]
     return {"headline_zh": blocks["HEADLINE_ZH"].splitlines()[0].strip(), "headline_en": blocks["HEADLINE_EN"].splitlines()[0].strip(),
-            "body_zh": blocks["BODY_ZH"], "body_en": blocks["BODY_EN"], "sources": sources}
+            "body_zh": blocks["BODY_ZH"], "body_en": blocks["BODY_EN"], "sources": sources,
+            "predictions_text": blocks.get("PREDICTIONS", "")}
 
 
 # ---------------------------------------------------------------- the CLI
@@ -324,37 +424,47 @@ def _notify(title: str, text: str) -> None:
 # ---------------------------------------------------------------- one run
 
 def generate(kind: str, session: Optional[str] = None, trigger: str = "schedule", force: bool = False,
-             path: Optional[Path] = None) -> Optional[int]:
+             path: Optional[Path] = None, topic: str = "", context: Optional[Dict[str, Any]] = None) -> Optional[int]:
     """Write one brief. Returns its row id, or None when there was nothing to do."""
     if kind not in KINDS:
         raise ValueError(f"unknown brief kind {kind!r}")
     session = session or current_session(kind)
-    if not _claim(kind, session, trigger, force, path):
+    if not _claim(kind, session, topic, trigger, force, path):
         return None
     started = time.time()
     snap: Dict[str, Any] = {}
     raw = None
+    preds: List[Dict[str, Any]] = []
     try:
-        snap = snapshot(kind, path)
-        out = run_claude(build_prompt(kind, session, snap))
+        snap = snapshot(kind, path, context)
+        out = run_claude(build_prompt(kind, session, snap, topic))
         raw = out.get("result") or ""
         parsed = parse_reply(raw)
+        preds, dropped = predictions.parse_block(parsed.pop("predictions_text"), predictions.universe(_us_symbols(snap)),
+                                                 date.fromisoformat(session))
+        if dropped:
+            print(f"[briefs] {kind} {session} {topic}: dropped predictions: {dropped}")
         models = list((out.get("modelUsage") or {}).keys())
         fields = {**parsed, "sources": json.dumps(parsed["sources"], ensure_ascii=False), "status": "done", "error": None,
                   "model": ",".join(models) or None, "cost_usd": out.get("total_cost_usd")}
     except Exception as e:  # noqa: BLE001 - stored with the row, retried by run_due
         fields = {"status": "failed", "error": f"{type(e).__name__}: {e}"[:2000]}
     fields.update(snapshot=json.dumps(snap, ensure_ascii=False), raw=raw, finished_at=time.time(),
-                  duration_s=round(time.time() - started, 1))
+                  duration_s=round(time.time() - started, 1), context=json.dumps(context) if context else None)
     conn = _conn(path)
     try:
-        conn.execute(f"UPDATE briefs SET {', '.join(f'{k} = ?' for k in fields)} WHERE kind = ? AND session_date = ?",
-                     (*fields.values(), kind, session))
+        conn.execute(f"UPDATE briefs SET {', '.join(f'{k} = ?' for k in fields)} WHERE kind = ? AND session_date = ? AND topic = ?",
+                     (*fields.values(), kind, session, topic))
         conn.commit()
-        row = conn.execute("SELECT id, attempts FROM briefs WHERE kind = ? AND session_date = ?", (kind, session)).fetchone()
+        row = conn.execute("SELECT id, attempts FROM briefs WHERE kind = ? AND session_date = ? AND topic = ?",
+                           (kind, session, topic)).fetchone()
     finally:
         conn.close()
-    title = f"{KINDS[kind]['title']} brief"
+    if fields["status"] == "done":
+        predictions.save(row["id"], kind, preds, path)
+    if path is None:
+        backup.schedule_backup()
+    title = f"{KINDS[kind]['title']}{f' · {topic}' if topic else ''} brief"
     if fields["status"] == "done":
         _notify(title, fields["headline_zh"])
     elif row["attempts"] >= MAX_ATTEMPTS or force:
@@ -362,41 +472,89 @@ def generate(kind: str, session: Optional[str] = None, trigger: str = "schedule"
     return row["id"]
 
 
-def run_due(path: Optional[Path] = None) -> List[int]:
-    """Called every minute by the background loop."""
+def _flash_count(us_date: str, path: Optional[Path]) -> int:
+    conn = _conn(path)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM briefs WHERE kind = 'flash' AND session_date = ?", (us_date,)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def check_flash(path: Optional[Path] = None) -> List[int]:
+    """During pre-market and after hours: a flash brief for each bellwether moving FLASH_THRESHOLD %
+    or more, once per company and US date, at most FLASH_DAILY_CAP a day."""
+    if portfolio.session_now() not in ("pre", "post"):
+        return []
+    us_date = datetime.now(NEW_YORK).date().isoformat()
     done = []
-    for kind in KINDS:
+    for m in events.big_moves(path):
+        if _flash_count(us_date, path) >= events.FLASH_DAILY_CAP:
+            break
+        rid = generate("flash", us_date, "schedule", path=path, topic=m["symbol"], context=m)
+        if rid:
+            done.append(rid)
+    return done
+
+
+def run_due(path: Optional[Path] = None) -> List[int]:
+    """Called every minute by the background loop: scheduled briefs, flash triggers, scoring."""
+    done = []
+    for kind in ("outlook", "asia_europe", "us"):
         session = due_session(kind)
         if session:
             rid = generate(kind, session, "schedule", path=path)
             if rid:
                 done.append(rid)
+    now = time.time()
+    if now - _last["flash_check"] >= events.FLASH_CHECK_EVERY:
+        _last["flash_check"] = now
+        done += check_flash(path)
+    if now - _last["score"] >= SCORE_EVERY:
+        _last["score"] = now
+        if predictions.score_due(path):
+            if path is None:
+                backup.schedule_backup()
     return done
 
 
-def generate_in_background(kind: str, path: Optional[Path] = None) -> bool:
-    """For the page's "Generate now" button: regenerate the current session's brief."""
+def generate_in_background(kind: str, path: Optional[Path] = None, symbol: str = "") -> bool:
+    """For the page's buttons: write the current session's brief now. A flash needs a symbol;
+    its trigger is that symbol's latest move (whatever its size)."""
     if kind not in KINDS:
         raise ValueError(f"unknown brief kind {kind!r}")
+    symbol = symbol.strip().upper()
+    if kind == "flash" and not re.fullmatch(r"[A-Z][A-Z.\-]{0,9}", symbol):
+        raise ValueError("a flash brief needs a US ticker, e.g. LRCX")
+    key = f"{kind}:{symbol}"
     with _run_lock:
-        if _running.get(kind):
+        if _running.get(key):
             return False
-        _running[kind] = True
+        _running[key] = True
 
     def run():
         try:
-            generate(kind, trigger="manual", force=True, path=path)
+            context = None
+            if kind == "flash":
+                q = portfolio.get_quotes([symbol], path=path, force=True).get(symbol) or {}
+                move = q.get("session_change_pct") if q.get("session") in ("pre", "post") else None
+                if move is None and q.get("price") and q.get("prev_close"):
+                    move = (q["price"] / q["prev_close"] - 1) * 100
+                context = {"symbol": symbol, "name": events.BELLWETHERS.get(symbol, (q.get("name"), None))[0] or symbol,
+                           "group": events.BELLWETHERS.get(symbol, (None, "user's pick"))[1], "session": q.get("session"),
+                           "price": q.get("price"), "regular_close": q.get("regular_price") or q.get("prev_close"),
+                           "move_pct": round(move, 2) if move is not None else None, "asked_by_hand": True}
+            generate(kind, trigger="manual", force=True, path=path, topic=symbol if kind == "flash" else "", context=context)
         finally:
             with _run_lock:
-                _running[kind] = False
+                _running[key] = False
 
-    threading.Thread(target=run, name=f"brief-{kind}", daemon=True).start()
+    threading.Thread(target=run, name=f"brief-{key}", daemon=True).start()
     return True
 
 
 # ---------------------------------------------------------------- reading
 
-_LIST_COLS = ("id", "kind", "session_date", "status", "attempts", "trigger", "started_at", "finished_at", "duration_s",
+_LIST_COLS = ("id", "kind", "session_date", "topic", "status", "attempts", "trigger", "started_at", "finished_at", "duration_s",
               "headline_zh", "headline_en", "error", "model", "cost_usd")
 
 
@@ -408,7 +566,8 @@ def list_briefs(kind: str = "", limit: int = 60, path: Optional[Path] = None) ->
         if kind:
             sql += " WHERE kind = ?"
             args.append(kind)
-        rows = conn.execute(sql + " ORDER BY session_date DESC, kind LIMIT ?", (*args, int(limit))).fetchall()
+        rows = conn.execute(sql + " ORDER BY session_date DESC, COALESCE(finished_at, started_at) DESC LIMIT ?",
+                            (*args, int(limit))).fetchall()
     finally:
         conn.close()
     return [dict(r) for r in rows]
@@ -425,12 +584,16 @@ def get_brief(brief_id: int, path: Optional[Path] = None) -> Optional[Dict[str, 
     d = dict(row)
     d["sources"] = json.loads(d["sources"]) if d.get("sources") else []
     d["snapshot"] = json.loads(d["snapshot"]) if d.get("snapshot") else None
+    d["context"] = json.loads(d["context"]) if d.get("context") else None
+    d["predictions"] = predictions.for_brief(d["id"], path)
     d.pop("raw", None)
     return d
 
 
 def status() -> Dict[str, Any]:
     """Schedule facts for the page: which brief is due now, and whether one is being written."""
-    return {"kinds": {k: {"title": v["title"], "due_session": due_session(k), "running": bool(_running.get(k))}
+    return {"kinds": {k: {"title": v["title"], "due_session": due_session(k),
+                          "running": any(r for key, r in _running.items() if key.split(":")[0] == k)}
                       for k, v in KINDS.items()},
-            "claude_found": bool(find_claude())}
+            "claude_found": bool(find_claude()), "flash_threshold": events.FLASH_THRESHOLD,
+            "bellwethers": {s: n for s, (n, _) in events.BELLWETHERS.items()}}

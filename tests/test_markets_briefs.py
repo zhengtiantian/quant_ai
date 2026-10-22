@@ -28,6 +28,9 @@ Chips led.
 =====SOURCES=====
 - [Reuters: Asia stocks fall](https://www.reuters.com/x)
 - [CNBC](https://www.cnbc.com/y)
+=====PREDICTIONS=====
+{"symbol": "8035.T", "date": "2026-10-23", "op": "<=", "threshold": -3, "confidence": 0.7, "zh": "东京电子跌超3%", "en": "TEL down 3%+"}
+{"symbol": "NOPE", "date": "2026-10-23", "op": "<=", "threshold": -3, "confidence": 0.7}
 """
 
 
@@ -46,6 +49,11 @@ class DueTest(unittest.TestCase):
         # Friday's brief can still be caught up over the weekend, until Monday's pre-market
         self.assertEqual(briefs.due_session("us", datetime(2026, 10, 25, 12, 0, tzinfo=NY)), "2026-10-23")
         self.assertIsNone(briefs.due_session("us", datetime(2026, 10, 26, 4, 1, tzinfo=NY)))
+
+    def test_outlook_from_1330_and_flash_never_scheduled(self):
+        self.assertIsNone(briefs.due_session("outlook", datetime(2026, 10, 22, 13, 29, tzinfo=DUB)))
+        self.assertEqual(briefs.due_session("outlook", datetime(2026, 10, 22, 13, 30, tzinfo=DUB)), "2026-10-22")
+        self.assertIsNone(briefs.due_session("flash", datetime(2026, 10, 22, 18, 0, tzinfo=NY)))
 
     def test_us_brief_time_in_dublin_follows_both_dst_switches(self):
         # 20:05 New York is 01:05 Dublin most of the year, 00:05 in the weeks the US switches later
@@ -88,6 +96,7 @@ class GenerateTest(unittest.TestCase):
         b = briefs.get_brief(rid, self.path)
         self.assertEqual((b["status"], b["headline_zh"], len(b["sources"]), b["model"]),
                          ("done", "芯片股领跌，亚洲普跌", 2, "claude-opus-5-5"))
+        self.assertEqual([(p["symbol"], p["exchange"], p["status"]) for p in b["predictions"]], [("8035.T", "TSE", "pending")])
 
     def test_failure_retries_after_a_pause_then_gives_up(self):
         with self.claude(error="usage limit reached"):
@@ -116,10 +125,10 @@ class GenerateTest(unittest.TestCase):
         self.assertEqual(briefs.get_brief(rid, self.path)["trigger"], "schedule")
 
     def test_a_running_brief_is_not_started_twice(self):
-        self.assertTrue(briefs._claim("us", "2026-10-22", "schedule", False, self.path))
-        self.assertFalse(briefs._claim("us", "2026-10-22", "manual", True, self.path))
+        self.assertTrue(briefs._claim("us", "2026-10-22", "", "schedule", False, self.path))
+        self.assertFalse(briefs._claim("us", "2026-10-22", "", "manual", True, self.path))
         with mock.patch.object(briefs.time, "time", return_value=briefs.time.time() + briefs.STALE_RUNNING + 1):
-            self.assertTrue(briefs._claim("us", "2026-10-22", "schedule", False, self.path))   # crashed run
+            self.assertTrue(briefs._claim("us", "2026-10-22", "", "schedule", False, self.path))   # crashed run
 
     def test_unparseable_reply_keeps_the_raw_text_for_debugging(self):
         with self.claude(reply="sorry, no"):
@@ -135,6 +144,54 @@ class GenerateTest(unittest.TestCase):
             briefs.generate("us", "2026-10-22", path=self.path)
         self.assertEqual([b["session_date"] for b in briefs.list_briefs(path=self.path)], ["2026-10-22", "2026-10-21"])
         self.assertEqual(len(briefs.list_briefs("us", path=self.path)), 1)
+
+
+class FlashTest(unittest.TestCase):
+    def setUp(self):
+        self.path = Path(tempfile.mkdtemp()) / "m.db"
+        for name, value in (("snapshot", {"macro": {}}), ("_notify", None)):
+            p = mock.patch.object(briefs, name, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(briefs, "run_claude", return_value={"result": REPLY})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def moves(self, *syms):
+        return [{"symbol": s, "name": s, "group": "chips", "session": "post", "price": 1, "regular_close": 1.1, "move_pct": -7.4}
+                for s in syms]
+
+    def test_one_flash_per_company_and_day_within_the_cap(self):
+        with mock.patch.object(briefs.portfolio, "session_now", return_value="post"), \
+             mock.patch.object(briefs.events, "big_moves", return_value=self.moves("LRCX", "KLAC")):
+            self.assertEqual(len(briefs.check_flash(self.path)), 2)
+            self.assertEqual(briefs.check_flash(self.path), [])                 # already written today
+        with mock.patch.object(briefs.portfolio, "session_now", return_value="post"), \
+             mock.patch.object(briefs.events, "FLASH_DAILY_CAP", 3), \
+             mock.patch.object(briefs.events, "big_moves", return_value=self.moves("A", "B", "C")):
+            self.assertEqual(len(briefs.check_flash(self.path)), 1)             # cap of 3 reached
+        topics = sorted(b["topic"] for b in briefs.list_briefs("flash", path=self.path))
+        self.assertEqual(topics, ["A", "KLAC", "LRCX"])
+
+    def test_no_flash_check_during_regular_hours(self):
+        with mock.patch.object(briefs.portfolio, "session_now", return_value="regular"), \
+             mock.patch.object(briefs.events, "big_moves") as bm:
+            self.assertEqual(briefs.check_flash(self.path), [])
+        bm.assert_not_called()
+
+    def test_old_table_gains_topic_column(self):
+        conn = briefs.sqlite3.connect(str(self.path))
+        conn.executescript("""CREATE TABLE briefs (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, session_date TEXT NOT NULL,
+            status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, trigger TEXT, started_at REAL, finished_at REAL,
+            duration_s REAL, headline_zh TEXT, headline_en TEXT, body_zh TEXT, body_en TEXT, sources TEXT, snapshot TEXT,
+            error TEXT, raw TEXT, model TEXT, cost_usd REAL, UNIQUE (kind, session_date));
+            INSERT INTO briefs(kind, session_date, status, headline_zh) VALUES ('us', '2026-10-21', 'done', 'old');""")
+        conn.commit()
+        conn.close()
+        rows = briefs.list_briefs(path=self.path)
+        self.assertEqual([(r["headline_zh"], r["topic"]) for r in rows], [("old", "")])
+        self.assertTrue(briefs._claim("flash", "2026-10-21", "LRCX", "manual", True, self.path))
+        self.assertTrue(briefs._claim("flash", "2026-10-21", "KLAC", "manual", True, self.path))
 
 
 class FindClaudeTest(unittest.TestCase):

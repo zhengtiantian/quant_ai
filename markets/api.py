@@ -5,6 +5,7 @@ address the server listens on. quant_ui calls these from the browser and the des
 calls them with curl, both locally.
 """
 
+import time
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -43,10 +44,14 @@ def _latest_briefs():
     """The newest written brief of each kind, for the desktop widget's headline lines."""
     from . import briefs
     out = {}
-    for b in briefs.list_briefs(limit=20):
+    for b in briefs.list_briefs(limit=30):
         if b["status"] == "done" and b["kind"] not in out:
-            out[b["kind"]] = {k: b[k] for k in ("id", "kind", "session_date", "headline_zh", "headline_en", "finished_at")}
-    return [out[k] for k in briefs.KINDS if k in out]
+            out[b["kind"]] = {k: b[k] for k in ("id", "kind", "session_date", "topic", "headline_zh", "headline_en", "finished_at")}
+    # A flash only while it is fresh: today's or yesterday's.
+    flash = out.get("flash")
+    if flash and time.time() - (flash["finished_at"] or 0) > 36 * 3600:
+        out.pop("flash")
+    return [out[k] for k in ("flash", "outlook", "asia_europe", "us") if k in out]
 
 
 @router.get("/portfolio/chart")
@@ -131,7 +136,16 @@ def briefs_run(payload: Dict[str, Any]):
     """Write (or rewrite) the current session's brief now. Uses the subscription quota."""
     from . import briefs
     try:
-        started = briefs.generate_in_background(str(payload.get("kind", "")))
+        started = briefs.generate_in_background(str(payload.get("kind", "")), symbol=str(payload.get("symbol", "")))
         return {"status": "success", "started": started, **briefs.status()}
     except ValueError as e:
         return _error(e, 400)
+
+
+@router.get("/predictions/scorecard")
+def predictions_scorecard():
+    from . import predictions
+    try:
+        return {"status": "success", **predictions.scorecard()}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
