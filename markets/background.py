@@ -1,5 +1,6 @@
 """One background thread for the markets jobs that run without anyone looking at a page:
-retrying a budget push that job_agent missed, and (briefs.py) writing the daily briefs."""
+retrying a budget push that job_agent missed, watching the quant_data pipeline's freshness
+(pipeline_health.py), and (briefs.py) writing the daily briefs."""
 
 import threading
 import time
@@ -22,6 +23,11 @@ def _loop() -> None:
                     print("[markets] pending budget lines delivered to job_agent")
             except Exception as e:  # noqa: BLE001
                 print(f"[markets] budget retry failed: {type(e).__name__}: {e}")
+        try:
+            from . import pipeline_health
+            pipeline_health.run_due()
+        except Exception as e:  # noqa: BLE001
+            print(f"[markets] pipeline check failed: {type(e).__name__}: {e}")
         try:
             from . import briefs
             briefs.run_due()

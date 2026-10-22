@@ -35,7 +35,8 @@ def portfolio_state(force: str = ""):
         portfolio.init_db()
         # Never waits on Nasdaq: stored quotes now, a background thread refreshes them.
         state = portfolio.get_state(force_quotes=force == "1", background_refresh=True)
-        return {"status": "success", **state, "latest_briefs": _latest_briefs()}
+        from . import pipeline_health
+        return {"status": "success", **state, "latest_briefs": _latest_briefs(), "pipeline": pipeline_health.latest()}
     except Exception as e:  # noqa: BLE001
         return _error(e, 500)
 
@@ -147,5 +148,15 @@ def predictions_scorecard():
     from . import predictions
     try:
         return {"status": "success", **predictions.scorecard()}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
+@router.get("/pipeline/health")
+def pipeline_health_route(refresh: str = ""):
+    """Freshness of each quant_data stage; ?refresh=1 checks now instead of the last result."""
+    from . import pipeline_health
+    try:
+        return {"status": "success", **(pipeline_health.check() if refresh == "1" else pipeline_health.latest())}
     except Exception as e:  # noqa: BLE001
         return _error(e, 500)
