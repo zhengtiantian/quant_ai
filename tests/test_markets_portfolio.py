@@ -344,3 +344,22 @@ class PortfolioTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FastWindowTest(unittest.TestCase):
+    """10:00-22:00 Dublin: every 5 s in any trading session (asked 2026-10-22)."""
+
+    def at(self, hh, mm=0):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        return datetime(2026, 10, 22, hh, mm, tzinfo=ZoneInfo("Europe/Dublin"))
+
+    def test_pre_regular_post_inside_the_window_are_5s(self):
+        for session in ("pre", "regular", "post"):
+            self.assertEqual(pf.refresh_interval(session, pf.REFRESH_SECONDS, self.at(10)), 5)
+            self.assertEqual(pf.refresh_interval(session, pf.WATCH_TTL, self.at(21, 59)), 5)
+
+    def test_outside_the_window_the_session_table_applies(self):
+        self.assertEqual(pf.refresh_interval("pre", pf.REFRESH_SECONDS, self.at(9, 30)), 30)
+        self.assertEqual(pf.refresh_interval("post", pf.REFRESH_SECONDS, self.at(22, 0)), 30)
+        self.assertIsNone(pf.refresh_interval("closed", pf.REFRESH_SECONDS, self.at(12)))   # weekend / holiday

@@ -25,6 +25,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
+from datetime import time as dtime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -43,6 +44,25 @@ SESSIONS = {"pre": "Pre-market", "regular": "Market open", "post": "After hours"
 QUOTE_TTL = {"regular": 5, "pre": 30, "post": 30, "closed": 3600}             # holdings
 WATCH_TTL = {"regular": 5, "pre": 30, "post": 30, "closed": 3600}             # watchlist
 REFRESH_SECONDS = {"regular": 5, "pre": 30, "post": 30, "closed": None}
+# The user's waking hours (Dublin): every 5 s in any trading session, pre-market and after hours
+# included (asked 2026-10-22). Outside it the tables above apply. US pre-market opens 09:00 Dublin
+# and after hours ends 01:00, so on a weekday the window is all trading time.
+FAST_ZONE = ZoneInfo("Europe/Dublin")
+FAST_WINDOW = (dtime(10, 0), dtime(22, 0))
+FAST_SECONDS = 5
+
+
+def in_fast_window(now: Optional[datetime] = None) -> bool:
+    t = (now or datetime.now(FAST_ZONE)).astimezone(FAST_ZONE).time()
+    return FAST_WINDOW[0] <= t < FAST_WINDOW[1]
+
+
+def refresh_interval(session: str, table: Dict[str, Any], now: Optional[datetime] = None) -> Any:
+    """Seconds for this session: FAST_SECONDS inside the window while any session trades,
+    otherwise the session's entry in `table` (None = do not poll)."""
+    if session in ("pre", "regular", "post") and in_fast_window(now):
+        return FAST_SECONDS
+    return table.get(session)
 
 NASDAQ = "https://api.nasdaq.com/api/quote/{sym}/{endpoint}?assetclass={cls}"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -569,7 +589,7 @@ def get_quotes(symbols: List[str], force: bool = False, path: Optional[Path] = N
         row = stored.get(s)
         if row:
             q = json.loads(row["data"])
-            ttl = (ttl_by_symbol or {}).get(s, QUOTE_TTL.get(clock_session, 60))
+            ttl = (ttl_by_symbol or {}).get(s, refresh_interval(clock_session, QUOTE_TTL) or 60)
             if cached_only or (not force and now - row["fetched_at"] < ttl):
                 out[s] = {**q, "fetched_at": row["fetched_at"], "stale": False}
                 continue
@@ -828,8 +848,8 @@ def get_state(force_quotes: bool = False, path: Optional[Path] = None, cached_qu
     refreshing = False
     if background_refresh:
         clock = session_now()
-        ttl_by_symbol = {s: QUOTE_TTL.get(clock, 60) for s in open_syms}
-        ttl_by_symbol.update({w["symbol"]: WATCH_TTL.get(clock, 60) for w in watch_rows})
+        ttl_by_symbol = {s: refresh_interval(clock, QUOTE_TTL) or 60 for s in open_syms}
+        ttl_by_symbol.update({w["symbol"]: refresh_interval(clock, WATCH_TTL) or 60 for w in watch_rows})
         out_of_date = any(q.get("pending") or time.time() - (q.get("fetched_at") or 0) >= ttl_by_symbol.get(s, 60)
                           for s, q in quotes.items())
         if force_quotes or out_of_date:
@@ -886,9 +906,9 @@ def get_state(force_quotes: bool = False, path: Optional[Path] = None, cached_qu
         "transactions": sorted(txs, key=lambda t: (t["trade_date"], t["id"]), reverse=True),
         "holdings": holdings, "closed": closed, "watchlist": watchlist, "totals": tot, "problems": problems,
         "session": session, "session_label": SESSIONS.get(session, session),
-        "refresh_seconds": REFRESH_SECONDS.get(session),
-        "watch_refresh_seconds": WATCH_TTL.get(session) if REFRESH_SECONDS.get(session) else None,
-        "next_session_in": seconds_until_next_session() if REFRESH_SECONDS.get(session) is None else None,
+        "refresh_seconds": refresh_interval(session, REFRESH_SECONDS),
+        "watch_refresh_seconds": refresh_interval(session, WATCH_TTL) if refresh_interval(session, REFRESH_SECONDS) else None,
+        "next_session_in": seconds_until_next_session() if refresh_interval(session, REFRESH_SECONDS) is None else None,
         "us_time": datetime.now(US_EAST).strftime("%H:%M"), "usd_cny": _usd_cny(),
         "tx_types": TX_TYPES, "server_time": time.time(), "refreshing": refreshing,
         "global": global_markets.global_state(path, background=background_refresh),
