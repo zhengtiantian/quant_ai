@@ -151,6 +151,8 @@ def build_context(hits, coll) -> tuple[str, list[dict]]:
         )
         sources.append({
             "id": i,
+            # R.11 rebuilds exactly what the model read from this, to judge the answer against it.
+            "mongo_id": h.mongo_id,
             "symbol": h.symbol,
             "date": h.date,
             "title": title_screen.text,
