@@ -445,6 +445,13 @@ def fetch_quote(symbol: str, asset_class: Optional[str] = None, known_prev_close
         if prev_close is None:
             summary = replies.get((cls, "summary")) or {}
             prev_close = _money(((summary.get("summaryData") or {}).get("PreviousClose") or {}).get("value"))
+        # Before the open Nasdaq's summary PreviousClose can still be the day before yesterday's: on
+        # 2026-10-23 pre-market it gave the 10-21 closes and the day P&L showed -1,600 instead of
+        # +200 (the 10-22 drop counted twice). In pre-market the regular session's last price
+        # (secondaryData) is yesterday's close, so it is the baseline there.
+        regular_price = _money(secondary.get("lastSalePrice"))
+        if session == "pre" and regular_price:
+            prev_close = regular_price
         if _frozen_reply(info):
             raise StaleQuote(f"{symbol}: Nasdaq kept answering from a stale copy")
         price = _money(primary.get("lastSalePrice"))
@@ -457,8 +464,12 @@ def fetch_quote(symbol: str, asset_class: Optional[str] = None, known_prev_close
             "trade_time": primary.get("lastTradeTimestamp"),
             "session_change": _money(primary.get("netChange")), "session_change_pct": _money(primary.get("percentageChange")),
             # During pre-market / after-hours Nasdaq puts the regular session's last price here.
-            "regular_price": _money(secondary.get("lastSalePrice")), "regular_time": secondary.get("lastTradeTimestamp"),
-            "prev_close": prev_close, "prev_close_date": datetime.now(US_EAST).date().isoformat(), "source": "nasdaq",
+            "regular_price": regular_price, "regular_time": secondary.get("lastTradeTimestamp"),
+            # A previous close read while the market is closed (overnight, after midnight ET) may
+            # be the stale one above, so it is not reused for the rest of the ET day.
+            "prev_close": prev_close,
+            "prev_close_date": datetime.now(US_EAST).date().isoformat() if session != "closed" else None,
+            "source": "nasdaq",
             "price_basis": price_basis, "volume": _money(primary.get("volume")),
         }
     raise ValueError(f"Nasdaq: symbol {symbol} not found")

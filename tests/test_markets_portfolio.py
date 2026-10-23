@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from markets import budget_link  # noqa: E402
 from markets import portfolio as pf  # noqa: E402
 
+REAL_FETCH_QUOTE = pf.fetch_quote
+
 
 def fake_quote(symbol, asset_class=None, known_prev_close=None):
     prices = {"NVDA": (213.0, 217.0), "VOO": (700.0, 704.0), "AAPL": (250.0, 248.0)}
@@ -328,6 +330,28 @@ class PortfolioTest(unittest.TestCase):
         self.assertFalse(pf._frozen_reply(live))
         self.assertTrue(pf._frozen_reply(frozen))
         self.assertFalse(pf._frozen_reply(after))             # thin extended hours may lack a quote
+
+    def _nasdaq_replies(self, status, secondary_price):
+        info = {"marketStatus": status, "companyName": "Intel",
+                "primaryData": {"lastSalePrice": "$86.10", "bidPrice": "$86.05", "askPrice": "$86.15"},
+                "secondaryData": {"lastSalePrice": secondary_price} if secondary_price else None}
+        summary = {"summaryData": {"PreviousClose": {"value": "$92.96"}}}      # the 10-21 close, stale
+        return lambda symbol, endpoint, cls: info if endpoint == "info" else summary
+
+    def test_pre_market_baseline_is_yesterdays_regular_close_not_the_stale_summary(self):
+        # 2026-10-23: the summary still said 92.96 (10-21) while 10-22 closed at 85.49.
+        with mock.patch.object(pf, "_nasdaq", side_effect=self._nasdaq_replies("Pre-Market", "$85.49")):
+            q = REAL_FETCH_QUOTE("INTC", "stocks")
+            cached = REAL_FETCH_QUOTE("INTC", "stocks", known_prev_close=92.96)
+        self.assertEqual((q["session"], q["prev_close"]), ("pre", 85.49))
+        self.assertEqual(cached["prev_close"], 85.49)              # a stale cached value is overridden too
+        self.assertIsNotNone(q["prev_close_date"])
+
+    def test_previous_close_read_while_closed_is_not_reused(self):
+        with mock.patch.object(pf, "_nasdaq", side_effect=self._nasdaq_replies("Closed", "$85.49")):
+            q = REAL_FETCH_QUOTE("INTC", "stocks")
+        self.assertEqual(q["prev_close"], 92.96)
+        self.assertIsNone(q["prev_close_date"])
 
     def test_batch_row_with_volume_going_backwards_is_refetched(self):
         pf.get_quotes(["NVDA"], force=True, path=self.db)
