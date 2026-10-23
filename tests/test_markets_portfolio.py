@@ -331,26 +331,29 @@ class PortfolioTest(unittest.TestCase):
         self.assertTrue(pf._frozen_reply(frozen))
         self.assertFalse(pf._frozen_reply(after))             # thin extended hours may lack a quote
 
-    def _nasdaq_replies(self, status, secondary_price):
+    def _nasdaq_replies(self, status, secondary=None, primary_change="+0.61"):
         info = {"marketStatus": status, "companyName": "Intel",
-                "primaryData": {"lastSalePrice": "$86.10", "bidPrice": "$86.05", "askPrice": "$86.15"},
-                "secondaryData": {"lastSalePrice": secondary_price} if secondary_price else None}
+                "primaryData": {"lastSalePrice": "$86.10", "netChange": primary_change,
+                                "bidPrice": "$86.05", "askPrice": "$86.15"},
+                "secondaryData": secondary}
         summary = {"summaryData": {"PreviousClose": {"value": "$92.96"}}}      # the 10-21 close, stale
         return lambda symbol, endpoint, cls: info if endpoint == "info" else summary
 
-    def test_pre_market_baseline_is_yesterdays_regular_close_not_the_stale_summary(self):
-        # 2026-10-23: the summary still said 92.96 (10-21) while 10-22 closed at 85.49.
-        with mock.patch.object(pf, "_nasdaq", side_effect=self._nasdaq_replies("Pre-Market", "$85.49")):
-            q = REAL_FETCH_QUOTE("INTC", "stocks")
-            cached = REAL_FETCH_QUOTE("INTC", "stocks", known_prev_close=92.96)
-        self.assertEqual((q["session"], q["prev_close"]), ("pre", 85.49))
-        self.assertEqual(cached["prev_close"], 85.49)              # a stale cached value is overridden too
-        self.assertIsNotNone(q["prev_close_date"])
+    def test_baseline_comes_from_the_info_reply_not_the_stale_summary(self):
+        # 2026-10-23: some summary replies still said 92.96 (10-21) while 10-22 closed at 85.49.
+        cases = [("Pre-Market", {"lastSalePrice": "$85.49", "netChange": "-7.47"}, "+0.61", 85.49),
+                 ("Open", None, "+0.61", 85.49),
+                 ("After-Hours", {"lastSalePrice": "$86.96", "netChange": "+1.47"}, "-0.86", 85.49)]
+        for status, secondary, change, want in cases:
+            with self.subTest(status), \
+                 mock.patch.object(pf, "_nasdaq", side_effect=self._nasdaq_replies(status, secondary, change)):
+                self.assertEqual(REAL_FETCH_QUOTE("INTC", "stocks")["prev_close"], want)
+                self.assertEqual(REAL_FETCH_QUOTE("INTC", "stocks", known_prev_close=92.96)["prev_close"], want)
 
     def test_previous_close_read_while_closed_is_not_reused(self):
-        with mock.patch.object(pf, "_nasdaq", side_effect=self._nasdaq_replies("Closed", "$85.49")):
+        with mock.patch.object(pf, "_nasdaq", side_effect=self._nasdaq_replies("Closed")):
             q = REAL_FETCH_QUOTE("INTC", "stocks")
-        self.assertEqual(q["prev_close"], 92.96)
+        self.assertEqual(q["prev_close"], 92.96)                   # only the summary to go by
         self.assertIsNone(q["prev_close_date"])
 
     def test_batch_row_with_volume_going_backwards_is_refetched(self):

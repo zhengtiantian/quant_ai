@@ -445,13 +445,8 @@ def fetch_quote(symbol: str, asset_class: Optional[str] = None, known_prev_close
         if prev_close is None:
             summary = replies.get((cls, "summary")) or {}
             prev_close = _money(((summary.get("summaryData") or {}).get("PreviousClose") or {}).get("value"))
-        # Before the open Nasdaq's summary PreviousClose can still be the day before yesterday's: on
-        # 2026-10-23 pre-market it gave the 10-21 closes and the day P&L showed -1,600 instead of
-        # +200 (the 10-22 drop counted twice). In pre-market the regular session's last price
-        # (secondaryData) is yesterday's close, so it is the baseline there.
         regular_price = _money(secondary.get("lastSalePrice"))
-        if session == "pre" and regular_price:
-            prev_close = regular_price
+        prev_close = _prev_close_from_info(session, primary, secondary) or prev_close
         if _frozen_reply(info):
             raise StaleQuote(f"{symbol}: Nasdaq kept answering from a stale copy")
         price = _money(primary.get("lastSalePrice"))
@@ -485,6 +480,25 @@ STALE_RETRIES = 3
 
 class StaleQuote(ValueError):
     pass
+
+
+# Nasdaq's summary PreviousClose is not reliable: some servers still answer with the day before
+# yesterday's close. On 2026-10-23 it gave the 10-21 closes in pre-market (day P&L -1,600 instead
+# of +200, the 10-22 drop counted twice) and again for INTC / STX / WDC after hours, while other
+# replies had the right 10-22 values. The info reply carries the baseline itself, consistently
+# with its own price: regular = last - change; after hours the regular session's last and change
+# are in secondaryData; pre-market secondaryData holds yesterday's regular close. The summary is
+# only the fallback (closed market, or a reply without these fields).
+def _prev_close_from_info(session: str, primary: Dict[str, Any], secondary: Dict[str, Any]) -> Optional[float]:
+    if session == "pre":
+        return _money(secondary.get("lastSalePrice"))
+    src = primary if session == "regular" else secondary if session == "post" else None
+    if not src:
+        return None
+    last, change = _money(src.get("lastSalePrice")), _money(src.get("netChange"))
+    if last is None or change is None:
+        return None
+    return round(last - change, 4)
 
 
 def _frozen_reply(info: Optional[Dict[str, Any]]) -> bool:
