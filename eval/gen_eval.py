@@ -59,6 +59,11 @@ GEN_MODEL = os.getenv("LOCAL_MODEL_NAME", "qwen3.5-9b-mlx")
 JUDGE_MODEL = os.getenv("GEN_JUDGE_MODEL", "gemma-4-e4b-it-mlx")
 JUDGE_SOURCE = os.getenv("GEN_JUDGE_SOURCE", "llm_gemma")
 WORKERS = int(os.getenv("GEN_JUDGE_WORKERS", "3"))
+# Questions answered at once by --generate. 1 keeps generation_ms a clean per-answer latency; more
+# (quant_data's lm_session.py sets it from the slots LM Studio loaded the model with) only makes
+# sense for a run whose latency is not being compared, such as reasoning-on at 60-200 s an answer.
+# Rerank runs stay at 1: the cross-encoder is one shared MPS model.
+GEN_WORKERS = int(os.getenv("GEN_WORKERS", "1"))
 
 # Questions the corpus cannot answer: future events, private facts, companies and topics it
 # does not cover. A good answer declines; an answer here is invented by construction.
@@ -158,9 +163,20 @@ def numeric_grounding(sentence: str, cited_texts: list[str]) -> tuple[int, int]:
 
 
 REFUSAL_MARKERS = re.compile(
-    r"(do(?:es)? not (?:contain|mention|include|say|provide|address)|no (?:information|mention|excerpt)|"
+    r"(do(?:es)? not (?:contain|mention|include|say|state|specify|identify|provide|address|report)|no (?:information|mention|excerpt)|"
+    r"there is no specific|"
     r"not (?:in|covered by|mentioned in) the (?:excerpts|articles)|could not find|cannot (?:answer|determine)|"
     r"nothing to answer|unable to (?:answer|find|determine))", re.I)
+
+
+def declines(answer: str, refused_flag: bool = False) -> bool:
+    """Opens by saying the excerpts do not cover the question. The generator usually adds what the
+    excerpts do say after that (u01, 2026-10-24: no 2031 Apple event, then the 2023 iPhone 15
+    launch), so requiring every sentence to decline, as is_refusal does, counted 0 of 8 probes."""
+    if refused_flag:
+        return True
+    sents = split_sentences(answer)
+    return bool(sents) and bool(REFUSAL_MARKERS.search(sents[0]))
 
 
 def is_refusal(answer: str, refused_flag: bool = False) -> bool:
@@ -265,47 +281,56 @@ def generate(run: str, rerank: bool, limit: int | None = None, reasoning: bool =
 
     db = _db()
     coll = MongoClient(MONGO_URI)["quant_data"]["news_articles_company_matched_v2"]
-    # reasoning=True is what /api/ask/news does today: qwen3.5 thinks first, ~60-200 s an answer on
-    # 2026-10-22 against ~9 s measured for R.10. LM Studio now ignores reasoning_effort "none",
-    # chat_template_kwargs and "/no_think" (all 299 of 299 tokens went to reasoning); the one switch
-    # that works is an empty think block pre-filled as the assistant turn, which the enrichment
-    # pipeline already uses. reasoning=False does that.
+    # reasoning=True is what /api/ask/news did until R.11: qwen3.5 thinks first, ~60-200 s an answer
+    # against ~6 s without. R.11 found no significant faithfulness difference, so production now
+    # pre-fills an empty think block (news_rag.NEWS_REASONING, off by default); reasoning=True
+    # reproduces the old behaviour for comparison.
     llm = ChatOpenAI(model=GEN_MODEL, openai_api_key="lm-studio", openai_api_base=LM_STUDIO_URL, temperature=0.2)
-    if not reasoning:
-        llm = NoThink(llm)
     done = {d["question_id"] for d in db[RUNS_COLL].find({"run": run, "error": None}, {"question_id": 1})}
     todo = [q for q in load_questions() if q["id"] not in done][:limit]
-    print(f"[generate] run={run} rerank={rerank} reasoning={reasoning} model={GEN_MODEL}: {len(todo)} questions")
-    for q in todo:
+    workers = 1 if rerank else max(1, GEN_WORKERS)
+    if todo and workers > 1:
+        # Load the embedding model with one request first: on 2026-10-24 its TTL had run out, and
+        # eight questions asking at once while LM Studio loaded it got HTTP 500 on 7 of 8.
+        from hybrid_search import embed_query
+        for attempt in range(5):
+            try:
+                embed_query("warm up")
+                break
+            except Exception:  # noqa: BLE001 - still loading
+                import time
+                time.sleep(5)
+    print(f"[generate] run={run} rerank={rerank} reasoning={reasoning} model={GEN_MODEL} workers={workers}: {len(todo)} questions")
+
+    def one(q):
         try:
             out = news_rag.answer_from_news(q["question"], llm=llm, coll=coll, symbol=q["symbol"],
-                                            since=_date_int(q["since"]), until=_date_int(q["until"]), rerank=rerank)
+                                            since=_date_int(q["since"]), until=_date_int(q["until"]), rerank=rerank,
+                                            reasoning=reasoning)
             err = out.get("error")
         except Exception as e:  # noqa: BLE001 - one question must not stop the run
             out, err = {}, f"{type(e).__name__}: {e}"[:300]
         excerpts = _excerpt_texts(coll, out.get("sources") or [])
         db[RUNS_COLL].update_one({"run": run, "question_id": q["id"]}, {"$set": {
             **{k: q[k] for k in ("question", "challenge", "symbol", "answerable")},
-            "rerank": rerank, "reasoning": reasoning, "model": GEN_MODEL, "answer": out.get("answer"), "refused": out.get("refused", False),
+            "rerank": rerank, "reasoning": reasoning, "model": GEN_MODEL, "workers": workers,
+            "answer": out.get("answer"), "refused": out.get("refused", False),
             "cited": out.get("cited", []), "sources": out.get("sources", []), "excerpts": excerpts,
             "generation_ms": out.get("generation_ms"), "error": err, "generated_at": datetime.now(timezone.utc)}},
             upsert=True)
-        print(f"  {q['id']}: {'ERROR ' + err if err else (out.get('answer') or '')[:90]!r}")
+        print(f"  {q['id']}: {'ERROR ' + err if err else (out.get('answer') or '')[:90]!r}", flush=True)
+
+    with ThreadPoolExecutor(workers) as ex:
+        list(ex.map(one, todo))
     _split_run(db, run)
 
 
 class NoThink:
-    """Wraps a chat model so every call ends with an empty, pre-filled think block: qwen3.5 then
-    answers directly instead of reasoning for thousands of tokens."""
+    """The empty think block the judges get pre-filled (see _chat). Generation leaves it to
+    news_rag.answer_from_news(reasoning=...), the same switch /api/ask/news uses, so R.11 measures
+    the production path."""
 
     PREFILL = "<think>\n\n</think>\n\n"
-
-    def __init__(self, llm):
-        self.llm = llm
-
-    def invoke(self, messages):
-        from langchain_core.messages import AIMessage
-        return self.llm.invoke(list(messages) + [AIMessage(content=self.PREFILL)])
 
 
 def _excerpt_texts(coll, sources: list[dict]) -> dict[str, str]:
@@ -582,6 +607,93 @@ def reference(sample: int, seed: int = 11, source: str = "reference_claude") -> 
         print(f"  {i + len(batch)}/{len(pick)}")
 
 
+# ---------------------------------------------------------------- 3b. Claude as the judge (option A)
+
+# The sentence rules and relevance grades exactly as the local judges and the reference get them.
+_SENT_RULES = SENT_PROMPT[SENT_PROMPT.index("Decide three things."):SENT_PROMPT.index("\n\nReply with JSON only")]
+_REL_RULES = REL_PROMPT[REL_PROMPT.index("grade 2"):REL_PROMPT.index("\n\nReply with JSON only")]
+
+ANSWER_PROMPT = """You check the sentences of one AI-written answer against the news excerpts it was given.
+
+Excerpts:
+{excerpts}
+
+Question that was asked: {question}
+
+Sentences of the answer:
+{sentences}
+
+For EACH sentence, independently: {rules}
+
+Also grade the whole answer for relevance (relevance only, not truth):
+{rel_rules}
+
+Reply with one JSON object per line and no other text: one per sentence, in order,
+{{"item": <sentence number>, "kind": "claim|meta", "verdict": "supported|partial|unsupported", "supported_by": [ids], "why": "<one short reason>"}}
+then one line {{"item": "answer", "grade": 0|1|2, "why": "<one short reason>"}}"""
+
+
+def _claude(prompt: str, binary: str) -> str:
+    env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+    proc = subprocess.run([binary, "-p", "--output-format", "json", "--no-session-persistence", "--tools", ""],
+                          input=prompt, capture_output=True, text=True, env=env, timeout=900,
+                          cwd=str(Path.home() / "Library/Application Support/quant_ai"))
+    return json.loads(proc.stdout).get("result") or ""
+
+
+def claude_judge(source: str = "judge_claude", run: str | None = None, parallel: int = 3, limit: int | None = None) -> None:
+    """Option A of R.11: Claude (claude CLI, the user's subscription) labels every sentence and
+    every answer's relevance. One call per answer, so its excerpts are sent once rather than once
+    per sentence (the reference sampler's per-sentence batches would cost ~5x the tokens)."""
+    sys.path.insert(0, str(ROOT))
+    from markets.briefs import find_claude
+    binary = find_claude()
+    if not binary:
+        raise SystemExit("claude CLI not found")
+    db = _db()
+    pending = {s["_key"] for s in _pending_sentences(db, source, run)}
+    rel_done = {d["key"] for d in db[LABEL_COLL].find({"source": source, "level": "answer", "error": None}, {"key": 1})}
+    runs = [r for r in db[RUNS_COLL].find({"error": None} | ({"run": run} if run else {"run": {"$not": {"$regex": "^smoke"}}}))]
+    todo = []
+    for r in runs:
+        sents = list(db[SENT_COLL].find({"run": r["run"], "question_id": r["question_id"]}).sort("idx", 1))
+        if any(x["_key"] in pending for x in sents) or f"{r['run']}|{r['question_id']}" not in rel_done:
+            todo.append((r, sents))
+    todo = todo[:limit]
+    print(f"[claude_judge] {source}: {len(todo)} answers, {sum(len(x) for _, x in todo)} sentences, {parallel} at a time")
+
+    def one(item):
+        r, sents = item
+        prompt = ANSWER_PROMPT.format(excerpts=_excerpt_block(r["excerpts"]), question=r["question"],
+                                      sentences="\n".join(f'{i}. "{x["text"]}"' for i, x in enumerate(sents)),
+                                      rules=_SENT_RULES, rel_rules=_REL_RULES)
+        try:
+            return r, sents, _claude(prompt, binary), None
+        except Exception as e:  # noqa: BLE001 - the answer is retried on the next run
+            return r, sents, "", f"{type(e).__name__}: {e}"[:200]
+
+    done = 0
+    with ThreadPoolExecutor(parallel) as ex:
+        for r, sents, text, err in ex.map(one, todo):
+            got = {}
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        got[str(json.loads(line).get("item"))] = line
+                    except ValueError:
+                        pass
+            for i, x in enumerate(sents):
+                lab = {"error": err} if err else parse_sentence_label(got.get(str(i), ""))
+                _save_label(db, source, "sentence", x["_key"], lab, "claude")
+            rel = {"error": err} if err else parse_relevance(got.get("answer", ""))
+            _save_label(db, source, "answer", f"{r['run']}|{r['question_id']}", rel, "claude")
+            done += 1
+            missing = sum(1 for i in range(len(sents)) if str(i) not in got)
+            print(f"  {done}/{len(todo)} {r['run']}/{r['question_id']}" + (f" ERROR {err}" if err else
+                  (f" ({missing} sentence labels missing)" if missing else "")), flush=True)
+
+
 # ---------------------------------------------------------------- 4. agreement and scores
 
 def kappa(a: str, b: str) -> dict:
@@ -614,6 +726,7 @@ def score(source: str = JUDGE_SOURCE, compare: list[str] | None = None) -> dict:
         m = answer_metrics(sents, sent)
         m["relevance"] = (rel.get(f"{r['run']}|{r['question_id']}") or {}).get("grade")
         m["refused"] = is_refusal(r.get("answer") or "", r.get("refused", False))
+        m["declined"] = declines(r.get("answer") or "", r.get("refused", False))
         m["answerable"] = r.get("answerable")
         by_run.setdefault(r["run"], {})[r["question_id"]] = m
     report = {}
@@ -631,6 +744,8 @@ def score(source: str = JUDGE_SOURCE, compare: list[str] | None = None) -> dict:
         row["relevance_mean_0_2"] = round(sum(rels) / len(rels), 3) if rels else None
         row["refused_when_unanswerable"] = f"{sum(v['refused'] for v in una.values())}/{len(una)}"
         row["refused_when_answerable"] = f"{sum(v['refused'] for v in ans.values())}/{len(ans)}"
+        row["declined_when_unanswerable"] = f"{sum(v['declined'] for v in una.values())}/{len(una)}"
+        row["declined_when_answerable"] = f"{sum(v['declined'] for v in ans.values())}/{len(ans)}"
         row["answers_with_claims"] = sum(1 for v in ans.values() if v.get("claims"))
         report[run] = row
     print(json.dumps(report, indent=1))
@@ -655,6 +770,8 @@ def main() -> None:
     ap.add_argument("--source", default=JUDGE_SOURCE)
     ap.add_argument("--subset", metavar="SOURCE", help="--judge: only sentences this source labelled")
     ap.add_argument("--reference", action="store_true")
+    ap.add_argument("--claude-judge", action="store_true", help="option A: Claude labels every sentence and answer")
+    ap.add_argument("--parallel", type=int, default=3, help="--claude-judge: answers in flight")
     ap.add_argument("--sample", type=int, default=100)
     ap.add_argument("--kappa", nargs=2, metavar=("A", "B"))
     ap.add_argument("--score", action="store_true")
@@ -672,6 +789,8 @@ def main() -> None:
         judge(a.source, a.model, a.run, a.limit, keys)
     if a.reference:
         reference(a.sample)
+    if a.claude_judge:
+        claude_judge(a.source if a.source != JUDGE_SOURCE else "judge_claude", a.run, a.parallel, a.limit)
     if a.kappa:
         kappa(*a.kappa)
     if a.score:

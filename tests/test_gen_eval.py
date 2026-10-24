@@ -109,5 +109,29 @@ class QuestionsTest(unittest.TestCase):
         self.assertEqual(ge._date_int(temporal[0]["since"]), int(str(temporal[0]["since"]).replace("-", "")))
 
 
+class DeclineTest(unittest.TestCase):
+    def test_an_opening_decline_counts_even_with_context_after_it(self):
+        u01 = ("The provided news excerpts do not contain any information regarding an Apple September 2031 "
+               "product event. The most recent excerpt is from September 2023 [6], which discusses the iPhone 15.")
+        self.assertTrue(ge.declines(u01))
+        self.assertFalse(ge.is_refusal(u01))                       # the strict all-sentences rule
+        self.assertTrue(ge.declines("The provided excerpts do not state what his favourite restaurant is. "
+                                    "They mention Evvia in Palo Alto [3]."))
+        self.assertTrue(ge.declines("Based on the provided excerpts, there is no specific share price predicted for 2030."))
+        self.assertFalse(ge.declines("Tesla cut prices in China [1]. The excerpts do not mention Europe."))
+
+
+class ClaudeJudgePromptTest(unittest.TestCase):
+    def test_answer_prompt_carries_the_same_rules_as_the_sentence_judge(self):
+        self.assertIn('"partial"', ge._SENT_RULES)
+        self.assertIn("never against what you know yourself", ge._SENT_RULES)
+        self.assertNotIn("Reply with JSON", ge._SENT_RULES)
+        self.assertTrue(ge._REL_RULES.startswith("grade 2"))
+        prompt = ge.ANSWER_PROMPT.format(excerpts="<excerpt id=\"1\">x</excerpt>", question="q?",
+                                         sentences='0. "a"\n1. "b"', rules=ge._SENT_RULES, rel_rules=ge._REL_RULES)
+        self.assertIn('{"item": "answer", "grade": 0|1|2', prompt)
+        self.assertEqual(prompt.count("<excerpt"), 1)             # excerpts once per answer
+
+
 if __name__ == "__main__":
     unittest.main()

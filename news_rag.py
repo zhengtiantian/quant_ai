@@ -56,6 +56,14 @@ DEFAULT_K = 8
 RERANK_ENABLED = os.getenv("NEWS_RERANK", "0") == "1"
 RERANK_CANDIDATES = int(os.getenv("NEWS_RERANK_CANDIDATES", "30"))
 RERANK_MAX_LEN = int(os.getenv("NEWS_RERANK_MAX_LEN", "256"))
+# qwen3.5 thinking, off by default since R.11 (2026-10-24). Measured on 68 questions with Claude
+# as the judge: thinking off answered in ~6 s instead of 60-200 s, and faithfulness moved
+# 0.899 -> 0.869, a paired difference of -0.041 [95% CI -0.085, +0.005] (not significant);
+# refusals on unanswerable questions 8/8 either way. LM Studio ignores reasoning_effort "none",
+# chat_template_kwargs and "/no_think" for qwen3.5; an empty think block pre-filled as the
+# assistant turn is the switch that works. Other models (the hosted fallbacks) are left alone.
+REASONING_ENABLED = os.getenv("NEWS_REASONING", "0") == "1"
+THINK_PREFILL = "<think>\n\n</think>\n\n"
 
 REFUSAL = (
     "I could not find any articles in the corpus matching that question, so I have "
@@ -275,10 +283,12 @@ def answer_from_news(
     k: int = DEFAULT_K,
     rrf_k: int = RRF_K,
     rerank: bool | None = None,
+    reasoning: bool | None = None,
 ) -> dict:
-    from langchain_core.messages import HumanMessage, SystemMessage
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
     use_rerank = RERANK_ENABLED if rerank is None else rerank
+    use_reasoning = REASONING_ENABLED if reasoning is None else reasoning
     t0 = time.perf_counter()
     dense, sparse, fused = search(
         question, k=max(k, RERANK_CANDIDATES) if use_rerank else k,
@@ -311,10 +321,13 @@ def answer_from_news(
     context, sources = build_context(fused, coll)
 
     t1 = time.perf_counter()
-    answer = llm.invoke([
+    messages = [
         SystemMessage(content=SYSTEM),
         HumanMessage(content=f"News excerpts:\n\n{context}\n\nQuestion: {question}"),
-    ]).content
+    ]
+    if not use_reasoning and "qwen" in str(getattr(llm, "model_name", "")).lower():
+        messages.append(AIMessage(content=THINK_PREFILL))
+    answer = llm.invoke(messages).content.strip()
     t_gen = time.perf_counter() - t1
 
     cited = cited_ids(answer, len(sources))
