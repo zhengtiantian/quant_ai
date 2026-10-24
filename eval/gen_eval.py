@@ -694,6 +694,149 @@ def claude_judge(source: str = "judge_claude", run: str | None = None, parallel:
                   (f" ({missing} sentence labels missing)" if missing else "")), flush=True)
 
 
+# ---------------------------------------------------------------- 3c. verbatim evidence check
+
+# The judge is Claude, so a second Claude reading cannot validate it: the two share their errors.
+# This check needs no second opinion. For each sentence the judge called supported or partial,
+# Claude must split it into facts and copy, for each, the exact excerpt text it rests on; code
+# then checks the copy is really in that excerpt. A "supported" sentence with a fact whose quote
+# is not there means the judge was too lenient or invented its evidence; a "partial" sentence with
+# every fact found means it was too strict. (User's choice over a hand-labelled sample, 2026-10-24.)
+EVIDENCE_COLL = "eval_generation_evidence"
+
+EVIDENCE_PROMPT = """For each numbered sentence of an AI-written answer, find the evidence for it in the news excerpts.
+
+Excerpts:
+{excerpts}
+
+Sentences:
+{sentences}
+
+For EACH sentence: split it into its separate facts (each name, figure, date, event, attribution or
+cause is a fact; at most 6), and give each a type:
+  "stated"  - something an excerpt would say: an event, figure, date, name, quote, cause.
+  "overall" - a statement about the excerpts as a whole that no single passage can show: what they do
+              NOT mention, that something is the "only" one, that excerpts conflict or differ by period.
+For a "stated" fact copy, character for character, ONE contiguous span from ONE excerpt that states it
+(at most 30 words; the "symbol: X | date: Y" first line of an excerpt may be quoted for a company or
+date). Never paraphrase, join two spans, or add "...". If no excerpt states it, excerpt null and quote
+null. For an "overall" fact, excerpt null and quote null.
+
+Reply with one JSON object per sentence and no other text:
+{{"item": <sentence number>, "facts": [{{"fact": "<short>", "type": "stated|overall", "excerpt": <id or null>, "quote": "<exact text or null>"}}]}}"""
+
+_QUOTE_FOLD = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013": "-", "\u2014": "-", "\u00a0": " "})
+
+
+def _fold(text: str) -> str:
+    """Case, whitespace, curly quotes and dashes do not count as a difference."""
+    return re.sub(r"\s+", " ", (text or "").translate(_QUOTE_FOLD)).strip().lower()
+
+
+def quote_found(quote: str | None, excerpt_text: str | None) -> bool:
+    if not quote or not excerpt_text:
+        return False
+    q = _fold(quote).strip(" .\"'")
+    return bool(q) and q in _fold(excerpt_text)
+
+
+def evidence_verdict(facts: list[dict], excerpts: dict[str, str]) -> dict:
+    """Over the "stated" facts: verified = a quote really in the excerpt it names; missing = the
+    model itself found none; bad_quote = quoted, but the quote is not there. "overall" facts
+    (absence, "only", excerpts conflicting) cannot be shown by a quote and are only counted: on
+    2026-10-24 the first trial marked "there is no mention of a memory glut" as missing evidence."""
+    stated = [f for f in facts if f.get("type", "stated") != "overall"]
+    out = {"facts": len(stated), "overall": len(facts) - len(stated), "verified": 0, "missing": 0, "bad_quote": 0}
+    for f in stated:
+        ex = f.get("excerpt")
+        if f.get("quote") is None or ex is None:
+            out["missing"] += 1
+        elif quote_found(f.get("quote"), excerpts.get(str(ex))):
+            out["verified"] += 1
+        else:
+            out["bad_quote"] += 1
+    out["all_verified"] = out["verified"] == out["facts"]       # vacuously true for overall-only
+    return out
+
+
+def evidence_check(source: str = "judge_claude", run: str | None = None, parallel: int = 3, limit: int | None = None) -> None:
+    sys.path.insert(0, str(ROOT))
+    from markets.briefs import find_claude
+    binary = find_claude()
+    if not binary:
+        raise SystemExit("claude CLI not found")
+    db = _db()
+    labels = {d["key"]: d for d in db[LABEL_COLL].find({"source": source, "level": "sentence", "error": None,
+                                                         "kind": "claim", "verdict": {"$in": ["supported", "partial"]}})}
+    done = {d["key"] for d in db[EVIDENCE_COLL].find({"error": None}, {"key": 1})}
+    runs = list(db[RUNS_COLL].find({"error": None} | ({"run": run} if run else {"run": {"$not": {"$regex": "^smoke"}}})))
+    todo = []
+    for r in runs:
+        sents = [x for x in db[SENT_COLL].find({"run": r["run"], "question_id": r["question_id"]}).sort("idx", 1)
+                 if x["_key"] in labels and x["_key"] not in done]
+        if sents:
+            todo.append((r, sents))
+    todo = todo[:limit]
+    print(f"[evidence] {len(todo)} answers, {sum(len(x) for _, x in todo)} sentences, {parallel} at a time")
+
+    def one(item):
+        r, sents = item
+        prompt = EVIDENCE_PROMPT.format(excerpts=_excerpt_block(r["excerpts"]),
+                                        sentences="\n".join(f'{i}. "{x["text"]}"' for i, x in enumerate(sents)))
+        try:
+            return r, sents, _claude(prompt, binary), None
+        except Exception as e:  # noqa: BLE001 - retried on the next run
+            return r, sents, "", f"{type(e).__name__}: {e}"[:200]
+
+    n = 0
+    with ThreadPoolExecutor(parallel) as ex:
+        for r, sents, text, err in ex.map(one, todo):
+            got = {}
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        obj = json.loads(line)
+                        got[str(obj.get("item"))] = obj.get("facts") or []
+                    except ValueError:
+                        pass
+            for i, x in enumerate(sents):
+                facts = got.get(str(i))
+                doc = {"key": x["_key"], "run": r["run"], "verdict": labels[x["_key"]]["verdict"],
+                       "error": err or (None if facts is not None else "no evidence line"),
+                       "facts_detail": facts or [], "checked_at": datetime.now(timezone.utc)}
+                if facts is not None and not err:
+                    doc.update(evidence_verdict(facts, r["excerpts"]))
+                db[EVIDENCE_COLL].update_one({"key": x["_key"]}, {"$set": doc}, upsert=True)
+            n += 1
+            print(f"  {n}/{len(todo)} {r['run']}/{r['question_id']}" + (f" ERROR {err}" if err else ""), flush=True)
+
+
+def evidence_report() -> dict:
+    db = _db()
+    rows = list(db[EVIDENCE_COLL].find({"error": None}))
+    rep = {}
+    for verdict in ("supported", "partial"):
+        rs = [r for r in rows if r["verdict"] == verdict]
+        facts = sum(r["facts"] for r in rs)
+        rep[verdict] = {
+            "sentences": len(rs),
+            "all_facts_verified": sum(r["all_verified"] for r in rs),
+            "with_missing_fact": sum(1 for r in rs if r["missing"]),
+            "with_bad_quote": sum(1 for r in rs if r["bad_quote"]),
+            "overall_only": sum(1 for r in rs if r["facts"] == 0),
+            "facts": facts,
+            "facts_overall": sum(r.get("overall", 0) for r in rs),
+            "facts_verified": sum(r["verified"] for r in rs),
+            "facts_missing": sum(r["missing"] for r in rs),
+            "facts_bad_quote": sum(r["bad_quote"] for r in rs),
+        }
+    quoted = sum(r["verified"] + r["bad_quote"] for r in rows)
+    rep["quotes_found_verbatim"] = f"{sum(r['verified'] for r in rows)}/{quoted}"
+    print(json.dumps(rep, indent=1))
+    return rep
+
+
 # ---------------------------------------------------------------- 4. agreement and scores
 
 def kappa(a: str, b: str) -> dict:
@@ -771,7 +914,9 @@ def main() -> None:
     ap.add_argument("--subset", metavar="SOURCE", help="--judge: only sentences this source labelled")
     ap.add_argument("--reference", action="store_true")
     ap.add_argument("--claude-judge", action="store_true", help="option A: Claude labels every sentence and answer")
-    ap.add_argument("--parallel", type=int, default=3, help="--claude-judge: answers in flight")
+    ap.add_argument("--parallel", type=int, default=3, help="--claude-judge / --evidence: answers in flight")
+    ap.add_argument("--evidence", action="store_true", help="verbatim evidence check of the Claude judge")
+    ap.add_argument("--evidence-report", action="store_true")
     ap.add_argument("--sample", type=int, default=100)
     ap.add_argument("--kappa", nargs=2, metavar=("A", "B"))
     ap.add_argument("--score", action="store_true")
@@ -789,6 +934,10 @@ def main() -> None:
         judge(a.source, a.model, a.run, a.limit, keys)
     if a.reference:
         reference(a.sample)
+    if a.evidence:
+        evidence_check(run=a.run, parallel=a.parallel, limit=a.limit)
+    if a.evidence_report:
+        evidence_report()
     if a.claude_judge:
         claude_judge(a.source if a.source != JUDGE_SOURCE else "judge_claude", a.run, a.parallel, a.limit)
     if a.kappa:

@@ -121,6 +121,30 @@ class DeclineTest(unittest.TestCase):
         self.assertFalse(ge.declines("Tesla cut prices in China [1]. The excerpts do not mention Europe."))
 
 
+class EvidenceTest(unittest.TestCase):
+    EX = {"1": "symbol: TSLA | date: 20240421\nTesla cut prices of its \u201cModel Y\u201d in China\u2014by up to 20%.",
+          "2": "Ford cut output because of the chip crunch."}
+
+    def test_quote_must_be_in_the_named_excerpt_case_and_typography_aside(self):
+        self.assertTrue(ge.quote_found('tesla cut prices of its "Model Y"  in China-by up to 20%', self.EX["1"]))
+        self.assertTrue(ge.quote_found("date: 20240421", self.EX["1"]))
+        self.assertFalse(ge.quote_found("Tesla cut prices by 30%", self.EX["1"]))     # not what it says
+        self.assertFalse(ge.quote_found("Ford cut output", self.EX["1"]))             # wrong excerpt
+        self.assertFalse(ge.quote_found("", self.EX["1"]))
+
+    def test_evidence_verdict_counts_missing_and_invented_quotes(self):
+        facts = [{"fact": "Tesla cut prices", "excerpt": 1, "quote": "Tesla cut prices"},
+                 {"fact": "Ford output", "excerpt": 2, "quote": "Ford cut output because of the chip crunch"},
+                 {"fact": "GM", "excerpt": None, "quote": None},
+                 {"fact": "Up to 30%", "excerpt": 1, "quote": "by up to 30%"}]
+        v = ge.evidence_verdict(facts, self.EX)
+        self.assertEqual((v["verified"], v["missing"], v["bad_quote"], v["all_verified"]), (2, 1, 1, False))
+        self.assertTrue(ge.evidence_verdict(facts[:2], self.EX)["all_verified"])
+        overall = [{"fact": "no excerpt mentions a glut", "type": "overall", "excerpt": None, "quote": None}]
+        v = ge.evidence_verdict(facts[:1] + overall, self.EX)
+        self.assertEqual((v["facts"], v["overall"], v["missing"], v["all_verified"]), (1, 1, 0, True))
+
+
 class ClaudeJudgePromptTest(unittest.TestCase):
     def test_answer_prompt_carries_the_same_rules_as_the_sentence_judge(self):
         self.assertIn('"partial"', ge._SENT_RULES)
