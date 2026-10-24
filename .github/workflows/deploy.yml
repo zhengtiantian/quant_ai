@@ -39,8 +39,11 @@ jobs:
             xiz001/quant_ai:${{ env.COMMIT_TAG }}
 
       - name: Update image tag in quant_docker
+        id: compose
         run: |
-          git clone https://zhengtiantian:${{ secrets.MAIN_REPO_PAT }}@github.com/zhengtiantian/quant_docker.git
+          # The platform repo was renamed from quant_docker; git follows the redirect, the PR API
+          # below does not (it answered 301 and no PR was ever opened), so use the new name.
+          git clone https://zhengtiantian:${{ secrets.MAIN_REPO_PAT }}@github.com/zhengtiantian/ai-equity-signal-platform.git quant_docker
           cd quant_docker
 
           sed -i "s@xiz001/quant_ai:[^[:space:]]\+@xiz001/quant_ai:${{ env.COMMIT_TAG }}@g" docker-compose.yml
@@ -54,22 +57,25 @@ jobs:
             git add docker-compose.yml
             git commit -m "Update quant_ai image tag to ${{ env.COMMIT_TAG }}"
             git push origin update-quant-ai-${{ env.COMMIT_TAG }}
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "No changes in docker-compose.yml, skipping commit."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create Pull Request
-        if: success()
+        if: steps.compose.outputs.changed == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.MAIN_REPO_PAT }}
         run: |
-          curl -s -X POST \
+          # --fail-with-body: a refused PR fails the job instead of passing silently.
+          curl -sS --fail-with-body -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/zhengtiantian/quant_docker/pulls \
+            https://api.github.com/repos/zhengtiantian/ai-equity-signal-platform/pulls \
             -d '{
               "title": "Update quant_ai image to '${{ env.COMMIT_TAG }}'",
               "head": "update-quant-ai-'${{ env.COMMIT_TAG }}'",
               "base": "main",
               "body": "Updates quant_ai image tag to '${{ env.COMMIT_TAG }}'."
-            }' || echo "No PR created (branch may already exist or no changes)."
+            }'
