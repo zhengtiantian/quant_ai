@@ -9,10 +9,11 @@ runs it on report days:
   15:55 ET    a holding reports after the close today: the watch starts; the pre-release context
               (run-up, volatility, typical report move, news) comes from quant_data
   every 5 s   the quote; the release minute is the first after 16:00 with a 0.5% move
-  placements  before the close, 1/3/5/10/20/30 min after the release, 5 min before the call: the
-              model scores the plans that can go in now; the first that clears its margin, on a
-              stock whose out-of-sample record is positive, becomes orders
-  orders      whole shares (PULSE_FRACTION of the position, three steps), extended-hours limits,
+  placements  1/3/5/10/20/30 min after the release, 5 min before the call: the model scores every
+              step it could put in now (12 levels x 7 buy-back rules) for gain and downside and
+              composes the plan (how many steps, which levels, what weights); the first plan that
+              clears its margin, on a stock whose out-of-sample record is positive, becomes orders
+  orders      whole shares (PULSE_FRACTION of the position, split by the plan's weights), limits,
               saved with the advisor's orders (tag pulse, the buy-backs waiting on their sales) and
               announced by an urgent notification: the move lasts minutes, no report is written first
 
@@ -66,15 +67,25 @@ def reporting_today(held: List[Dict[str, Any]], today: date, cal_fn=None) -> Lis
             and "after" in str(e.get("when") or "").lower() and "seoul" not in str(e.get("when") or "").lower()]
 
 
-def shares_for(quantity: float, n_steps: int = 3, fraction: float = FRACTION) -> List[int]:
-    """Whole shares per ladder step: fraction of the whole position over the steps, at least one each
-    while the position allows, never more than the position."""
+def shares_for(quantity: float, weights: List[float], fraction: float = FRACTION) -> List[int]:
+    """Whole shares per step: `fraction` of the whole position split by the policy's weights (largest
+    remainders first), at least one share per step while the budget allows; steps that get none are
+    dropped by the caller."""
     whole = int(math.floor(quantity))
-    if whole < 1:
+    if whole < 1 or not weights:
         return []
-    each = max(1, int(whole * fraction // n_steps))
-    steps = min(n_steps, whole // each)
-    return [each] * steps
+    budget = max(1, min(whole, int(whole * fraction)))
+    w = [x / sum(weights) for x in weights]
+    raw = [budget * x for x in w]
+    out = [int(math.floor(x)) for x in raw]
+    for i in sorted(range(len(w)), key=lambda i: raw[i] - out[i], reverse=True)[:budget - sum(out)]:
+        out[i] += 1
+    if 0 in out and budget >= len(out):                 # every step gets a share before any gets two
+        for i in [i for i, n in enumerate(out) if n == 0]:
+            j = max(range(len(out)), key=lambda j: out[j])
+            out[j] -= 1
+            out[i] += 1
+    return out
 
 
 class Watch:
@@ -97,7 +108,7 @@ class Watch:
         return datetime(self.day.year, self.day.month, self.day.day, h, m, tzinfo=NY)
 
     def placements(self) -> Dict[str, datetime]:
-        out = {"pre": self._at(15, 57)}
+        out: Dict[str, datetime] = {}                  # the policy puts nothing in before the release (2026-10-26)
         if self.release:
             out.update({f"r+{k}": self.release + timedelta(minutes=k) for k in AFTER_RELEASE})
         out["c-5"] = self.call - timedelta(minutes=5)
@@ -139,8 +150,9 @@ class Watch:
 
     def make_orders(self, ans: Dict[str, Any], p0: float, now: datetime) -> Dict[str, Any]:
         best = ans["best"]
-        sizes = shares_for(self.quantity, len(best["ladder"]))
-        sells = [{"shares": n, "limit": round(p0 * (1 + lev / 100), 2), "step_pct": lev} for n, lev in zip(sizes, best["ladder"])]
+        sizes = shares_for(self.quantity, best.get("weights") or [1.0] * len(best["ladder"]))
+        sells = [{"shares": n, "limit": round(p0 * (1 + lev / 100), 2), "step_pct": lev}
+                 for n, lev in zip(sizes, best["ladder"]) if n > 0]
         bb = best["buyback"]
         if bb.startswith("lim"):
             b = int(bb[3:])

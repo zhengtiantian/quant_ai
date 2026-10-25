@@ -27,7 +27,8 @@ class FakeModel:
     def __call__(self, req):
         self.calls.append(req)
         act = self.act_above is not None and req["place"] != "pre" and req["move_at"] >= self.act_above
-        return {"act": act, "best": {"plan": f"{req['place']} | 1/2/3 | lim2", "ladder": [1, 2, 3], "buyback": "lim2", "pred_pct": 0.8},
+        return {"act": act, "best": {"plan": f"{req['place']} | 1/2/3 | lim2", "ladder": [1, 2, 3], "weights": [1, 1, 1],
+                                      "buyback": "lim2", "pred_pct": 0.8},
                 "stock_record": {"reports": 30, "acted": 13, "mean_when_acting": 1.65, "win": 0.77}, "model_record": {}}
 
 
@@ -52,20 +53,19 @@ class WatchTest(unittest.TestCase):
         w = pulse.Watch("INTC", 98.9, 106.74, 100.0, DAY, {"run5": -3.0}, predict=m)
         self.assertIsNone(run(w, self.evening(None)))
         self.assertEqual(w.release, at(16, 1))
-        self.assertEqual([c["place"] for c in m.calls], ["pre", "r+1", "r+3", "r+5", "r+10", "r+20", "r+30", "c-5"])
+        self.assertEqual([c["place"] for c in m.calls], ["r+1", "r+3", "r+5", "r+10", "r+20", "r+30", "c-5"])
         r5 = next(c for c in m.calls if c["place"] == "r+5")
         self.assertAlmostEqual(r5["move_at"], 11.0)                 # the price at 16:06, when r+5 is asked
         self.assertEqual(r5["release_min"], 16 * 60 + 1)
-        self.assertEqual(m.calls[0]["release_min"], None)          # before the release nothing about it is known
 
     def test_first_placement_that_clears_becomes_whole_share_orders(self):
         w = pulse.Watch("INTC", 98.9, 106.74, 100.0, DAY, {}, predict=FakeModel(act_above=9.5))
         o = run(w, self.evening(None))
         self.assertEqual(o["plan"], "r+3 | 1/2/3 | lim2")
-        self.assertEqual([s["shares"] for s in o["sells"]], [9, 9, 9])            # 30% of 98 whole shares in three steps
+        self.assertEqual([s["shares"] for s in o["sells"]], [10, 10, 9])          # 30% of 98 whole shares, equal weights
         self.assertEqual([s["limit"] for s in o["sells"]], [111.1, 112.2, 113.3])  # +1/2/3% on 110
         self.assertEqual([r["limit"] for r in o["rebuys"]], [108.88, 109.96, 111.03])
-        self.assertEqual(len(w.decisions), 3)                                      # asks nothing after it acted
+        self.assertEqual(len(w.decisions), 2)                                      # asks nothing after it acted
 
     def test_close_is_the_last_price_before_the_bell(self):
         w = pulse.Watch("INTC", 10, None, 90.0, DAY, {}, predict=FakeModel())
@@ -74,11 +74,12 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(w.close, 100.0)
         self.assertIsNone(w.release)
 
-    def test_shares_for_small_and_large_positions(self):
-        self.assertEqual(pulse.shares_for(98.9), [9, 9, 9])
-        self.assertEqual(pulse.shares_for(6.3), [1, 1, 1])
-        self.assertEqual(pulse.shares_for(2.0), [1, 1])
-        self.assertEqual(pulse.shares_for(0.4), [])
+    def test_shares_split_by_the_policy_weights(self):
+        self.assertEqual(pulse.shares_for(98.9, [1, 1, 1]), [10, 10, 9])           # 29 shares (30% of 98)
+        self.assertEqual(pulse.shares_for(98.9, [0.6, 0.3, 0.1]), [17, 9, 3])
+        self.assertEqual(pulse.shares_for(6.3, [0.5, 0.3, 0.2]), [1, 0, 0])         # STX: 30% of 6 shares is one share
+        self.assertEqual(pulse.shares_for(10, [0.9, 0.05, 0.05]), [1, 1, 1])        # 3 shares: one per step first
+        self.assertEqual(pulse.shares_for(0.4, [1]), [])
 
     def test_saved_with_buy_backs_waiting_and_kept_out_of_daily_scoring(self):
         with tempfile.TemporaryDirectory() as d:
