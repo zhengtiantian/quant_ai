@@ -177,7 +177,7 @@ def save(orders: Dict[str, Any], day: date, path: Optional[Path] = None) -> None
                      "valid_until": until, "zh": f"卖出成交后买回 {r['shares']} 股：{orders['how']}",
                      "en": f"After that sale fills, buy back {r['shares']}: {orders['how']}", "note": note,
                      "plan": "pulse:" + orders["plan"], "parent": r["after_sale"]})
-    advisor.save_orders(None, legs, time.time(), path)
+    advisor.save_orders(None, legs, datetime.fromisoformat(orders["at"]).timestamp(), path)
 
 
 def events_next_session(d: date) -> date:
@@ -199,6 +199,114 @@ def write_log(w: Watch) -> None:
     (LOG_DIR / f"{w.day}_{w.symbol}.json").write_text(json.dumps(
         {"symbol": w.symbol, "close": w.close, "release": w.release.isoformat() if w.release else None,
          "ticks": [(t.isoformat(), p) for t, p in w.ticks], "decisions": w.decisions, "orders": w.orders}, default=str))
+
+
+# ---------------------------------------------------------------- scoring, the next morning (1-minute bars)
+
+ALPACA_BARS = "https://data.alpaca.markets/v2/stocks/{sym}/bars"
+SCORE_AFTER = (10, 45)                 # ET on the next session: the latest buy-back (the open) is in the bars
+
+
+def _alpaca_headers() -> Dict[str, str]:
+    from .pipeline_health import QUANT_DATA_ENV
+    env = dict(line.strip().split("=", 1) for line in QUANT_DATA_ENV.read_text().splitlines() if "=" in line and not line.startswith("#"))
+    return {"APCA-API-KEY-ID": env["ALPACA_API_KEY_ID"].strip(), "APCA-API-SECRET-KEY": env["ALPACA_API_SECRET_KEY"].strip()}
+
+
+def minute_bars(symbol: str, start: datetime, end: datetime) -> List[Dict[str, Any]]:
+    """1-minute bars incl. extended hours (SIP: free for anything older than 15 minutes)."""
+    import requests
+    out, token = [], None
+    while True:
+        params = {"timeframe": "1Min", "start": start.astimezone(ZoneInfo("UTC")).isoformat(), "limit": 10000,
+                  "end": end.astimezone(ZoneInfo("UTC")).isoformat(), "feed": "sip", "adjustment": "raw"}
+        if token:
+            params["page_token"] = token
+        r = requests.get(ALPACA_BARS.format(sym=symbol), headers=_alpaca_headers(), params=params, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        out += [{"t": datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(NY), "o": b["o"], "h": b["h"], "l": b["l"],
+                 "c": b["c"]} for b in j.get("bars") or []]
+        token = j.get("next_page_token")
+        if not token:
+            return out
+
+
+def replay_leg(sell_limit: float, p0: float, issued: datetime, buyback: str, bars: List[Dict[str, Any]],
+               call: datetime) -> Dict[str, Any]:
+    """One ladder step on the evening's 1-minute bars: when (if) the sale filled, when and at what the
+    shares came back, and the gain against holding in % of the price when the orders were given."""
+    after = [b for b in bars if b["t"] >= issued.replace(second=0, microsecond=0) + timedelta(minutes=1)]
+    sale = next((b for b in after if b["h"] >= sell_limit), None)
+    if sale is None:
+        return {"filled": False}
+    sell = max(sell_limit, sale["o"])
+    later = [b for b in after if b["t"] > sale["t"]]
+    nxt_open = next((b for b in later if b["t"].date() > issued.date() and b["t"].hour * 60 + b["t"].minute >= 570), None)
+    buy_bar = None
+    if buyback.startswith("lim"):
+        back = sell * (1 - int(buyback[3:]) / 100)
+        buy_bar = next((b for b in later if (nxt_open is None or b["t"] <= nxt_open["t"]) and b["l"] <= back), None)
+        buy = min(back, buy_bar["o"]) if buy_bar else None
+    else:
+        when = {"c+5": call + timedelta(minutes=5), "c+30": call + timedelta(minutes=30),
+                "ah_end": issued.replace(hour=19, minute=55, second=0, microsecond=0)}.get(buyback)
+        buy_bar = next((b for b in later if when and b["t"] >= when and (nxt_open is None or b["t"] < nxt_open["t"])), None)
+        buy = buy_bar["o"] if buy_bar else None
+    if buy is None:
+        if nxt_open is None:
+            return {"filled": True, "sold_at": sale["t"], "sell": sell, "pending": True}
+        buy_bar, buy = nxt_open, nxt_open["o"]
+    return {"filled": True, "sold_at": sale["t"], "sell": sell, "bought_at": buy_bar["t"], "buy": buy,
+            "gain_pct": round((sell - buy) / p0 * 100, 3)}
+
+
+def score_due(path: Optional[Path] = None, now: Optional[datetime] = None, bars_fn=None) -> int:
+    """The morning after a report evening: replay each pulse order on that evening's 1-minute bars
+    and store the result with the order (sale filled or expired; buy-back scored or void)."""
+    now = now or datetime.now(NY)
+    conn = advisor._conn(path)
+    try:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM advice_orders WHERE plan LIKE 'pulse:%' AND status IN ('open', 'waiting')")]
+    finally:
+        conn.close()
+    sells = [r for r in rows if r["side"] == "sell"]
+    kids = {r["parent_id"]: r for r in rows if r["parent_id"]}
+    done = 0
+    for s in sells:
+        until = date.fromisoformat(s["valid_until"])
+        if now < datetime(until.year, until.month, until.day, *SCORE_AFTER, tzinfo=NY):
+            continue
+        issued = datetime.fromtimestamp(s["issued_ts"], NY)
+        try:
+            bars = (bars_fn or minute_bars)(s["symbol"], issued - timedelta(minutes=5),
+                                            datetime(until.year, until.month, until.day, 10, 30, tzinfo=NY))
+        except Exception as e:  # noqa: BLE001 - tried again on the next tick
+            print(f"[pulse] scoring bars for {s['symbol']} failed: {type(e).__name__}: {e}")
+            continue
+        buyback = s["plan"].split("|")[-1].strip()
+        call = issued.replace(hour=DEFAULT_CALL[0], minute=DEFAULT_CALL[1], second=0, microsecond=0)
+        r = replay_leg(s["limit_price"], s["issued_price"] or s["limit_price"], issued, buyback, bars, call)
+        if r.get("pending"):
+            continue
+        kid = kids.get(s["id"])
+        conn = advisor._conn(path)
+        try:
+            if not r["filled"]:
+                conn.execute("UPDATE advice_orders SET status = 'expired', eval_date = ? WHERE id = ?", (until.isoformat(), s["id"]))
+                if kid:
+                    conn.execute("UPDATE advice_orders SET status = 'void' WHERE id = ?", (kid["id"],))
+            else:
+                conn.execute("UPDATE advice_orders SET status = 'scored', filled_date = ?, eval_date = ?, eval_close = ?, edge_pct = ? "
+                             "WHERE id = ?", (r["sold_at"].isoformat(), r["bought_at"].isoformat(), r["buy"], r["gain_pct"], s["id"]))
+                if kid:
+                    conn.execute("UPDATE advice_orders SET status = 'scored', filled_date = ?, eval_close = ? WHERE id = ?",
+                                 (r["bought_at"].isoformat(), r["buy"], kid["id"]))
+            conn.commit()
+        finally:
+            conn.close()
+        done += 1
+    return done
 
 
 # ---------------------------------------------------------------- the evening loop

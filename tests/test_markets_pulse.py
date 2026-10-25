@@ -91,6 +91,26 @@ class WatchTest(unittest.TestCase):
             self.assertTrue(all(r["valid_until"] == "2026-10-30" and r["plan"].startswith("pulse:") for r in rows))
             self.assertEqual(advisor.score_due(db, now=at(23, 0).timestamp() + 2 * 86400, bars_fn=lambda *a: []), 0)
 
+    def test_next_morning_scoring_on_minute_bars(self):
+        def bar(h, m, o, hi, lo, c, day=29):
+            return {"t": datetime(2026, 10, day, h, m, tzinfo=NY), "o": o, "h": hi, "l": lo, "c": c}
+        # sold the +1% step (111.1) at 16:08 and the +2% step (112.2) at 16:20; both bought back at 16:40
+        # (the bar opened at 109.5, below 112.2 x 0.98); the +3% step never traded
+        bars = [bar(16, 7, 110, 110.5, 109.8, 110.2), bar(16, 8, 110.5, 111.3, 110.4, 111.0), bar(16, 20, 111.5, 112.4, 111.4, 112.0),
+                bar(16, 40, 109.5, 109.6, 108.5, 108.9), bar(19, 59, 107, 107, 107, 107), bar(9, 30, 106, 106.5, 105.5, 106, day=30)]
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "a.db"
+            w = pulse.Watch("INTC", 98.9, 106.74, 100.0, DAY, {}, predict=FakeModel(act_above=9.5))
+            pulse.save(run(w, WatchTest.evening(self, None)), DAY, db)          # orders at 16:06, p0 110
+            self.assertEqual(pulse.score_due(db, now=datetime(2026, 10, 30, 9, 0, tzinfo=NY), bars_fn=lambda *a: bars), 0)
+            self.assertEqual(pulse.score_due(db, now=datetime(2026, 10, 30, 11, 0, tzinfo=NY), bars_fn=lambda *a: bars), 3)
+            card = {(r["side"], r["limit_price"]): r for r in advisor.scorecard(db)["recent"]}
+            self.assertEqual(card[("sell", 111.1)]["status"], "scored")
+            self.assertAlmostEqual(card[("sell", 111.1)]["edge_pct"], round((111.1 - 111.1 * 0.98) / 110 * 100, 3))   # back 2% under the sale, as in training
+            self.assertAlmostEqual(card[("sell", 112.2)]["edge_pct"], round((112.2 - 109.5) / 110 * 100, 3))
+            self.assertEqual(card[("sell", 113.3)]["status"], "expired")
+            self.assertEqual(card[("buy", 111.03)]["status"], "void")
+
     def test_reporting_today_only_after_the_close(self):
         held = [{"symbol": "INTC"}, {"symbol": "TSM"}, {"symbol": "SKHY"}]
         cal = [{"symbol": "INTC", "date": "2026-10-29", "when": "after the close"},

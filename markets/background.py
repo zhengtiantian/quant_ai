@@ -32,6 +32,7 @@ def _loop() -> None:
         try:
             from . import pulse
             pulse.run_due()                    # report evenings: the after-the-close pulse watch
+            pulse.score_due()                  # the morning after: its orders replayed on 1-minute bars
         except Exception as e:  # noqa: BLE001
             print(f"[markets] pulse check failed: {type(e).__name__}: {e}")
         try:
