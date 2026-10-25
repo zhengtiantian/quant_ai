@@ -11,6 +11,13 @@ Forward-looking:
   flash        whenever a bellwether moves 5% or more in pre-market or after hours (Lam Research
                on 2026-10-21): how the move should travel to Asia, Europe and the holdings.
 
+Holdings advisor (PROJECT_PLAN Q.5, markets/advisor.py):
+  advisor      13:00 Dublin, weekdays (US pre-market, 1.5 h before the open): what to do with each
+               holding, as limit orders that are stored and scored; plus a focused update whenever
+               a 15-minute check finds a reason (a move beyond the stock's threshold, an advised
+               limit reached, earnings tomorrow or just out, important news). Only urgent updates
+               notify; everything shows in My Holdings.
+
 Every brief ends with checkable predictions (markets/predictions.py), scored against real closes,
 so the briefs keep a track record instead of only sounding right.
 
@@ -41,7 +48,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from . import backup, events, global_markets, portfolio, predictions
+from . import advisor, backup, events, global_markets, portfolio, predictions
 from .config import DATA_DIR, DB_PATH
 
 DUBLIN = ZoneInfo("Europe/Dublin")
@@ -51,6 +58,7 @@ KINDS = {
     "us": {"title": "US markets", "zone": NEW_YORK, "at": dtime(20, 5)},
     "outlook": {"title": "Week ahead", "zone": DUBLIN, "at": dtime(13, 30)},
     "flash": {"title": "Flash", "zone": NEW_YORK, "at": None},          # event-driven, no schedule
+    "advisor": {"title": "Holdings advisor", "zone": DUBLIN, "at": dtime(13, 0)},
 }
 MAX_ATTEMPTS = 3
 RETRY_AFTER = 20 * 60          # seconds between attempts after a failure
@@ -77,7 +85,7 @@ CREATE TABLE IF NOT EXISTS briefs (
 """
 _run_lock = threading.Lock()
 _running: Dict[str, bool] = {}
-_last = {"flash_check": 0.0, "score": 0.0}
+_last = {"flash_check": 0.0, "score": 0.0, "advisor_check": 0.0}
 
 
 def _conn(path: Optional[Path] = None) -> sqlite3.Connection:
@@ -108,7 +116,7 @@ def due_session(kind: str, now: Optional[datetime] = None) -> Optional[str]:
     if k["at"] is None:
         return None
     local = (now or datetime.now(ZoneInfo("UTC"))).astimezone(k["zone"])
-    if kind in ("asia_europe", "outlook"):
+    if kind in ("asia_europe", "outlook", "advisor"):
         # From the scheduled time to the end of that Dublin weekday.
         return local.date().isoformat() if local.weekday() < 5 and local.time() >= k["at"] else None
     # US: the latest weekday whose 20:05 has passed, until the next weekday's 04:00 pre-market.
@@ -257,6 +265,11 @@ def snapshot(kind: str, path: Optional[Path] = None, context: Optional[Dict[str,
         except Exception as e:  # noqa: BLE001
             snap["calendar"] = {"unavailable": f"{type(e).__name__}: {e}"}
         snap["bellwethers"] = {s: {"name": n, "group": g} for s, (n, g) in events.BELLWETHERS.items()}
+    if kind == "advisor":
+        try:
+            snap["advisor"] = advisor.build(path, focus=(context or {}).get("symbol"))
+        except Exception as e:  # noqa: BLE001
+            snap["advisor"] = {"unavailable": f"{type(e).__name__}: {e}"}
     if kind == "flash" and context:
         try:
             today = datetime.now(NEW_YORK).date()
@@ -269,7 +282,7 @@ def snapshot(kind: str, path: Optional[Path] = None, context: Optional[Dict[str,
 
 # ---------------------------------------------------------------- the prompt
 
-SECTIONS = ("HEADLINE_ZH", "HEADLINE_EN", "BODY_ZH", "BODY_EN", "SOURCES", "PREDICTIONS")
+SECTIONS = ("HEADLINE_ZH", "HEADLINE_EN", "BODY_ZH", "BODY_EN", "SOURCES", "PREDICTIONS", "ORDERS")
 
 PROMPT = """You are writing the user's {title} market brief for {session} (a personal note, not advice
 for anyone else). The user is in Dublin, holds the US stocks listed under my_portfolio and follows the
@@ -299,8 +312,8 @@ my_portfolio, the US indices .SPX .IXIC .DJI .SOX .RUT, or a ticker named in the
 stocks are not scorable, use .KS11 / .KQ11. Pick dates that are trading days for that exchange. Prefer
 thresholds that make the call informative (not "moves less than 20%"), and state an honest confidence:
 the calls will be scored against real closes.
-
-Reply with exactly these six blocks and nothing before or after them:
+{extra_rules}
+Reply with exactly these blocks and nothing before or after them:
 =====HEADLINE_ZH=====
 (one line, at most 40 Chinese characters)
 =====HEADLINE_EN=====
@@ -312,7 +325,7 @@ Reply with exactly these six blocks and nothing before or after them:
 =====SOURCES=====
 (one per line: - [title](url))
 =====PREDICTIONS=====
-(one JSON object per line)
+(one JSON object per line){extra_blocks}
 
 SNAPSHOT (JSON):
 {snapshot}
@@ -342,6 +355,19 @@ FLASH_SECTIONS = """  ## What happened          (the trigger: who moved, how muc
   ## What would change this (what could stop or reverse the move: conference call details, peer results, macro)"""
 FLASH_ZH = "发生了什么 / 传导链条 / 对我的持仓 / 什么会改变判断"
 
+ADVISOR_SECTIONS = """  ## Bottom line            (the 2-3 actions that matter today, with prices; or why the best move is to wait)
+  ## Holding by holding     (for each position in snapshot.advisor.positions: where it stands (cost, break-even, % to get
+                             back to cost, weight), what is driving it now (news, earnings, sector, with sources), the plan
+                             as concrete orders (limit, size, validity) and what happens if the call is wrong)
+  ## Earnings plays         (for each holding reporting within the calendar: the implied move, the plan before and after,
+                             sized as a part of the position; say plainly that selling before a gap up means buying back
+                             higher or not at all)
+  ## New ideas              (0-3 names, normally from snapshot.advisor.buy_candidates, preferring ones that reduce the
+                             concentration in chips and memory; entry limit and size from the cash, or the switch that pays)
+  ## Risks and rules        (concentration, the Irish four-week rule where a loss sale and re-buy is advised, what would
+                             change this plan)"""
+ADVISOR_ZH = "一句话结论 / 逐只持仓 / 财报应对 / 新的机会 / 风险与规则"
+
 FOCUS = {
     "asia_europe": "Focus: today's Asian sessions (closed) and European sessions (still trading), what they "
                    "imply for tonight's US open (see the US futures in macro), and the macro board.",
@@ -354,15 +380,32 @@ FOCUS = {
     "flash": "Focus: snapshot.trigger is a sector bellwether that just moved sharply outside regular hours. Explain "
              "the move from the news, then trace how it should travel to the Asian and European exchanges in "
              "snapshot.exchanges (their next sessions) and to the user's holdings at the next US open.",
+    "advisor": "You are the user's personal trading adviser for the positions in snapshot.advisor.positions. The user's "
+               "priority is profit: first getting the losing positions back to cost (INTC is the largest loss and weight), "
+               "then growing. Give concrete, sized, priced actions rather than commentary, and only actions you would "
+               "defend: doing nothing is a valid answer. Lowering the cost basis by trimming into strength and re-buying "
+               "lower is welcome when the volatility supports it, always on part of the position. Use the computed "
+               "levels in each position (band from the options-implied move near earnings, else 2 x ATR; 20/60-day "
+               "support and resistance; break-even) for prices. snapshot.advisor.quant_model and buy_candidates come from "
+               "the platform's own ranking model; news_7d from its news store (search the web for anything newer and "
+               "for SK hynix / Seagate, which the store does not cover). Respect cash_usd.",
 }
+ADVISOR_FOCUS_UPDATE = (" This is a focused update: snapshot.trigger says which holding and why it was written now. Put "
+                        "that holding first and in depth, revise or cancel its open orders (listed in snapshot.trigger) "
+                        "and give the other holdings one line each.")
 
 
 def build_prompt(kind: str, session: str, snap: Dict[str, Any], topic: str = "") -> str:
-    sections, zh, n = {"outlook": (OUTLOOK_SECTIONS, OUTLOOK_ZH, "4 to 8"), "flash": (FLASH_SECTIONS, FLASH_ZH, "4 to 8")}.get(
-        kind, (SUMMARY_SECTIONS, SUMMARY_ZH, "2 to 4"))
+    sections, zh, n = {"outlook": (OUTLOOK_SECTIONS, OUTLOOK_ZH, "4 to 8"), "flash": (FLASH_SECTIONS, FLASH_ZH, "4 to 8"),
+                       "advisor": (ADVISOR_SECTIONS, ADVISOR_ZH, "2 to 4")}.get(kind, (SUMMARY_SECTIONS, SUMMARY_ZH, "2 to 4"))
     title = f"{KINDS[kind]['title']}: {topic}" if topic else KINDS[kind]["title"]
-    return PROMPT.format(title=title, session=session, focus=FOCUS[kind], sections=sections, n_preds=n,
-                         sections_note=f"in the Chinese version titled {zh}",
+    focus = FOCUS[kind] + (ADVISOR_FOCUS_UPDATE if kind == "advisor" and topic else "")
+    extra_rules, extra_blocks = "", ""
+    if kind == "advisor":
+        extra_rules = "\n" + advisor.ORDER_RULES.format(max_days=advisor.ORDER_MAX_DAYS) + "\n"
+        extra_blocks = "\n=====ORDERS=====\n(one JSON object per line, or nothing)"
+    return PROMPT.format(title=title, session=session, focus=focus, sections=sections, n_preds=n,
+                         sections_note=f"in the Chinese version titled {zh}", extra_rules=extra_rules, extra_blocks=extra_blocks,
                          snapshot=json.dumps(snap, ensure_ascii=False, separators=(",", ":")))
 
 
@@ -376,7 +419,7 @@ def parse_reply(text: str) -> Dict[str, Any]:
                for m in re.finditer(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", blocks.get("SOURCES", ""))]
     return {"headline_zh": blocks["HEADLINE_ZH"].splitlines()[0].strip(), "headline_en": blocks["HEADLINE_EN"].splitlines()[0].strip(),
             "body_zh": blocks["BODY_ZH"], "body_en": blocks["BODY_EN"], "sources": sources,
-            "predictions_text": blocks.get("PREDICTIONS", "")}
+            "predictions_text": blocks.get("PREDICTIONS", ""), "orders_text": blocks.get("ORDERS", "")}
 
 
 # ---------------------------------------------------------------- the CLI
@@ -435,6 +478,7 @@ def generate(kind: str, session: Optional[str] = None, trigger: str = "schedule"
     snap: Dict[str, Any] = {}
     raw = None
     preds: List[Dict[str, Any]] = []
+    orders: List[Dict[str, Any]] = []
     try:
         snap = snapshot(kind, path, context)
         out = run_claude(build_prompt(kind, session, snap, topic))
@@ -444,6 +488,14 @@ def generate(kind: str, session: Optional[str] = None, trigger: str = "schedule"
                                                  date.fromisoformat(session), issued_ts=started)
         if dropped:
             print(f"[briefs] {kind} {session} {topic}: dropped predictions: {dropped}")
+        orders_text = parsed.pop("orders_text")
+        if kind == "advisor":
+            adv = snap.get("advisor") or {}
+            prices = {p["symbol"]: p.get("price") for p in adv.get("positions") or []}
+            prices.update({c["symbol"]: c.get("price") for c in adv.get("buy_candidates") or [] if c.get("price")})
+            orders, dropped_orders = advisor.parse_orders(orders_text, prices, date.fromisoformat(session))
+            if dropped_orders:
+                print(f"[briefs] advisor {session} {topic}: dropped orders: {dropped_orders}")
         models = list((out.get("modelUsage") or {}).keys())
         fields = {**parsed, "sources": json.dumps(parsed["sources"], ensure_ascii=False), "status": "done", "error": None,
                   "model": ",".join(models) or None, "cost_usd": out.get("total_cost_usd")}
@@ -462,11 +514,15 @@ def generate(kind: str, session: Optional[str] = None, trigger: str = "schedule"
         conn.close()
     if fields["status"] == "done":
         predictions.save(row["id"], kind, preds, path)
+        if kind == "advisor":
+            advisor.save_orders(row["id"], orders, started, path)
     if path is None:
         backup.schedule_backup()
     title = f"{KINDS[kind]['title']}{f' · {topic}' if topic else ''} brief"
     if fields["status"] == "done":
-        _notify(title, fields["headline_zh"])
+        # The advisor shows in My Holdings; only an urgent update interrupts (Q.5).
+        if kind != "advisor" or (context or {}).get("urgent"):
+            _notify(title, fields["headline_zh"])
     elif row["attempts"] >= MAX_ATTEMPTS or force:
         _notify(f"{title} failed", fields["error"])
     return row["id"]
@@ -499,7 +555,7 @@ def check_flash(path: Optional[Path] = None) -> List[int]:
 def run_due(path: Optional[Path] = None) -> List[int]:
     """Called every minute by the background loop: scheduled briefs, flash triggers, scoring."""
     done = []
-    for kind in ("outlook", "asia_europe", "us"):
+    for kind in ("advisor", "outlook", "asia_europe", "us"):
         session = due_session(kind)
         if session:
             rid = generate(kind, session, "schedule", path=path)
@@ -509,11 +565,36 @@ def run_due(path: Optional[Path] = None) -> List[int]:
     if now - _last["flash_check"] >= events.FLASH_CHECK_EVERY:
         _last["flash_check"] = now
         done += check_flash(path)
+    if now - _last["advisor_check"] >= advisor.TRIGGER_EVERY:
+        _last["advisor_check"] = now
+        done += check_advisor(path)
     if now - _last["score"] >= SCORE_EVERY:
         _last["score"] = now
-        if predictions.score_due(path):
+        if predictions.score_due(path) + advisor.score_due(path):
             if path is None:
                 backup.schedule_backup()
+    return done
+
+
+def _advisor_topic(symbol: str) -> str:
+    return f"{symbol} {datetime.now(DUBLIN):%H:%M}"
+
+
+def check_advisor(path: Optional[Path] = None) -> List[int]:
+    """Every 15 minutes: a focused advisor update for each holding with a reason to look again."""
+    try:
+        found = advisor.check_triggers(path)
+    except Exception as e:  # noqa: BLE001 - the check runs again in 15 minutes
+        print(f"[briefs] advisor trigger check failed: {type(e).__name__}: {e}")
+        return []
+    done = []
+    session = datetime.now(DUBLIN).date().isoformat()
+    for t in found:
+        t = {**t, "open_orders": [{k: o[k] for k in ("id", "side", "tag", "pct", "limit_price", "valid_until", "status", "en")}
+                                  for o in advisor.active_orders(path) if o["symbol"] == t["symbol"]]}
+        rid = generate("advisor", session, "event", path=path, topic=_advisor_topic(t["symbol"]), context=t)
+        if rid:
+            done.append(rid)
     return done
 
 
@@ -525,6 +606,8 @@ def generate_in_background(kind: str, path: Optional[Path] = None, symbol: str =
     symbol = symbol.strip().upper()
     if kind == "flash" and not re.fullmatch(r"[A-Z][A-Z.\-]{0,9}", symbol):
         raise ValueError("a flash brief needs a US ticker, e.g. LRCX")
+    if kind == "advisor" and symbol and not re.fullmatch(r"[A-Z][A-Z.\-]{0,9}", symbol):
+        raise ValueError("bad ticker")
     key = f"{kind}:{symbol}"
     with _run_lock:
         if _running.get(key):
@@ -543,7 +626,13 @@ def generate_in_background(kind: str, path: Optional[Path] = None, symbol: str =
                            "group": events.BELLWETHERS.get(symbol, (None, "user's pick"))[1], "session": q.get("session"),
                            "price": q.get("price"), "regular_close": q.get("regular_price") or q.get("prev_close"),
                            "move_pct": round(move, 2) if move is not None else None, "asked_by_hand": True}
-            generate(kind, trigger="manual", force=True, path=path, topic=symbol if kind == "flash" else "", context=context)
+            topic = symbol if kind == "flash" else ""
+            if kind == "advisor" and symbol:
+                topic = _advisor_topic(symbol)
+                context = {"symbol": symbol, "urgent": False, "reasons": [{"kind": "manual", "text": "asked by hand", "urgent": False}],
+                           "open_orders": [o for o in advisor.active_orders(path) if o["symbol"] == symbol]}
+            generate(kind, session=datetime.now(DUBLIN).date().isoformat() if kind == "advisor" else None,
+                     trigger="manual", force=True, path=path, topic=topic, context=context)
         finally:
             with _run_lock:
                 _running[key] = False
@@ -573,6 +662,23 @@ def list_briefs(kind: str = "", limit: int = 60, path: Optional[Path] = None) ->
     return [dict(r) for r in rows]
 
 
+def list_advisor(limit: int = 30, path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Advisor reports for My Holdings, newest first, with why each was written and whether urgent."""
+    conn = _conn(path)
+    try:
+        rows = conn.execute(f"SELECT {', '.join(_LIST_COLS)}, context FROM briefs WHERE kind = 'advisor' "
+                            "ORDER BY COALESCE(finished_at, started_at) DESC LIMIT ?", (int(limit),)).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        ctx = json.loads(d.pop("context") or "null") or {}
+        d.update(symbol=ctx.get("symbol"), urgent=bool(ctx.get("urgent")), reasons=ctx.get("reasons") or [])
+        out.append(d)
+    return out
+
+
 def get_brief(brief_id: int, path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     conn = _conn(path)
     try:
@@ -586,6 +692,8 @@ def get_brief(brief_id: int, path: Optional[Path] = None) -> Optional[Dict[str, 
     d["snapshot"] = json.loads(d["snapshot"]) if d.get("snapshot") else None
     d["context"] = json.loads(d["context"]) if d.get("context") else None
     d["predictions"] = predictions.for_brief(d["id"], path)
+    if d["kind"] == "advisor":
+        d["orders"] = advisor.orders_for_brief(d["id"], path)
     d.pop("raw", None)
     return d
 

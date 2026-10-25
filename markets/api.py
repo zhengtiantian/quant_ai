@@ -87,6 +87,8 @@ def portfolio_write(action: str, payload: Dict[str, Any]):
             result["symbol"] = portfolio.add_watch(payload.get("symbol", ""), payload.get("note", ""))
         elif action == "watch/remove":
             portfolio.remove_watch(payload.get("symbol", ""))
+        elif action == "cash/set":
+            result["cash"] = portfolio.set_cash(payload.get("cash"))
         else:
             return JSONResponse({"status": "error", "message": f"unknown portfolio endpoint {action}"}, status_code=404)
         backup.schedule_backup()
@@ -141,6 +143,20 @@ def briefs_run(payload: Dict[str, Any]):
         return {"status": "success", "started": started, **briefs.status()}
     except ValueError as e:
         return _error(e, 400)
+
+
+@router.get("/advisor")
+def advisor_state(limit: int = 30):
+    """My Holdings' advisor panel: the reports (urgent ones flagged), the orders still in play, the
+    orders' track record, the cash the advice is sized with."""
+    from . import advisor, briefs
+    try:
+        st = briefs.status()["kinds"]["advisor"]
+        return {"status": "success", "reports": briefs.list_advisor(limit), "orders": advisor.active_orders(),
+                "scorecard": advisor.scorecard(), "cash": portfolio.get_cash(), "running": st["running"],
+                "due_session": st["due_session"], "schedule": "weekdays 13:00 Dublin, plus focused updates on events"}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
 
 
 @router.get("/predictions/scorecard")

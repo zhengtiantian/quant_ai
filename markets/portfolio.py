@@ -94,6 +94,42 @@ def _conn(path: Optional[Path] = None) -> sqlite3.Connection:
     return conn
 
 
+# Cash available to invest, in USD, entered by hand on the Holdings page (Q.5, 2026-10-25). The
+# holdings advisor sizes its buy ideas with it; at 0 a buy can only be a switch out of a holding.
+CASH_KEY = "cash_usd"
+CASH_MAX = 1e9
+
+
+def get_cash(path: Optional[Path] = None) -> float:
+    conn = _conn(path)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (CASH_KEY,)).fetchone()
+    finally:
+        conn.close()
+    try:
+        return float(row["value"]) if row else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def set_cash(amount: Any, path: Optional[Path] = None) -> float:
+    try:
+        value = round(float(amount), 2)
+    except (TypeError, ValueError):
+        raise ValueError("cash must be a number")
+    if not 0 <= value < CASH_MAX:
+        raise ValueError("cash must be between 0 and 1,000,000,000")
+    conn = _conn(path)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (CASH_KEY, str(value)))
+        conn.commit()
+    finally:
+        conn.close()
+    return value
+
+
 def init_db(path: Optional[Path] = None) -> None:
     conn = _conn(path)
     try:
@@ -935,6 +971,6 @@ def get_state(force_quotes: bool = False, path: Optional[Path] = None, cached_qu
         "watch_refresh_seconds": refresh_interval(session, WATCH_TTL) if refresh_interval(session, REFRESH_SECONDS) else None,
         "next_session_in": seconds_until_next_session() if refresh_interval(session, REFRESH_SECONDS) is None else None,
         "us_time": datetime.now(US_EAST).strftime("%H:%M"), "usd_cny": _usd_cny(),
-        "tx_types": TX_TYPES, "server_time": time.time(), "refreshing": refreshing,
+        "tx_types": TX_TYPES, "server_time": time.time(), "refreshing": refreshing, "cash": get_cash(path),
         "global": global_markets.global_state(path, background=background_refresh),
     }
