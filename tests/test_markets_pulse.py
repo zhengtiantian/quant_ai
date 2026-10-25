@@ -1,0 +1,103 @@
+"""Earnings pulse watch (Q.5 v4): release minute, placements, whole-share ladders, saved orders. No network."""
+import sys
+import tempfile
+import unittest
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from markets import advisor, pulse  # noqa: E402
+
+NY = ZoneInfo("America/New_York")
+DAY = date(2026, 10, 29)
+
+
+def at(h, m, s=0):
+    return datetime(2026, 10, 29, h, m, s, tzinfo=NY)
+
+
+class FakeModel:
+    """Acts at the first placement after the release whose move is at least act_above."""
+
+    def __init__(self, act_above=None):
+        self.act_above, self.calls = act_above, []
+
+    def __call__(self, req):
+        self.calls.append(req)
+        act = self.act_above is not None and req["place"] != "pre" and req["move_at"] >= self.act_above
+        return {"act": act, "best": {"plan": f"{req['place']} | 1/2/3 | lim2", "ladder": [1, 2, 3], "buyback": "lim2", "pred_pct": 0.8},
+                "stock_record": {"reports": 30, "acted": 13, "mean_when_acting": 1.65, "win": 0.77}, "model_record": {}}
+
+
+def run(watch, prices):
+    """prices: [(datetime, price)]; returns the orders, if any."""
+    out = None
+    for t, p in prices:
+        out = watch.step(t, p) or out
+    return out
+
+
+class WatchTest(unittest.TestCase):
+    def evening(self, path):
+        """Close 100, flat to 16:00, jumps to +8% at 16:01, +11% by 16:05, fades to +5% by 17:10."""
+        pts = [(at(15, 50) + timedelta(seconds=30 * i), 100.0) for i in range(20)]
+        pts += [(at(16, 1), 108.0), (at(16, 2), 109.0), (at(16, 4), 110.0), (at(16, 6), 111.0), (at(16, 11), 109.0),
+                (at(16, 21), 107.0), (at(16, 31), 106.0), (at(16, 56), 105.5), (at(17, 10), 105.0)]
+        return pts
+
+    def test_release_minute_and_placements_in_order(self):
+        m = FakeModel()
+        w = pulse.Watch("INTC", 98.9, 106.74, 100.0, DAY, {"run5": -3.0}, predict=m)
+        self.assertIsNone(run(w, self.evening(None)))
+        self.assertEqual(w.release, at(16, 1))
+        self.assertEqual([c["place"] for c in m.calls], ["pre", "r+1", "r+3", "r+5", "r+10", "r+20", "r+30", "c-5"])
+        r5 = next(c for c in m.calls if c["place"] == "r+5")
+        self.assertAlmostEqual(r5["move_at"], 11.0)                 # the price at 16:06, when r+5 is asked
+        self.assertEqual(r5["release_min"], 16 * 60 + 1)
+        self.assertEqual(m.calls[0]["release_min"], None)          # before the release nothing about it is known
+
+    def test_first_placement_that_clears_becomes_whole_share_orders(self):
+        w = pulse.Watch("INTC", 98.9, 106.74, 100.0, DAY, {}, predict=FakeModel(act_above=9.5))
+        o = run(w, self.evening(None))
+        self.assertEqual(o["plan"], "r+3 | 1/2/3 | lim2")
+        self.assertEqual([s["shares"] for s in o["sells"]], [9, 9, 9])            # 30% of 98 whole shares in three steps
+        self.assertEqual([s["limit"] for s in o["sells"]], [111.1, 112.2, 113.3])  # +1/2/3% on 110
+        self.assertEqual([r["limit"] for r in o["rebuys"]], [108.88, 109.96, 111.03])
+        self.assertEqual(len(w.decisions), 3)                                      # asks nothing after it acted
+
+    def test_close_is_the_last_price_before_the_bell(self):
+        w = pulse.Watch("INTC", 10, None, 90.0, DAY, {}, predict=FakeModel())
+        w.step(at(15, 58), 100.0)
+        w.step(at(16, 0, 30), 100.2)                                # +0.2%: not the release
+        self.assertEqual(w.close, 100.0)
+        self.assertIsNone(w.release)
+
+    def test_shares_for_small_and_large_positions(self):
+        self.assertEqual(pulse.shares_for(98.9), [9, 9, 9])
+        self.assertEqual(pulse.shares_for(6.3), [1, 1, 1])
+        self.assertEqual(pulse.shares_for(2.0), [1, 1])
+        self.assertEqual(pulse.shares_for(0.4), [])
+
+    def test_saved_with_buy_backs_waiting_and_kept_out_of_daily_scoring(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "a.db"
+            w = pulse.Watch("INTC", 98.9, 106.74, 100.0, DAY, {}, predict=FakeModel(act_above=9.5))
+            o = run(w, self.evening(None))
+            pulse.save(o, DAY, db)
+            rows = advisor.active_orders(db)
+            self.assertEqual(sorted((r["side"], r["status"]) for r in rows), [("buy", "waiting")] * 3 + [("sell", "open")] * 3)
+            self.assertTrue(all(r["valid_until"] == "2026-10-30" and r["plan"].startswith("pulse:") for r in rows))
+            self.assertEqual(advisor.score_due(db, now=at(23, 0).timestamp() + 2 * 86400, bars_fn=lambda *a: []), 0)
+
+    def test_reporting_today_only_after_the_close(self):
+        held = [{"symbol": "INTC"}, {"symbol": "TSM"}, {"symbol": "SKHY"}]
+        cal = [{"symbol": "INTC", "date": "2026-10-29", "when": "after the close"},
+               {"symbol": "TSM", "date": "2026-10-29", "when": "before the open"},
+               {"symbol": "SKHY", "date": "2026-10-29", "when": "after the close (Seoul morning)"}]
+        self.assertEqual([e["symbol"] for e in pulse.reporting_today(held, DAY, cal_fn=lambda s: cal)], ["INTC"])
+
+
+if __name__ == "__main__":
+    unittest.main()

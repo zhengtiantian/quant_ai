@@ -1,6 +1,7 @@
 """One background thread for the markets jobs that run without anyone looking at a page:
 retrying a budget push that job_agent missed, watching the quant_data pipeline's freshness
-(pipeline_health.py), and (briefs.py) writing the daily briefs."""
+(pipeline_health.py), (briefs.py) writing the daily briefs, and (pulse.py) watching a holding's
+after-the-close earnings release."""
 
 import threading
 import time
@@ -28,6 +29,11 @@ def _loop() -> None:
             pipeline_health.run_due()
         except Exception as e:  # noqa: BLE001
             print(f"[markets] pipeline check failed: {type(e).__name__}: {e}")
+        try:
+            from . import pulse
+            pulse.run_due()                    # report evenings: the after-the-close pulse watch
+        except Exception as e:  # noqa: BLE001
+            print(f"[markets] pulse check failed: {type(e).__name__}: {e}")
         try:
             from . import briefs
             briefs.run_due()

@@ -397,7 +397,7 @@ def check_triggers(path: Optional[Path] = None, now: Optional[float] = None,
                         abs(move) >= URGENT_MULT * thr)
             # 2. a recommended limit reached
             for o in open_orders:
-                if o["symbol"] != s or o["status"] != "open" or not price:
+                if o["symbol"] != s or o["status"] != "open" or not price or str(o.get("plan") or "").startswith("pulse:"):
                     continue
                 hit = (o["side"] == "buy" and price <= o["limit_price"]) or (o["side"] == "sell" and o["tag"] == "stop" and price <= o["limit_price"]) \
                     or (o["side"] == "sell" and o["tag"] != "stop" and price >= o["limit_price"])
@@ -628,6 +628,8 @@ def score_due(path: Optional[Path] = None, now: Optional[float] = None, bars_fn=
         conn.close()
     changed = 0
     cache: Dict[str, List[Dict[str, Any]]] = {}
+    # Earnings-pulse orders live for minutes in extended hours: daily bars cannot score them (pulse.py).
+    rows = [o for o in rows if not str(o.get("plan") or "").startswith("pulse:")]
     for o in rows:
         issued = datetime.fromtimestamp(o["issued_ts"], NEW_YORK)
         until = date.fromisoformat(o["valid_until"])
