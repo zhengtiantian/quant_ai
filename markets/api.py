@@ -55,6 +55,19 @@ def _latest_briefs():
     return [out[k] for k in ("flash", "outlook", "asia_europe", "us") if k in out]
 
 
+@router.get("/portfolio/symbols")
+def portfolio_symbols():
+    """Just the tickers held (dust left out) and watched, for quant_data's news collectors: a stock
+    bought today gets its own company news from the next 30-minute run."""
+    try:
+        from . import advisor
+        st = portfolio.get_state(cached_quotes=True)
+        return {"status": "success", "held": [h["symbol"] for h in advisor.followed(st)],
+                "watchlist": [w["symbol"] for w in st.get("watchlist") or []]}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
 @router.get("/portfolio/chart")
 def portfolio_chart(symbol: str = "", range: str = "1d"):  # noqa: A002 - the page's parameter name
     try:

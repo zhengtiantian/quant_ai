@@ -10,6 +10,7 @@
 """
 
 import json
+import os
 import re
 import time
 from datetime import date, datetime, timedelta
@@ -130,13 +131,59 @@ def implied_move(symbol: str, on: date, price: Optional[float]) -> Optional[Dict
     return None
 
 
+# Nasdaq's calendar misses some listings: SK hynix's ADR (SKHY, listed 2026-07-10) never appears,
+# its results being announced in Seoul. Finnhub has them (under 000660.KS for SKHY), so a symbol
+# Nasdaq does not list in the window is looked up there, one call per symbol and day (2026-10-25).
+FINNHUB_EARNINGS_URL = "https://finnhub.io/api/v1/calendar/earnings?symbol={sym}&from={start}&to={end}&token={key}"
+FINNHUB_ENV = Path(os.getenv("FINNHUB_ENV", "/Users/xiz/Quant_trade/quant_data/collectors/news/finnhub/.env"))
+
+
+def _finnhub_key() -> Optional[str]:
+    if os.getenv("FINNHUB_API_KEY"):
+        return os.environ["FINNHUB_API_KEY"]
+    try:
+        for line in FINNHUB_ENV.read_text().splitlines():
+            k, _, v = line.strip().partition("=")
+            if k.strip() == "FINNHUB_API_KEY":
+                return v.strip().strip('"')
+    except OSError:
+        return None
+    return None
+
+
+def finnhub_earnings(symbol: str, start: date, end: date, path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    key = _finnhub_key()
+    if not key:
+        return []
+
+    def fetch():
+        d = pf._get_json(FINNHUB_EARNINGS_URL.format(sym=symbol, start=start.isoformat(), end=end.isoformat(), key=key))
+        out = []
+        for r in d.get("earningsCalendar") or []:
+            listed = str(r.get("symbol") or "")
+            when = {"amc": "after the close", "bmo": "before the open"}.get(r.get("hour") or "")
+            if not when:
+                # A Seoul announcement before the Korean open is the previous evening in New York.
+                when = "after the close (Seoul morning)" if listed.endswith(".KS") else "time not given"
+            out.append({"symbol": symbol, "listed_as": listed, "date": r.get("date"), "when": when,
+                        "eps_forecast": r.get("epsEstimate"), "revenue_forecast": r.get("revenueEstimate"),
+                        # per share of the listing Finnhub found: won for 000660.KS, not per ADR in dollars
+                        "forecast_currency": "KRW" if listed.endswith(".KS") else "USD",
+                        "fiscal_quarter": f"Q{r.get('quarter')} {r.get('year')}", "source": "finnhub"})
+        return out
+    return _cache(path, f"finnhub_earnings:{symbol}:{start.isoformat()}:{end.isoformat()}", fetch)
+
+
 def upcoming(symbols: List[str], days: int = 5, path: Optional[Path] = None,
-             prices: Optional[Dict[str, float]] = None, max_options: int = 8) -> Dict[str, Any]:
-    """Earnings of these symbols and the main economic releases over the next `days` trading days."""
-    today = datetime.now(NEW_YORK).date()
+             prices: Optional[Dict[str, float]] = None, max_options: int = 8,
+             start: Optional[date] = None) -> Dict[str, Any]:
+    """Earnings of these symbols and the main economic releases over `days` trading days from
+    `start` (today in New York by default)."""
+    today = start or datetime.now(NEW_YORK).date()
     wanted = set(symbols)
     earnings, econ, options_left = [], [], max_options
-    for d in trading_days(today, days):
+    window = trading_days(today, days)
+    for d in window:
         for e in earnings_on(d, path):
             if e["symbol"] in wanted:
                 item = {"date": d.isoformat(), **e,
@@ -152,6 +199,23 @@ def upcoming(symbols: List[str], days: int = 5, path: Optional[Path] = None,
         for r in econ_on(d, path):
             if r["country"] in ECON_COUNTRIES and r["event"] and ECON_KEYWORDS.search(r["event"]):
                 econ.append({"date": d.isoformat(), **r})
+    found = {e["symbol"] for e in earnings}
+    for sym in sorted(wanted - found):
+        try:
+            rows = finnhub_earnings(sym, window[0], window[-1], path) if window else []
+        except Exception:  # noqa: BLE001 - one missing date must not take the calendar down
+            rows = []
+        for e in rows:
+            item = {**e, "bellwether": BELLWETHERS.get(sym, (None, None))[1]}
+            price = (prices or {}).get(sym)
+            if price and options_left > 0 and e.get("date"):
+                options_left -= 1
+                try:
+                    item["implied"] = implied_move(sym, date.fromisoformat(e["date"]), price)
+                except Exception:  # noqa: BLE001
+                    item["implied"] = None
+            earnings.append(item)
+    earnings.sort(key=lambda e: e.get("date") or "")
     return {"from": today.isoformat(), "trading_days": days, "earnings": earnings, "economic": econ[:60]}
 
 

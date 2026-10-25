@@ -182,13 +182,18 @@ def impact(title: str) -> Optional[str]:
 
 
 def news(symbols: List[str], days: int = NEWS_DAYS, per_symbol: int = NEWS_PER_SYMBOL) -> Dict[str, List[Dict[str, Any]]]:
-    """Recent company-matched articles per symbol, newest first, one per headline. Intraday articles
-    arrive every 30 minutes; their sentiment / event labels only after the nightly enrichment."""
+    """Recent articles per symbol, newest first, one per headline. Read from the raw store, which the
+    collectors fill every 30 minutes, not only from the matched one, which the nightly company match
+    fills: a 14:00 headline must reach the 15-minute check the same afternoon. Sentiment and event
+    labels are added where the nightly enrichment has already run."""
     since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y%m%d")
-    rows = _db()["news_articles_company_matched_v2"].find(
-        {"symbol": {"$in": symbols}, "date": {"$gte": since}},
-        {"_id": 0, "symbol": 1, "date": 1, "title": 1, "source": 1, "url": 1, "llm_sentiment_final": 1, "llm_event_type_a": 1},
-    ).sort("date", -1).limit(60 * len(symbols))
+    q = {"symbol": {"$in": symbols}, "date": {"$gte": since}}
+    proj = {"_id": 0, "symbol": 1, "date": 1, "title": 1, "source": 1, "url": 1}
+    labelled = {d["url"]: d for d in _db()["news_articles_company_matched_v2"].find(
+        q, {**proj, "llm_sentiment_final": 1, "llm_event_type_a": 1}).sort("date", -1).limit(60 * len(symbols)) if d.get("url")}
+    raw = list(_db()["news_articles"].find(q, proj).sort("date", -1).limit(60 * len(symbols)))
+    rows = sorted([labelled.get(r.get("url"), r) for r in raw] + [d for u, d in labelled.items() if u not in {r.get("url") for r in raw}],
+                  key=lambda r: str(r.get("date") or ""), reverse=True)
     out: Dict[str, List[Dict[str, Any]]] = {s: [] for s in symbols}
     seen = set()
     for r in rows:
@@ -375,9 +380,9 @@ def check_triggers(path: Optional[Path] = None, now: Optional[float] = None,
                                          f"(order {o['id']}, valid until {o['valid_until']})", True)
         # 3. earnings: tomorrow (prepare) or just out (react)
         try:
-            cal = (earnings_fn or (lambda ss: events.upcoming(ss, days=2, path=path).get("earnings") or []))(syms)
-            for d in (_prev_trading_day(us_today),):
-                cal += [e for e in events.earnings_on(d, path) if e.get("symbol") in syms] if earnings_fn is None else []
+            # From the previous trading day: "just out" covers last night's after-the-close reports.
+            cal = (earnings_fn or (lambda ss: events.upcoming(ss, days=3, path=path, start=_prev_trading_day(us_today))
+                                   .get("earnings") or []))(syms)
         except Exception:  # noqa: BLE001
             cal = []
         sessions = {h["symbol"]: (h.get("quote") or {}).get("session") for h in held}
