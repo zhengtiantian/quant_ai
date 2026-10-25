@@ -39,19 +39,39 @@ class OrdersTest(unittest.TestCase):
     PRICES = {"INTC": 87.0, "AMZN": 248.0}
 
     def parse(self, lines):
-        return advisor.parse_orders("\n".join(lines), self.PRICES, date(2026, 10, 26))
+        return advisor.parse_orders("\n".join(lines), self.PRICES, date(2026, 10, 26), held={"INTC"})
 
-    def test_valid_orders_kept_bad_ones_dropped_with_reasons(self):
+    def test_new_buys_kept_in_whole_shares_holdings_and_bad_ones_dropped(self):
         orders, dropped = self.parse([
-            '{"symbol": "INTC", "side": "sell", "tag": "trim", "pct_of_position": 20, "limit": 92.5, "valid_until": "2026-10-29", "zh": "z", "en": "e"}',
+            '{"symbol": "INTC", "side": "sell", "tag": "trim", "pct_of_position": 20, "limit": 92.5, "valid_until": "2026-10-29"}',
             '{"symbol": "AMZN", "side": "buy", "tag": "new", "amount_usd": 500, "limit": 240, "valid_until": "2026-11-06"}',
             '{"symbol": "NVDA", "side": "buy", "limit": 180, "valid_until": "2026-10-30"}',          # not offered
-            '{"symbol": "INTC", "side": "sell", "limit": 140, "valid_until": "2026-10-30"}',         # 61% away
-            '{"symbol": "INTC", "side": "buy", "limit": 80, "valid_until": "2027-01-30"}',           # too long
+            '{"symbol": "AMZN", "side": "buy", "amount_usd": 900, "limit": 150, "valid_until": "2026-10-30"}',   # 40% away
+            '{"symbol": "AMZN", "side": "buy", "amount_usd": 900, "limit": 240, "valid_until": "2027-01-30"}',   # too long
+            '{"symbol": "AMZN", "side": "buy", "amount_usd": 100, "limit": 240, "valid_until": "2026-10-30"}',   # < 1 share
             'not json'])
-        self.assertEqual([(o["symbol"], o["side"], o["pct"], o["amount_usd"]) for o in orders],
-                         [("INTC", "sell", 20.0, None), ("AMZN", "buy", None, 500.0)])
-        self.assertEqual(len(dropped), 3)
+        self.assertEqual([(o["symbol"], o["side"], o["shares"], o["amount_usd"]) for o in orders], [("AMZN", "buy", 2, 480.0)])
+        self.assertEqual(len(dropped), 5)
+        self.assertIn("PLANS", dropped[0])
+
+    def test_plans_become_orders_only_when_eligible(self):
+        legs = [{"side": "sell", "shares": 14, "pct": 5.0, "after": None, "limit": 91.35, "below_cost": True},
+                {"side": "buy", "shares": 14, "pct": -5.0, "after": 0, "limit": 82.65, "below_cost": False}]
+        hist = {"n": 16, "mean_pct": 0.4, "win_rate": 0.6, "loss_rate": 0.3}
+        positions = [{"symbol": "INTC", "strategies": {"price": 87.0, "valid_until": "2026-11-13", "candidates": [
+            {"id": "hold", "legs": [], "eligible": True},
+            {"id": "t1", "label": "T", "legs": legs, "history": hist, "eligible": True},
+            {"id": "trim", "label": "Trim", "legs": legs[:1], "history": hist, "eligible": False, "why": "sells below cost"}]}},
+                     {"symbol": "TSM", "strategies": {"price": 418.0, "valid_until": "2026-11-13", "candidates": [
+                         {"id": "hold", "legs": [], "eligible": True}]}}]
+        orders, dropped = advisor.parse_plans("\n".join([
+            '{"symbol": "INTC", "plan": "trim"}', '{"symbol": "INTC", "plan": "t1", "zh": "z", "en": "e"}',
+            '{"symbol": "INTC", "plan": "hold"}', '{"symbol": "TSM", "plan": "hold"}', '{"symbol": "TSM", "plan": "t9"}']),
+            positions, date(2026, 10, 26))
+        self.assertEqual([(o["side"], o["shares"], o["limit_price"], o["tag"], o["parent"]) for o in orders],
+                         [("sell", 14, 91.35, "trim", None), ("buy", 14, 82.65, "rebuy", 0)])
+        self.assertEqual(orders[0]["valid_until"], "2026-11-13")
+        self.assertEqual(len(dropped), 3)           # ineligible, a second plan for INTC, unknown id
 
     def test_fills_and_edge(self):
         sell = {"side": "sell", "tag": "trim", "limit_price": 92.5}
@@ -93,6 +113,31 @@ class ScoringTest(unittest.TestCase):
         self.assertEqual(done[92.5], ("scored", 8.82))       # sold at 92.5, 85 at expiry
         self.assertEqual(done[70.0][0], "expired")
         self.assertEqual((card["fill_rate"], card["win_rate"]), (0.5, 1.0))
+
+    def test_buy_back_waits_for_its_sale_and_is_void_without_it(self):
+        issued = datetime(2026, 10, 26, 9, 0, tzinfo=NY).timestamp()
+        leg = lambda side, lim, parent: {"symbol": "INTC", "side": side, "tag": "rebuy" if parent is not None else "trim",
+                                         "pct": None, "shares": 14, "amount_usd": None, "limit_price": lim, "issued_price": 87.0,
+                                         "valid_until": "2026-10-30", "zh": "", "en": "", "plan": "t1", "parent": parent}
+        advisor.save_orders(1, [leg("sell", 92.5, None), leg("buy", 86.0, 0), leg("sell", 99.0, None), leg("buy", 80.0, 2)],
+                            issued, self.db)
+        self.assertEqual(sorted(o["status"] for o in advisor.active_orders(self.db)), ["open", "open", "waiting", "waiting"])
+        bars = [{"date": date(2026, 10, 26), "high": 90, "low": 85.5, "close": 89},      # 86 reached, but nothing sold yet
+                {"date": date(2026, 10, 27), "high": 93, "low": 88, "close": 91},        # sale at 92.5
+                {"date": date(2026, 10, 28), "high": 92, "low": 85, "close": 86},        # buy-back at 86
+                {"date": date(2026, 10, 29), "high": 88, "low": 84, "close": 87},
+                {"date": date(2026, 10, 30), "high": 88, "low": 84, "close": 87}]
+        fn = lambda s, a, b: bars
+        advisor.score_due(self.db, now=datetime(2026, 10, 27, 17, 0, tzinfo=NY).timestamp(), bars_fn=fn)
+        advisor.score_due(self.db, now=datetime(2026, 10, 28, 17, 0, tzinfo=NY).timestamp(), bars_fn=fn)
+        st = {o["limit_price"]: (o["status"], o["filled_date"]) for o in advisor.active_orders(self.db)}
+        self.assertEqual(st[92.5], ("filled", "2026-10-27"))
+        self.assertEqual(st[86.0], ("filled", "2026-10-28"))       # not the 26th: its sale had not filled
+        self.assertEqual(st[80.0][0], "waiting")
+        advisor.score_due(self.db, now=datetime(2026, 10, 30, 17, 0, tzinfo=NY).timestamp(), bars_fn=fn)
+        advisor.score_due(self.db, now=datetime(2026, 10, 30, 17, 0, tzinfo=NY).timestamp(), bars_fn=fn)
+        done = {o["limit_price"]: o["status"] for o in advisor.scorecard(self.db)["recent"]}
+        self.assertEqual(done, {92.5: "scored", 86.0: "scored", 99.0: "expired", 80.0: "void"})
 
 
 class TriggerTest(unittest.TestCase):

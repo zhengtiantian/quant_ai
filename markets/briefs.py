@@ -282,7 +282,7 @@ def snapshot(kind: str, path: Optional[Path] = None, context: Optional[Dict[str,
 
 # ---------------------------------------------------------------- the prompt
 
-SECTIONS = ("HEADLINE_ZH", "HEADLINE_EN", "BODY_ZH", "BODY_EN", "SOURCES", "PREDICTIONS", "ORDERS")
+SECTIONS = ("HEADLINE_ZH", "HEADLINE_EN", "BODY_ZH", "BODY_EN", "SOURCES", "PREDICTIONS", "PLANS", "ORDERS")
 
 PROMPT = """You are writing the user's {title} market brief for {session} (a personal note, not advice
 for anyone else). The user is in Dublin, holds the US stocks listed under my_portfolio and follows the
@@ -359,9 +359,10 @@ ADVISOR_SECTIONS = """  ## Bottom line            (the 2-3 actions that matter t
   ## Holding by holding     (for each position in snapshot.advisor.positions: where it stands (cost, break-even, % to get
                              back to cost, weight), what is driving it now (news, earnings, sector, with sources), the plan
                              as concrete orders (limit, size, validity) and what happens if the call is wrong)
-  ## Earnings plays         (for each holding reporting within the calendar: the implied move, the plan before and after,
-                             sized as a part of the position; say plainly that selling before a gap up means buying back
-                             higher or not at all)
+  ## Earnings plays         (for each holding reporting within the calendar: the implied move against its past reactions
+                             (strategies.past_earnings), what holding through its past reports returned, and which tested
+                             plan, if any, beat that; say plainly that selling before a gap up means buying back higher or
+                             not at all)
   ## New ideas              (0-3 names, normally from snapshot.advisor.buy_candidates, preferring ones that reduce the
                              concentration in chips and memory; entry limit and size from the cash, or the switch that pays)
   ## Risks and rules        (concentration, the Irish four-week rule where a loss sale and re-buy is advised, what would
@@ -383,12 +384,12 @@ FOCUS = {
     "advisor": "You are the user's personal trading adviser for the positions in snapshot.advisor.positions. The user's "
                "priority is profit: first getting the losing positions back to cost (INTC is the largest loss and weight), "
                "then growing. Give concrete, sized, priced actions rather than commentary, and only actions you would "
-               "defend: doing nothing is a valid answer. Lowering the cost basis by trimming into strength and re-buying "
-               "lower is welcome when the volatility supports it, always on part of the position. Use the computed "
-               "levels in each position (band from the options-implied move near earnings, else 2 x ATR; 20/60-day "
-               "support and resistance; break-even) for prices. snapshot.advisor.quant_model and buy_candidates come from "
-               "the platform's own ranking model; news_7d from its news store (search the web for anything newer and "
-               "for SK hynix / Seagate, which the store does not cover). Respect cash_usd.",
+               "defend: doing nothing is a valid answer. Trades on a holding are chosen from its strategies.candidates, "
+               "which the platform generated in whole shares and tested on that stock's own past; a trade idea that "
+               "did not beat holding there (including the user's own) is reported with its numbers, not recommended. "
+               "levels and price_stats give context (support, resistance, break-even). snapshot.advisor.quant_model and buy_candidates come from "
+               "the platform's own ranking model; news_7d from its news store (search the web for anything newer). "
+               "Respect cash_usd.",
 }
 ADVISOR_FOCUS_UPDATE = (" This is a focused update: snapshot.trigger says which holding and why it was written now. Put "
                         "that holding first and in depth, revise or cancel its open orders (listed in snapshot.trigger) "
@@ -403,7 +404,7 @@ def build_prompt(kind: str, session: str, snap: Dict[str, Any], topic: str = "")
     extra_rules, extra_blocks = "", ""
     if kind == "advisor":
         extra_rules = "\n" + advisor.ORDER_RULES.format(max_days=advisor.ORDER_MAX_DAYS) + "\n"
-        extra_blocks = "\n=====ORDERS=====\n(one JSON object per line, or nothing)"
+        extra_blocks = "\n=====PLANS=====\n(one JSON object per line, or nothing)\n=====ORDERS=====\n(one JSON object per line, or nothing)"
     return PROMPT.format(title=title, session=session, focus=focus, sections=sections, n_preds=n,
                          sections_note=f"in the Chinese version titled {zh}", extra_rules=extra_rules, extra_blocks=extra_blocks,
                          snapshot=json.dumps(snap, ensure_ascii=False, separators=(",", ":")))
@@ -419,7 +420,8 @@ def parse_reply(text: str) -> Dict[str, Any]:
                for m in re.finditer(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", blocks.get("SOURCES", ""))]
     return {"headline_zh": blocks["HEADLINE_ZH"].splitlines()[0].strip(), "headline_en": blocks["HEADLINE_EN"].splitlines()[0].strip(),
             "body_zh": blocks["BODY_ZH"], "body_en": blocks["BODY_EN"], "sources": sources,
-            "predictions_text": blocks.get("PREDICTIONS", ""), "orders_text": blocks.get("ORDERS", "")}
+            "predictions_text": blocks.get("PREDICTIONS", ""), "plans_text": blocks.get("PLANS", ""),
+            "orders_text": blocks.get("ORDERS", "")}
 
 
 # ---------------------------------------------------------------- the CLI
@@ -488,12 +490,16 @@ def generate(kind: str, session: Optional[str] = None, trigger: str = "schedule"
                                                  date.fromisoformat(session), issued_ts=started)
         if dropped:
             print(f"[briefs] {kind} {session} {topic}: dropped predictions: {dropped}")
-        orders_text = parsed.pop("orders_text")
+        orders_text, plans_text = parsed.pop("orders_text"), parsed.pop("plans_text")
         if kind == "advisor":
             adv = snap.get("advisor") or {}
-            prices = {p["symbol"]: p.get("price") for p in adv.get("positions") or []}
-            prices.update({c["symbol"]: c.get("price") for c in adv.get("buy_candidates") or [] if c.get("price")})
-            orders, dropped_orders = advisor.parse_orders(orders_text, prices, date.fromisoformat(session))
+            positions = adv.get("positions") or []
+            prices = {c["symbol"]: c.get("price") for c in adv.get("buy_candidates") or [] if c.get("price")}
+            # Plans first: their buy-backs point at their sales by position in this list.
+            orders, dropped_orders = advisor.parse_plans(plans_text, positions, date.fromisoformat(session))
+            buys, dropped_buys = advisor.parse_orders(orders_text, prices, date.fromisoformat(session),
+                                                      held={p["symbol"] for p in positions})
+            orders, dropped_orders = orders + buys, dropped_orders + dropped_buys
             if dropped_orders:
                 print(f"[briefs] advisor {session} {topic}: dropped orders: {dropped_orders}")
         models = list((out.get("modelUsage") or {}).keys())

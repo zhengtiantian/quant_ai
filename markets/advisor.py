@@ -18,6 +18,7 @@ This module is the code half; briefs.py runs Claude on what it builds.
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import statistics
@@ -29,7 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from . import events, predictions
+from . import events, predictions, strategy
 from . import portfolio as pf
 from .config import DB_PATH
 
@@ -54,6 +55,7 @@ ORDER_MAX_DEVIATION = 0.35     # a limit further than 35% from the price is not 
 SCORE_DELAY = 30 * 60          # after the close, before a day's bar is used
 SIDES = {"sell", "buy"}
 TAGS = {"trim", "rebuy", "add", "new", "stop", "exit"}
+LIVE = ("open", "filled", "waiting")   # waiting: a buy-back whose sale has not filled yet
 
 # Headlines that should make the advisor look again. Keyword rules first; a local model only if
 # these prove too coarse (PROJECT_PLAN Q.5). MAJOR ones are urgent.
@@ -76,7 +78,7 @@ CREATE TABLE IF NOT EXISTS advice_orders (
     pct REAL, shares REAL, amount_usd REAL, limit_price REAL NOT NULL,
     issued_ts REAL NOT NULL, issued_price REAL, valid_until TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'open', filled_date TEXT, eval_date TEXT, eval_close REAL, edge_pct REAL,
-    zh TEXT, en TEXT, note TEXT);
+    zh TEXT, en TEXT, note TEXT, parent_id INTEGER, plan TEXT);
 CREATE INDEX IF NOT EXISTS idx_advice_status ON advice_orders(status);
 CREATE TABLE IF NOT EXISTS advisor_triggers (key TEXT PRIMARY KEY, at REAL NOT NULL);
 """
@@ -89,6 +91,10 @@ def _conn(path: Optional[Path] = None) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path or DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    have = {r[1] for r in conn.execute("PRAGMA table_info(advice_orders)")}
+    for col in ("parent_id INTEGER", "plan TEXT"):          # added with the strategy engine, 2026-10-25
+        if col.split()[0] not in have:
+            conn.execute(f"ALTER TABLE advice_orders ADD COLUMN {col}")
     return conn
 
 
@@ -235,6 +241,23 @@ def quant_signals(held: List[str], n_candidates: int = 10) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------- the snapshot
 
+def reactions(symbol: str) -> List[Dict[str, Any]]:
+    """Past earnings reactions with their daily bars (quant_data research/features/earnings_reactions.py)."""
+    return list(_db()["earnings_reactions"].find({"symbol": symbol}, {"_id": 0, "computed_at": 0}).sort("report_time", 1))
+
+
+def strategies(symbol: str, holding: Dict[str, Any], price: float, stats: Dict[str, Any], earnings: Optional[Dict[str, Any]],
+               cash: float, path: Optional[Path] = None) -> Dict[str, Any]:
+    """The holding's candidate plans, each tested on its own history (strategy.py)."""
+    try:
+        past = reactions(symbol)
+    except Exception:  # noqa: BLE001 - quant_data down: plans are tested on the rolling windows only
+        past = []
+    candles = pf.get_chart(symbol, "1y", path).get("candles") or []
+    return strategy.evaluate_holding(symbol, holding["quantity"], price, holding.get("avg_cost"), cash, candles,
+                                     stats.get("atr14_pct"), earnings, past, _us_today())
+
+
 def followed(state: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [h for h in state.get("holdings") or [] if (h.get("market_value") or 0) >= DUST_VALUE]
 
@@ -269,6 +292,10 @@ def build(path: Optional[Path] = None, focus: Optional[str] = None) -> Dict[str,
             stats, gaps = {}, gaps + [f"{s} price history: {e}"]
         e = earnings.get(s)
         implied = ((e or {}).get("implied") or {}).get("implied_move_pct")
+        try:
+            strat = strategies(s, h, price, stats, e, pf.get_cash(path), path) if price and stats else None
+        except Exception as ex:  # noqa: BLE001
+            strat, gaps = None, gaps + [f"{s} strategies: {type(ex).__name__}: {ex}"]
         positions.append({
             "symbol": s, "name": q.get("name"), "quantity": round(h["quantity"], 6), "avg_cost": round(h["avg_cost"], 4),
             "price": price, "us_session": q.get("session"), "regular_close": q.get("regular_price") or q.get("prev_close"),
@@ -279,7 +306,7 @@ def build(path: Optional[Path] = None, focus: Optional[str] = None) -> Dict[str,
             "weight_pct": round(h["weight"], 1) if h.get("weight") is not None else None,
             "price_stats": stats, "earnings": e,
             "levels": levels(price, h.get("avg_cost"), stats, implied) if price and stats else None,
-            "news_7d": nw.get(s, []), "quant_model": sig.get("holdings", {}).get(s),
+            "news_7d": nw.get(s, []), "quant_model": sig.get("holdings", {}).get(s), "strategies": strat,
         })
     cand = sig.get("candidates") or []
     if cand:
@@ -437,20 +464,30 @@ def check_triggers(path: Optional[Path] = None, now: Optional[float] = None,
 
 # ---------------------------------------------------------------- orders
 
-ORDER_RULES = """Then the orders you recommend, each a JSON object on its own line (an empty block when the best
-advice is to do nothing):
-{{"symbol": "<a holding, or a buy candidate>", "side": "sell|buy", "tag": "trim|rebuy|add|new|stop|exit",
- "pct_of_position": <1-100 for sells and adds of a holding, else null>, "shares": <number or null>,
- "amount_usd": <for a new buy, the dollars to spend, else null>, "limit": <price>,
+ORDER_RULES = """Orders for the holdings come only from the plans the platform computed and tested: each position's
+strategies.candidates, in whole shares, each replayed on that stock's own past (around its past earnings
+when it reports within the horizon, else on rolling windows of the last year: "history", gain against
+holding in % of the position) and simulated for this time ("outlook": how likely each limit fills, and the
+regret rate, sold and never bought back below the sale). "hold" is the baseline; its history is what holding
+alone returned. Only candidates with "eligible": true may be chosen: they beat holding on the stock's own
+history and never sell below the average cost without a buy-back. Choose at most one plan per holding, or
+none, and say in the report why, quoting the history (n, mean, win rate) and the outlook fill rates; when
+no plan is eligible, say so and what the history shows, rather than inventing trades. Then the PLANS block,
+one JSON object per line (empty when every holding is best left alone):
+{{"symbol": "<a holding>", "plan": "<candidate id>", "zh": "<the plan and why, in Chinese>", "en": "<the same in English>"}}
+The platform turns a plan into its limit orders (buy-backs become active once their sale fills) valid
+until strategies.valid_until.
+
+New buys go in the ORDERS block, one JSON object per line, only for symbols that are not holdings:
+{{"symbol": "<a buy candidate>", "side": "buy", "tag": "new", "amount_usd": <dollars to spend>, "limit": <price>,
  "valid_until": "YYYY-MM-DD", "zh": "<the order and why, in Chinese>", "en": "<the same in English>"}}
-Use the limit prices in snapshot.advisor (levels, price_stats) or say in zh/en how you derived another one.
-Keep every limit within 35% of the current price and every order valid for at most {max_days} days. A limit
-order that would fill immediately (a sell below or a buy above the current price) is a market order: say so.
-A stop is a sell whose limit sits below the price. Cash is snapshot.advisor.cash_usd: a new buy larger than
-the cash must say what is sold to pay for it."""
+They are rounded down to whole shares; keep the limit within 35% of the price and the validity within
+{max_days} days. Cash is snapshot.advisor.cash_usd: a buy larger than the cash must name the plan that pays
+for it."""
 
 
-def parse_orders(text: str, prices: Dict[str, Optional[float]], session_date: date) -> Tuple[List[Dict[str, Any]], List[str]]:
+def parse_orders(text: str, prices: Dict[str, Optional[float]], session_date: date,
+                 held: Optional[set] = None) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Keep the orders that make sense; return (orders, reasons for each dropped one)."""
     orders, dropped = [], []
     for line in (text or "").splitlines():
@@ -469,7 +506,9 @@ def parse_orders(text: str, prices: Dict[str, Optional[float]], session_date: da
             continue
         price = prices.get(sym)
         why = None
-        if sym not in prices:
+        if sym in (held or ()):
+            why = "a holding: its orders come from the PLANS block"
+        elif sym not in prices:
             why = "not a holding or a buy candidate"
         elif side not in SIDES or tag not in TAGS:
             why = f"side/tag {side}/{tag}"
@@ -481,21 +520,77 @@ def parse_orders(text: str, prices: Dict[str, Optional[float]], session_date: da
             dropped.append(f"{sym}: {why}")
             continue
         num = lambda k: float(o[k]) if o.get(k) not in (None, "") else None
-        orders.append({"symbol": sym, "side": side, "tag": tag, "pct": num("pct_of_position"), "shares": num("shares"),
-                       "amount_usd": num("amount_usd"), "limit_price": round(limit, 4), "issued_price": price,
+        shares = math.floor(num("shares") or ((num("amount_usd") or 0) / limit))       # brokers fill whole shares
+        if shares < 1:
+            dropped.append(f"{sym}: less than one share at {limit}")
+            continue
+        orders.append({"symbol": sym, "side": side, "tag": tag, "pct": None, "shares": shares,
+                       "amount_usd": round(shares * limit, 2), "limit_price": round(limit, 4), "issued_price": price,
                        "valid_until": until.isoformat(), "zh": str(o.get("zh", ""))[:500], "en": str(o.get("en", ""))[:500]})
     return orders, dropped
 
 
+def parse_plans(text: str, positions: List[Dict[str, Any]], session_date: date) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """The chosen plans as orders: each leg one order, a buy-back pointing at its sale ("parent": index
+    in the returned list). Only eligible candidates of a holding are accepted, one plan per holding."""
+    by_sym = {p["symbol"]: p for p in positions}
+    orders, dropped, done = [], [], set()
+    for line in (text or "").splitlines():
+        line = line.strip().rstrip(",")
+        if not line.startswith("{"):
+            continue
+        try:
+            o = json.loads(line)
+            sym, pid = str(o.get("symbol", "")).upper().strip(), str(o.get("plan", "")).strip()
+        except (ValueError, TypeError) as e:
+            dropped.append(f"unreadable: {line[:80]} ({e})")
+            continue
+        st = (by_sym.get(sym) or {}).get("strategies") or {}
+        plan = next((c for c in st.get("candidates") or [] if c["id"] == pid), None)
+        if sym in done:
+            why = "a second plan for the same holding"
+        elif not plan:
+            why = f"no candidate {pid!r}"
+        elif not plan.get("eligible"):
+            why = f"{pid} is not eligible: {plan.get('why')}"
+        else:
+            why = None
+        if why:
+            dropped.append(f"{sym}: {why}")
+            continue
+        done.add(sym)
+        if not plan["legs"]:
+            continue
+        until = min(date.fromisoformat(st["valid_until"]), session_date + timedelta(days=ORDER_MAX_DAYS))
+        h = plan["history"]
+        note = (f"{pid}: {plan['label']}. History, {h['n']} windows: {h['mean_pct']:+.2f}% of the position against holding, "
+                f"beat it in {h['win_rate']:.0%}.")
+        base = len(orders)
+        for leg in plan["legs"]:
+            orders.append({"symbol": sym, "side": leg["side"], "tag": "rebuy" if leg["after"] is not None else
+                           ("trim" if leg["side"] == "sell" else "add"), "pct": None, "shares": leg["shares"],
+                           "amount_usd": round(leg["shares"] * leg["limit"], 2), "limit_price": leg["limit"],
+                           "issued_price": st.get("price"), "valid_until": until.isoformat(),
+                           "zh": str(o.get("zh", ""))[:500], "en": str(o.get("en", ""))[:500], "note": note,
+                           "plan": pid, "parent": base + leg["after"] if leg["after"] is not None else None})
+    return orders, dropped
+
+
 def save_orders(brief_id: int, orders: List[Dict[str, Any]], issued_ts: float, path: Optional[Path] = None) -> None:
+    """A buy-back is saved as 'waiting' with parent_id set to its sale's row."""
     conn = _conn(path)
     try:
-        conn.execute("DELETE FROM advice_orders WHERE brief_id = ? AND status = 'open'", (brief_id,))
-        conn.executemany(
-            "INSERT INTO advice_orders(brief_id, symbol, side, tag, pct, shares, amount_usd, limit_price, issued_ts, issued_price, "
-            "valid_until, zh, en) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [(brief_id, o["symbol"], o["side"], o["tag"], o["pct"], o["shares"], o["amount_usd"], o["limit_price"], issued_ts,
-              o["issued_price"], o["valid_until"], o["zh"], o["en"]) for o in orders])
+        conn.execute("DELETE FROM advice_orders WHERE brief_id = ? AND status IN ('open', 'waiting')", (brief_id,))
+        ids: List[int] = []
+        for o in orders:
+            parent = ids[o["parent"]] if o.get("parent") is not None else None
+            cur = conn.execute(
+                "INSERT INTO advice_orders(brief_id, symbol, side, tag, pct, shares, amount_usd, limit_price, issued_ts, "
+                "issued_price, valid_until, zh, en, note, parent_id, plan, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (brief_id, o["symbol"], o["side"], o["tag"], o["pct"], o["shares"], o["amount_usd"], o["limit_price"], issued_ts,
+                 o["issued_price"], o["valid_until"], o["zh"], o["en"], o.get("note"), parent, o.get("plan"),
+                 "waiting" if parent else "open"))
+            ids.append(cur.lastrowid)
         conn.commit()
     finally:
         conn.close()
@@ -528,7 +623,7 @@ def score_due(path: Optional[Path] = None, now: Optional[float] = None, bars_fn=
     now = now or time.time()
     conn = _conn(path)
     try:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM advice_orders WHERE status IN ('open', 'filled')")]
+        rows = [dict(r) for r in conn.execute("SELECT * FROM advice_orders WHERE status IN (?, ?, ?) ORDER BY id", LIVE)]
     finally:
         conn.close()
     changed = 0
@@ -537,9 +632,35 @@ def score_due(path: Optional[Path] = None, now: Optional[float] = None, bars_fn=
         issued = datetime.fromtimestamp(o["issued_ts"], NEW_YORK)
         until = date.fromisoformat(o["valid_until"])
         first = issued.date() if issued.time() < dtime(16, 0) else issued.date() + timedelta(days=1)
+        if o.get("parent_id"):
+            # A buy-back counts from the session after its sale filled; if the sale never fills, it is void.
+            conn = _conn(path)
+            try:
+                parent = conn.execute("SELECT status, filled_date FROM advice_orders WHERE id = ?", (o["parent_id"],)).fetchone()
+                if o["status"] == "waiting":
+                    new = "open" if parent and parent["filled_date"] else "void" if not parent or parent["status"] not in LIVE else None
+                    if new:
+                        conn.execute("UPDATE advice_orders SET status = ? WHERE id = ?", (new, o["id"]))
+                        conn.commit()
+                        changed += 1
+                        o["status"] = new
+            finally:
+                conn.close()
+            if o["status"] in ("waiting", "void"):
+                continue
+            first = max(first, date.fromisoformat(parent["filled_date"]) + timedelta(days=1))
         last_usable = _us_today(datetime.fromtimestamp(now - SCORE_DELAY, NEW_YORK))
         if datetime.fromtimestamp(now - SCORE_DELAY, NEW_YORK).time() < dtime(16, 0):
             last_usable -= timedelta(days=1)
+        if first > until and last_usable >= until:
+            conn = _conn(path)                     # a buy-back whose sale filled on the last valid day
+            try:
+                conn.execute("UPDATE advice_orders SET status = 'expired' WHERE id = ?", (o["id"],))
+                conn.commit()
+            finally:
+                conn.close()
+            changed += 1
+            continue
         if last_usable < first:
             continue
         key = o["symbol"]
@@ -583,11 +704,11 @@ def orders_for_brief(brief_id: int, path: Optional[Path] = None) -> List[Dict[st
 
 
 def active_orders(path: Optional[Path] = None) -> List[Dict[str, Any]]:
-    """Open orders and filled ones still inside their validity, newest first."""
+    """Open, waiting and filled orders still inside their validity, newest first."""
     conn = _conn(path)
     try:
         return [dict(r) for r in conn.execute(
-            "SELECT * FROM advice_orders WHERE status IN ('open', 'filled') ORDER BY issued_ts DESC")]
+            "SELECT * FROM advice_orders WHERE status IN (?, ?, ?) ORDER BY issued_ts DESC, id", LIVE)]
     finally:
         conn.close()
 
