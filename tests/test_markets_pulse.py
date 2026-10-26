@@ -140,6 +140,35 @@ class WatchTest(unittest.TestCase):
                {"symbol": "INTC", "date": "2026-10-29", "when": "after the close"}]
         self.assertEqual([e["symbol"] for e in pulse.reporting_premarket(held, DAY, cal_fn=lambda s: cal)], ["TSM"])
 
+    def test_shadow_is_kept_scored_and_never_announced(self):
+        class TwoModels(FakeModel):
+            def __call__(self, req):
+                ans = super().__call__(req)
+                # the shadow acts one placement later than the champion, with +2/4% steps
+                sh_act = req["place"] == "r+5"
+                ans["model"] = "catboost"
+                ans["shadow"] = {"model": "lgbm_seeds", "role": "shadow", "act": sh_act, "stock_record": {},
+                                 "best": {"plan": "r+5 | 2/4 | lim2", "ladder": [2, 4], "weights": [0.5, 0.5], "buyback": "lim2", "pred_pct": 0.9}}
+                return ans
+        w = pulse.Watch("INTC", 98.9, 106.74, 100.0, DAY, {}, predict=TwoModels(act_above=9.5))
+        o = run(w, WatchTest.evening(self, None))
+        self.assertEqual((o["plan"], o["model"]), ("r+3 | 1/2/3 | lim2", "catboost"))       # the champion at r+3
+        self.assertEqual(w.shadow_orders["plan"], "r+5 | 2/4 | lim2")                       # asked on after it acted
+        self.assertEqual([c["place"] for c in w.predict.calls], ["r+1", "r+3", "r+5"])        # and then stopped
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "a.db"
+            pulse.save(o, DAY, db)
+            pulse.save(w.shadow_orders, DAY, db, shadow=True)
+            live = advisor.active_orders(db)
+            self.assertTrue(all(r["plan"].startswith("pulse:") for r in live))                # the shadow is not an order to place
+            bars = [{"t": datetime(2026, 10, 29, 16, 7, tzinfo=NY), "o": 110.5, "h": 112.5, "l": 110.4, "c": 112.0},
+                    {"t": datetime(2026, 10, 29, 16, 40, tzinfo=NY), "o": 109.0, "h": 109.2, "l": 108.0, "c": 108.5},
+                    {"t": datetime(2026, 10, 30, 9, 30, tzinfo=NY), "o": 107.0, "h": 107.5, "l": 106.5, "c": 107.0}]
+            pulse.score_due(db, now=datetime(2026, 10, 30, 11, 0, tzinfo=NY), bars_fn=lambda *a: bars)
+            card = pulse.scorecard(db)
+            self.assertEqual((card["champion"]["evenings"], card["shadow"]["evenings"]), (1, 1))
+            self.assertFalse(any(r["plan"].startswith("shadow:") for r in advisor.scorecard(db)["recent"]))
+
     def test_reporting_today_only_after_the_close(self):
         held = [{"symbol": "INTC"}, {"symbol": "TSM"}, {"symbol": "SKHY"}]
         cal = [{"symbol": "INTC", "date": "2026-10-29", "when": "after the close"},

@@ -718,7 +718,9 @@ def active_orders(path: Optional[Path] = None) -> List[Dict[str, Any]]:
 def scorecard(path: Optional[Path] = None) -> Dict[str, Any]:
     conn = _conn(path)
     try:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM advice_orders ORDER BY issued_ts DESC")]
+        # the earnings-pulse shadow model's orders are scored apart (pulse.scorecard)
+        rows = [dict(r) for r in conn.execute("SELECT * FROM advice_orders WHERE plan IS NULL OR plan NOT LIKE 'shadow:%' "
+                                              "ORDER BY issued_ts DESC")]
     finally:
         conn.close()
     scored = [r for r in rows if r["status"] == "scored"]

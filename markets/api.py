@@ -158,6 +158,16 @@ def briefs_run(payload: Dict[str, Any]):
         return _error(e, 400)
 
 
+@router.get("/pulse/scorecard")
+def pulse_scorecard():
+    """Earnings pulse: the live champion against its shadow, evening by evening (Q.5 / Q.6)."""
+    from . import pulse
+    try:
+        return {"status": "success", **pulse.scorecard()}
+    except Exception as e:  # noqa: BLE001
+        return _error(e)
+
+
 @router.get("/advisor")
 def advisor_state(limit: int = 30):
     """My Holdings' advisor panel: the reports (urgent ones flagged), the orders still in play, the
