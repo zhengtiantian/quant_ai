@@ -74,7 +74,7 @@ class WindowsTest(unittest.TestCase):
 
 class EligibleTest(unittest.TestCase):
     def plan(self, legs, **h):
-        return {"legs": legs, "history": {"n": 16, "mean_pct": 0.3, "win_rate": 0.6, "loss_rate": 0.3, **h}}
+        return {"legs": legs, "history": {"n": 16, "n_eff": 16, "t": 2.5, "mean_pct": 0.3, "win_rate": 0.6, "loss_rate": 0.3, **h}}
 
     def test_profit_first(self):
         below = [{**T1[0], "below_cost": True}, {**T1[1], "below_cost": False}]
@@ -84,6 +84,7 @@ class EligibleTest(unittest.TestCase):
         self.assertFalse(stg.eligible(self.plan(below, n=5))[0])                   # too few windows
         self.assertFalse(stg.eligible(self.plan(below, win_rate=0.2, loss_rate=0.7))[0])
         self.assertTrue(stg.eligible({"legs": [], "history": {}})[0])               # hold is always allowed
+        self.assertFalse(stg.eligible(self.plan(below, t=1.0, n=47, n_eff=15.7))[0])  # TSM's ladder: +0.36%, t 1.0
 
 
 class EvaluateTest(unittest.TestCase):

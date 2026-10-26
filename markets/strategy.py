@@ -45,6 +45,11 @@ HOLD_AFTER = 10             # sessions after the reaction day a buy-back may sti
 WINDOW = 15                 # sessions per non-earnings replay window
 MIN_REPLAYS = 8             # fewer past windows than this: not enough to call an edge
 MIN_EDGE_PCT = 0.05         # mean gain against holding, % of the position, for a plan to be offered
+# The edge must also be significant (2026-10-26): TSM's two-step ladder was offered report after
+# report on +0.36% over 47 windows that overlap three times over (15 sessions every 5), about 16
+# independent ones, t well under 2. The daily policies of Q.7 (48,645 decision points) found no
+# edge over holding out of sample either. A plan now needs t >= MIN_T on the effective sample.
+MIN_T = 2.0
 PATHS = 3000
 SEED = 7
 
@@ -119,13 +124,19 @@ def _pctile(xs: List[float], q: float) -> float:
     return xs[min(len(xs) - 1, max(0, int(round(q * (len(xs) - 1)))))]
 
 
-def _summary(gains: List[float], fill_counts: List[int], regrets: int, value: float) -> Dict[str, Any]:
+def _summary(gains: List[float], fill_counts: List[int], regrets: int, value: float, overlap: float = 1.0) -> Dict[str, Any]:
     """Gains are in $ per $ of entry price; value is the position in shares: the result is in % of
-    the position's value. Win / loss = beat / trailed holding by more than 0.05%."""
+    the position's value. Win / loss = beat / trailed holding by more than 0.05%. overlap: how many
+    windows share each session (rolling windows of 15 every 5: 3), so the effective sample is n /
+    overlap and t = mean / (sd / sqrt(n_eff))."""
     if not gains:
         return {"n": 0}
     pct = [g / value * 100 for g in gains]
-    return {"n": len(pct), "mean_pct": round(statistics.mean(pct), 2), "median_pct": round(statistics.median(pct), 2),
+    sd = statistics.stdev(pct) if len(pct) > 1 else 0.0
+    n_eff = len(pct) / max(overlap, 1.0)
+    t = statistics.mean(pct) / (sd / math.sqrt(n_eff)) if sd > 0 and n_eff > 0 else 0.0
+    return {"n": len(pct), "n_eff": round(n_eff, 1), "sd_pct": round(sd, 2), "t": round(t, 2),
+            "mean_pct": round(statistics.mean(pct), 2), "median_pct": round(statistics.median(pct), 2),
             "win_rate": round(sum(p > 0.05 for p in pct) / len(pct), 2), "loss_rate": round(sum(p < -0.05 for p in pct) / len(pct), 2),
             "p10_pct": round(_pctile(pct, 0.1), 2), "p90_pct": round(_pctile(pct, 0.9), 2),
             "worst_pct": round(min(pct), 2), "best_pct": round(max(pct), 2),
@@ -146,7 +157,7 @@ def _scaled(legs: List[Dict[str, Any]], k: float) -> List[Dict[str, Any]]:
 
 
 def history_test(plan: Dict[str, Any], position: float, windows: List[Tuple[float, List[Dict[str, float]]]],
-                 scale: float = 1.0) -> Dict[str, Any]:
+                 scale: float = 1.0, overlap: float = 1.0) -> Dict[str, Any]:
     """scale converts today's limits to the past: a limit at +0.5 of today's move scale is replayed at
     +0.5 of the past typical move (SK hynix: ADR implied 9.3% today, the Seoul listing's typical 2.5%)."""
     if not plan["legs"]:
@@ -159,7 +170,7 @@ def history_test(plan: Dict[str, Any], position: float, windows: List[Tuple[floa
         regrets += r["regret"]
         for li in r["fills"]:
             counts[li] += 1
-    return _summary(gains, counts, regrets, position)
+    return _summary(gains, counts, regrets, position, overlap)
 
 
 # ---------------------------------------------------------------- the simulated outlook
@@ -249,7 +260,11 @@ def eligible(plan: Dict[str, Any]) -> Tuple[bool, str]:
         return False, f"trailed or matched holding ({h['mean_pct']:+.2f}% of the position on average)"
     if h["win_rate"] < h["loss_rate"]:
         return False, f"beat holding in {h['win_rate']:.0%} of windows, trailed in {h['loss_rate']:.0%}"
-    return True, f"beat holding by {h['mean_pct']:+.2f}% on average, in {h['win_rate']:.0%} of {h['n']} windows"
+    if h.get("t", 0.0) < MIN_T:
+        return False, (f"edge not significant: {h['mean_pct']:+.2f}% with t {h.get('t', 0):.1f} on about "
+                       f"{h.get('n_eff', h['n']):.0f} independent windows (needs t >= {MIN_T:g})")
+    return True, (f"beat holding by {h['mean_pct']:+.2f}% on average, in {h['win_rate']:.0%} of {h['n']} windows "
+                  f"(t {h['t']:.1f} on about {h['n_eff']:.0f} independent)")
 
 
 def _add_sessions(d: date, n: int) -> date:
@@ -278,18 +293,20 @@ def evaluate_holding(symbol: str, position: float, price: float, avg_cost: Optio
         m = implied or (statistics.median(hist_moves) if hist_moves else 2 * (atr_pct or 2))
         basis = "implied move" if implied else "median past earnings move"
         windows = earnings_windows(reactions, lead=reaction_session + 1)
+        overlap = 1.0                                     # one window per past report: independent
         sessions = reaction_session + 1 + HOLD_AFTER
         if hist_moves and m:
             scale = statistics.median(hist_moves) / m
     else:
         m, basis = 2 * (atr_pct or 2), "2 x ATR(14)"
         windows = rolling_windows(candles_1y)
+        overlap = WINDOW / 5                              # 15-session windows every 5 sessions
         sessions = WINDOW
     vol = daily_vol_pct(candles_1y)
     jumps = scaled_jumps(reactions, implied) if reaction_session is not None else []
     plans = []
     for c in candidates(position, price, avg_cost, m, cash):
-        hist = history_test(c, position, windows, scale)
+        hist = history_test(c, position, windows, scale, overlap)
         sim = simulate(c, position, price, vol, sessions, reaction_session, jumps)
         legs = [{**leg, "limit": round(price * (1 + leg["pct"] / 100), 2)} for leg in c["legs"]]
         for leg in legs:
