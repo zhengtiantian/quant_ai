@@ -350,6 +350,14 @@ class PortfolioTest(unittest.TestCase):
                 self.assertEqual(REAL_FETCH_QUOTE("INTC", "stocks")["prev_close"], want)
                 self.assertEqual(REAL_FETCH_QUOTE("INTC", "stocks", known_prev_close=92.96)["prev_close"], want)
 
+    def test_premarket_baseline_ignores_a_stale_secondary_close(self):
+        # GOOGL 2026-10-26 pre-market: the same primary pair, secondaryData alternating between replicas
+        for secondary in ({"lastSalePrice": "$320.21", "netChange": "-4.01"}, {"lastSalePrice": "$322.35", "netChange": "+2.14"}):
+            with self.subTest(secondary["lastSalePrice"]):
+                self.assertEqual(pf._prev_close_from_info("pre", {"lastSalePrice": "$321.9999", "netChange": "+1.7899"}, secondary), 320.21)
+        self.assertEqual(pf._prev_close_from_info("pre", {"lastSalePrice": "$321.99", "netChange": "N/A"},
+                                                  {"lastSalePrice": "$320.21"}), 320.21)   # no change in the reply: the fallback
+
     def test_previous_close_read_while_closed_is_not_reused(self):
         with mock.patch.object(pf, "_nasdaq", side_effect=self._nasdaq_replies("Closed")):
             q = REAL_FETCH_QUOTE("INTC", "stocks")

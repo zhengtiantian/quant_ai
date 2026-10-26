@@ -527,6 +527,14 @@ class StaleQuote(ValueError):
 # only the fallback (closed market, or a reply without these fields).
 def _prev_close_from_info(session: str, primary: Dict[str, Any], secondary: Dict[str, Any]) -> Optional[float]:
     if session == "pre":
+        # Pre-market primaryData is this morning's price and its change against the last close, a
+        # consistent pair. secondaryData's "last close" is not: GOOGL on 2026-10-26 alternated
+        # between $320.21 (-4.01, the 10-23 close) and $322.35 (+2.14, a stale replica) from one
+        # reply to the next, both labelled "Closed at Oct 23 4:00 PM", so the day change flipped
+        # between +0.6% and -0.0%. It is only the fallback.
+        last, change = _money(primary.get("lastSalePrice")), _money(primary.get("netChange"))
+        if last is not None and change is not None:
+            return round(last - change, 4)
         return _money(secondary.get("lastSalePrice"))
     src = primary if session == "regular" else secondary if session == "post" else None
     if not src:
