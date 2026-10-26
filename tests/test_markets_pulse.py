@@ -112,6 +112,34 @@ class WatchTest(unittest.TestCase):
             self.assertEqual(card[("sell", 113.3)]["status"], "expired")
             self.assertEqual(card[("buy", 111.03)]["status"], "void")
 
+    def test_premarket_watch_uses_the_previous_close_and_this_mornings_open(self):
+        m = FakeModel(act_above=6.0)
+        w = pulse.Watch("TSM", 6.75, 444.27, 400.0, DAY, {}, predict=m, session="bmo")   # yesterday's close 400
+        pts = [(at(4, 0), 400.5), (at(6, 30), 401.0), (at(7, 1), 420.0), (at(7, 2), 424.0), (at(7, 4), 426.0), (at(7, 6), 425.0)]
+        o = run(w, pts)
+        self.assertEqual((w.close, w.release), (400.0, at(7, 1)))              # 04:00-06:30 drift is not the release
+        self.assertEqual(m.calls[0]["bmo"], 1.0)
+        self.assertEqual(o["plan"], "r+1 | 1/2/3 | lim2")                     # +6% at 07:02
+        self.assertEqual(o["session"], "bmo")
+        bars = [{"t": datetime(2026, 10, 29, 7, 3, tzinfo=NY), "o": 424, "h": 428.6, "l": 423, "c": 428},
+                {"t": datetime(2026, 10, 29, 8, 0, tzinfo=NY), "o": 427, "h": 427.5, "l": 418, "c": 419},
+                {"t": datetime(2026, 10, 29, 9, 30, tzinfo=NY), "o": 417, "h": 418, "l": 415, "c": 416}]
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "a.db"
+            pulse.save(o, DAY, db)
+            self.assertTrue(all(r["valid_until"] == "2026-10-29" for r in advisor.active_orders(db)))  # this morning only
+            self.assertEqual(pulse.score_due(db, now=datetime(2026, 10, 29, 11, 0, tzinfo=NY), bars_fn=lambda *a: bars), 1)
+            card = {(r["side"], r["limit_price"]): r for r in advisor.scorecard(db)["recent"]}
+            sold = card[("sell", round(424 * 1.01, 2))]
+            self.assertEqual(sold["status"], "scored")                          # sold 428.24 at 07:03, back at 419.68 08:00
+            self.assertEqual(sold["eval_date"][:16], "2026-10-29T08:00")
+
+    def test_premarket_only_before_the_open(self):
+        held = [{"symbol": "TSM"}, {"symbol": "INTC"}]
+        cal = [{"symbol": "TSM", "date": "2026-10-29", "when": "before the open"},
+               {"symbol": "INTC", "date": "2026-10-29", "when": "after the close"}]
+        self.assertEqual([e["symbol"] for e in pulse.reporting_premarket(held, DAY, cal_fn=lambda s: cal)], ["TSM"])
+
     def test_reporting_today_only_after_the_close(self):
         held = [{"symbol": "INTC"}, {"symbol": "TSM"}, {"symbol": "SKHY"}]
         cal = [{"symbol": "INTC", "date": "2026-10-29", "when": "after the close"},

@@ -43,12 +43,15 @@ POLL = 5
 RELEASE_MOVE = 0.5                     # % from the close that marks the release minute (as in training)
 AFTER_RELEASE = (1, 3, 5, 10, 20, 30)
 DEFAULT_CALL = (17, 0)
+DEFAULT_CALL_BMO = (8, 30)             # a before-the-open report's call
+BMO_WINDOW = ((4, 0), (9, 35))         # pre-market watch, ET, on the reaction day
 FRACTION = float(os.getenv("PULSE_FRACTION", "0.3"))     # of the whole shares, over the three steps
 WINDOW_END = (18, 0)
 LOG_DIR = Path(os.getenv("PULSE_LOG_DIR", str(Path(DB_PATH).parent / "pulse")))
 BUYBACK_TEXT = {"c+5": "5 minutes into the call", "c+30": "30 minutes into the call", "ah_end": "at 19:55 ET, before after-hours ends",
                 "next_open": "at the next regular open, 09:30 ET"}
-_state = {"day": None, "thread": None}
+BUYBACK_TEXT_BMO = {"ah_end": "at 09:25 ET, before the pre-market ends", "next_open": "at the regular open, 09:30 ET"}
+_state: Dict[Any, Any] = {"thread": None}
 
 
 def _predict(req: Dict[str, Any]) -> Dict[str, Any]:
@@ -56,6 +59,14 @@ def _predict(req: Dict[str, Any]) -> Dict[str, Any]:
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip()[-300:])
     return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def reporting_premarket(held: List[Dict[str, Any]], today: date, cal_fn=None) -> List[Dict[str, Any]]:
+    """Holdings that report before today's open: their pulse trades in this morning's pre-market."""
+    syms = [h["symbol"] for h in held]
+    cal = (cal_fn or (lambda ss: events.upcoming(ss, days=1, start=today).get("earnings") or []))(syms)
+    return [e for e in cal if e.get("symbol") in syms and str(e.get("date"))[:10] == today.isoformat()
+            and "before" in str(e.get("when") or "").lower()]
 
 
 def reporting_today(held: List[Dict[str, Any]], today: date, cal_fn=None) -> List[Dict[str, Any]]:
@@ -94,15 +105,22 @@ class Watch:
 
     def __init__(self, symbol: str, quantity: float, avg_cost: Optional[float], close: float, day: date,
                  context: Dict[str, Any], predict: Callable[[Dict[str, Any]], Dict[str, Any]] = _predict,
-                 call: tuple = DEFAULT_CALL):
+                 call: Optional[tuple] = None, session: str = "amc"):
+        """session "amc": the report day's evening, close = that day's 16:00 close. "bmo": the reaction
+        day's pre-market (04:00 on), close = the previous session's close, given."""
         self.symbol, self.quantity, self.avg_cost, self.close, self.day = symbol, quantity, avg_cost, close, day
-        self.context, self.predict = context, predict
+        self.context, self.predict, self.session = context, predict, session
+        call = call or (DEFAULT_CALL if session == "amc" else DEFAULT_CALL_BMO)
         self.ticks: List[tuple] = []
         self.release: Optional[datetime] = None
         self.done: set = set()
         self.decisions: List[Dict[str, Any]] = []
         self.orders: Optional[Dict[str, Any]] = None
         self.call = datetime(day.year, day.month, day.day, *call, tzinfo=NY)
+
+    def start(self) -> datetime:
+        """When the extended session the pulse trades in begins: the close, or 04:00 pre-market."""
+        return self._at(16, 0) if self.session == "amc" else self._at(4, 0)
 
     def _at(self, h: int, m: int) -> datetime:
         return datetime(self.day.year, self.day.month, self.day.day, h, m, tzinfo=NY)
@@ -118,10 +136,10 @@ class Watch:
         if regular_close:
             self.close = regular_close                 # the official 16:00 close once the quote has it
         if price:
-            if now < self._at(16, 0):
+            if self.session == "amc" and now < self._at(16, 0):
                 self.close = price                     # until the bell, the close is the last price
             self.ticks.append((now, price))
-            if self.release is None and now >= self._at(16, 0) and abs(price / self.close - 1) * 100 >= RELEASE_MOVE:
+            if self.release is None and now >= self.start() and abs(price / self.close - 1) * 100 >= RELEASE_MOVE:
                 self.release = now.replace(second=0, microsecond=0)
         if self.orders:
             return None
@@ -131,12 +149,13 @@ class Watch:
             self.done.add(name)
             if name != "pre" and name != "c-5" and self.release is None:
                 continue
-            after = [p for t, p in self.ticks if t >= self._at(16, 0)] or [self.close]
+            after = [p for t, p in self.ticks if t >= self.start()] or [self.close]
             last = self.ticks[-1][1] if self.ticks else self.close
             req = {"symbol": self.symbol, "place": name, "move_at": (last / self.close - 1) * 100,
                    "maxmove_at": (max(after) / self.close - 1) * 100 if name != "pre" else 0.0,
                    "minmove_at": (min(after) / self.close - 1) * 100 if name != "pre" else 0.0,
                    "release_min": self.release.hour * 60 + self.release.minute if self.release and name != "pre" else None,
+                   "bmo": 1.0 if self.session == "bmo" else 0.0,
                    **{k: self.context.get(k) for k in ("run5", "run20", "vol20", "past_move_med", "news_pre_mean")}}
             try:
                 ans = self.predict(req)
@@ -161,17 +180,20 @@ class Watch:
         else:
             rebuy = [{"shares": s["shares"], "limit": s["limit"], "after_sale": i} for i, s in enumerate(sells)]
             when = self.call + timedelta(minutes=5 if bb == "c+5" else 30) if bb.startswith("c+") else None
-            how = f"buy back what filled {BUYBACK_TEXT[bb]}" + (f" ({when:%H:%M} ET, {when.astimezone(DUBLIN):%H:%M} Dublin)" if when else "") + \
+            text = BUYBACK_TEXT_BMO.get(bb, BUYBACK_TEXT[bb]) if self.session == "bmo" else BUYBACK_TEXT[bb]
+            how = f"buy back what filled {text}" + (f" ({when:%H:%M} ET, {when.astimezone(DUBLIN):%H:%M} Dublin)" if when else "") + \
                   ", at market"
         rec = ans.get("stock_record") or {}
         return {"symbol": self.symbol, "at": now.isoformat(), "price": p0, "plan": best["plan"], "pred_pct": best["pred_pct"],
-                "sells": sells, "rebuys": rebuy, "buyback": bb, "how": how, "record": rec, "model_record": ans.get("model_record")}
+                "sells": sells, "rebuys": rebuy, "buyback": bb, "how": how, "record": rec, "model_record": ans.get("model_record"),
+                "session": self.session}
 
 
 # ---------------------------------------------------------------- orders, notification, log
 
 def save(orders: Dict[str, Any], day: date, path: Optional[Path] = None) -> None:
-    until = events_next_session(day).isoformat()
+    # The buy-backs of an evening run to the next open; a pre-market's to this morning's open.
+    until = (day if orders.get("session") == "bmo" else events_next_session(day)).isoformat()
     rec = orders["record"]
     note = (f"pulse: {orders['plan']}; predicted {orders['pred_pct']:+.2f}% of the price on the ladder; {orders['symbol']} "
             f"out of sample: {rec.get('acted')} of {rec.get('reports')} reports acted, {rec.get('mean_when_acting', 0):+.2f}%, "
@@ -254,7 +276,9 @@ def replay_leg(sell_limit: float, p0: float, issued: datetime, buyback: str, bar
         return {"filled": False}
     sell = max(sell_limit, sale["o"])
     later = [b for b in after if b["t"] > sale["t"]]
-    nxt_open = next((b for b in later if b["t"].date() > issued.date() and b["t"].hour * 60 + b["t"].minute >= 570), None)
+    bmo = issued.hour < 12                       # orders given in the pre-market: the open is this morning's
+    nxt_open = next((b for b in later if 570 <= b["t"].hour * 60 + b["t"].minute < 960
+                     and (bmo or b["t"].date() > issued.date())), None)
     buy_bar = None
     if buyback.startswith("lim"):
         back = sell * (1 - int(buyback[3:]) / 100)
@@ -262,7 +286,7 @@ def replay_leg(sell_limit: float, p0: float, issued: datetime, buyback: str, bar
         buy = min(back, buy_bar["o"]) if buy_bar else None
     else:
         when = {"c+5": call + timedelta(minutes=5), "c+30": call + timedelta(minutes=30),
-                "ah_end": issued.replace(hour=19, minute=55, second=0, microsecond=0)}.get(buyback)
+                "ah_end": issued.replace(hour=9 if bmo else 19, minute=25 if bmo else 55, second=0, microsecond=0)}.get(buyback)
         buy_bar = next((b for b in later if when and b["t"] >= when and (nxt_open is None or b["t"] < nxt_open["t"])), None)
         buy = buy_bar["o"] if buy_bar else None
     if buy is None:
@@ -297,7 +321,8 @@ def score_due(path: Optional[Path] = None, now: Optional[datetime] = None, bars_
             print(f"[pulse] scoring bars for {s['symbol']} failed: {type(e).__name__}: {e}")
             continue
         buyback = s["plan"].split("|")[-1].strip()
-        call = issued.replace(hour=DEFAULT_CALL[0], minute=DEFAULT_CALL[1], second=0, microsecond=0)
+        hh, mm = DEFAULT_CALL_BMO if issued.hour < 12 else DEFAULT_CALL
+        call = issued.replace(hour=hh, minute=mm, second=0, microsecond=0)
         r = replay_leg(s["limit_price"], s["issued_price"] or s["limit_price"], issued, buyback, bars, call)
         if r.get("pending"):
             continue
@@ -323,8 +348,8 @@ def score_due(path: Optional[Path] = None, now: Optional[datetime] = None, bars_
 
 # ---------------------------------------------------------------- the evening loop
 
-def _run_evening(day: date, watches: List[Watch], path: Optional[Path] = None) -> None:
-    end = datetime(day.year, day.month, day.day, *WINDOW_END, tzinfo=NY)
+def _run_evening(day: date, watches: List[Watch], path: Optional[Path] = None, end_at: tuple = WINDOW_END) -> None:
+    end = datetime(day.year, day.month, day.day, *end_at, tzinfo=NY)
     while datetime.now(NY) < end and not all(w.orders for w in watches):
         now = datetime.now(NY)
         try:
@@ -351,16 +376,25 @@ def _run_evening(day: date, watches: List[Watch], path: Optional[Path] = None) -
 
 
 def run_due(path: Optional[Path] = None, now: Optional[datetime] = None) -> bool:
-    """Called every minute by background.py: on a report day, start the evening watch at 15:55 ET."""
+    """Called every minute by background.py: on a report day, start the watch: from 04:00 ET for a
+    holding reporting before the open (its pre-market), from 15:55 ET for one reporting after the close."""
     now = now or datetime.now(NY)
     day = now.date()
-    if now.weekday() >= 5 or _state["day"] == day or not (dtime_between(now, (15, 55), WINDOW_END)):
+    if now.weekday() >= 5:
         return False
-    _state["day"] = day
+    if dtime_between(now, *BMO_WINDOW):
+        session, finder, end_at = "bmo", reporting_premarket, BMO_WINDOW[1]
+    elif dtime_between(now, (15, 55), WINDOW_END):
+        session, finder, end_at = "amc", reporting_today, WINDOW_END
+    else:
+        return False
+    if _state.get((day, session)):
+        return False
+    _state[(day, session)] = True
     st = pf.get_state(path=path)
     held = advisor.followed(st)
     try:
-        todays = reporting_today(held, day)
+        todays = finder(held, day)
     except Exception as e:  # noqa: BLE001
         print(f"[pulse] earnings calendar failed: {type(e).__name__}: {e}")
         return False
@@ -375,10 +409,13 @@ def run_due(path: Optional[Path] = None, now: Optional[datetime] = None) -> bool
         except Exception as ex:  # noqa: BLE001
             print(f"[pulse] {e['symbol']} context failed: {ex}")
             ctx = {}
-        close = q.get("regular_price") or q.get("price") or ctx.get("close")
-        watches.append(Watch(e["symbol"], h["quantity"], h.get("avg_cost"), float(close), day, ctx))
-    print(f"[pulse] watching {[w.symbol for w in watches]} this evening")
-    t = threading.Thread(target=_run_evening, args=(day, watches, path), name="earnings-pulse", daemon=True)
+        if session == "amc":
+            close = q.get("regular_price") or q.get("price") or ctx.get("close")
+        else:                                            # the previous session's close
+            close = q.get("prev_close") or ctx.get("close")
+        watches.append(Watch(e["symbol"], h["quantity"], h.get("avg_cost"), float(close), day, ctx, session=session))
+    print(f"[pulse] watching {[w.symbol for w in watches]} ({session})")
+    t = threading.Thread(target=_run_evening, args=(day, watches, path, end_at), name=f"earnings-pulse-{session}", daemon=True)
     _state["thread"] = t
     t.start()
     return True
