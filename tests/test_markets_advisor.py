@@ -140,6 +140,44 @@ class ScoringTest(unittest.TestCase):
         self.assertEqual(done, {92.5: "scored", 86.0: "scored", 99.0: "expired", 80.0: "void"})
 
 
+class ReplaceTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self.tmp.name) / "a.db"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def plan(symbol, shares, sell, back):
+        o = lambda side, lim, parent: {"symbol": symbol, "side": side, "tag": "rebuy" if parent is not None else "trim", "pct": None,
+                                       "shares": shares, "amount_usd": None, "limit_price": lim, "issued_price": 100.0,
+                                       "valid_until": "2026-11-13", "zh": "", "en": "", "plan": "t1", "parent": parent}
+        return [o("sell", sell, None), o("buy", back, 0)]
+
+    def test_a_new_report_replaces_open_orders_of_its_symbols_only(self):
+        advisor.save_orders(1, self.plan("TSM", 1, 432, 405) + self.plan("SKHY", 11, 153, 127), 1.0, self.db)
+        advisor.save_orders(2, self.plan("TSM", 1, 434, 407), 2.0, self.db, replace={"TSM"})          # a focused TSM update
+        live = {(o["symbol"], o["limit_price"]): o["status"] for o in advisor.active_orders(self.db)}
+        self.assertEqual(live, {("TSM", 434): "open", ("TSM", 407): "waiting", ("SKHY", 153): "open", ("SKHY", 127): "waiting"})
+        conn = advisor._conn(self.db)
+        replaced = [r[0] for r in conn.execute("SELECT limit_price FROM advice_orders WHERE status = 'replaced' ORDER BY id")]
+        conn.close()
+        self.assertEqual(replaced, [432, 405])
+
+    def test_sales_beyond_the_shares_held_are_dropped_with_their_buy_backs(self):
+        advisor.save_orders(1, self.plan("TSM", 4, 432, 405), 1.0, self.db)                         # 4 of 6 already for sale
+        second = self.plan("TSM", 2, 450, 415)
+        second[1]["parent"] = 2                                       # its sale's position in the combined list
+        over = advisor.save_orders(2, self.plan("TSM", 3, 440, 410) + second, 2.0, self.db, held_whole={"TSM": 6})
+        self.assertEqual(len(over), 1)                                                             # the 3-share sale
+        live = sorted((o["side"], o["shares"], o["limit_price"]) for o in advisor.active_orders(self.db))
+        self.assertEqual(live, [("buy", 2, 415), ("buy", 4, 405), ("sell", 2, 450), ("sell", 4, 432)])
+        child = next(o for o in advisor.active_orders(self.db) if o["limit_price"] == 415)
+        parent = next(o for o in advisor.active_orders(self.db) if o["limit_price"] == 450)
+        self.assertEqual(child["parent_id"], parent["id"])                                          # still points at its sale
+
+
 class TriggerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

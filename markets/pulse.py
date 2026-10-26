@@ -193,7 +193,7 @@ class Watch:
         rec = ans.get("stock_record") or {}
         return {"symbol": self.symbol, "at": now.isoformat(), "price": p0, "plan": best["plan"], "pred_pct": best["pred_pct"],
                 "sells": sells, "rebuys": rebuy, "buyback": bb, "how": how, "record": rec, "model_record": ans.get("model_record"),
-                "session": self.session}
+                "session": self.session, "whole_shares": int(math.floor(self.quantity))}
 
 
 # ---------------------------------------------------------------- orders, notification, log
@@ -222,7 +222,9 @@ def save(orders: Dict[str, Any], day: date, path: Optional[Path] = None, shadow:
                      "en": f"After that sale fills, buy back {r['shares']}: {orders['how']}", "note": note,
                      "plan": prefix + orders["plan"], "parent": r["after_sale"]})
     ts = datetime.fromisoformat(orders["at"]).timestamp()
-    advisor.save_orders(None, legs, ts, path)
+    over = advisor.save_orders(None, legs, ts, path, held_whole=None if shadow else {orders["symbol"]: orders.get("whole_shares", 10 ** 9)})
+    if over:
+        print(f"[pulse] {orders['symbol']}: {over}")
     if shadow:
         conn = advisor._conn(path)
         try:

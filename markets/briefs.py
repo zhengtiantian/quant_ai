@@ -35,6 +35,7 @@ logged-in claude.ai subscription. That keeps this personal-use only.
 
 import glob
 import json
+import math
 import os
 import re
 import shutil
@@ -392,8 +393,9 @@ FOCUS = {
                "Respect cash_usd.",
 }
 ADVISOR_FOCUS_UPDATE = (" This is a focused update: snapshot.trigger says which holding and why it was written now. Put "
-                        "that holding first and in depth, revise or cancel its open orders (listed in snapshot.trigger) "
-                        "and give the other holdings one line each.")
+                        "that holding first and in depth and give the other holdings one line each. Its open orders "
+                        "(listed in snapshot.trigger) are replaced by whatever plan you give for it now (none = withdrawn); "
+                        "the PLANS block may contain that holding only, the other holdings' orders stay as they are.")
 
 
 def build_prompt(kind: str, session: str, snap: Dict[str, Any], topic: str = "") -> str:
@@ -495,8 +497,11 @@ def generate(kind: str, session: Optional[str] = None, trigger: str = "schedule"
             adv = snap.get("advisor") or {}
             positions = adv.get("positions") or []
             prices = {c["symbol"]: c.get("price") for c in adv.get("buy_candidates") or [] if c.get("price")}
-            # Plans first: their buy-backs point at their sales by position in this list.
-            orders, dropped_orders = advisor.parse_plans(plans_text, positions, date.fromisoformat(session))
+            # A focused update plans only its own holding (2026-10-26: INTC and STX updates kept re-issuing
+            # TSM plans). Plans first: their buy-backs point at their sales by position in this list.
+            focus = (context or {}).get("symbol") if topic else None
+            plan_positions = [p for p in positions if p["symbol"] == focus] if focus else positions
+            orders, dropped_orders = advisor.parse_plans(plans_text, plan_positions, date.fromisoformat(session))
             buys, dropped_buys = advisor.parse_orders(orders_text, prices, date.fromisoformat(session),
                                                       held={p["symbol"] for p in positions})
             orders, dropped_orders = orders + buys, dropped_orders + dropped_buys
@@ -521,7 +526,14 @@ def generate(kind: str, session: Optional[str] = None, trigger: str = "schedule"
     if fields["status"] == "done":
         predictions.save(row["id"], kind, preds, path)
         if kind == "advisor":
-            advisor.save_orders(row["id"], orders, started, path)
+            # The full report re-plans every holding; a focused update its own. Earlier open orders of
+            # those symbols are replaced, and no symbol may be sold beyond the shares held.
+            held_pos = (snap.get("advisor") or {}).get("positions") or []
+            replace = ({focus} if focus else {p["symbol"] for p in held_pos}) | {o["symbol"] for o in orders}
+            over = advisor.save_orders(row["id"], orders, started, path, replace=replace,
+                                       held_whole={p["symbol"]: int(math.floor(p["quantity"])) for p in held_pos})
+            if over:
+                print(f"[briefs] advisor {session} {topic}: dropped orders: {over}")
     if path is None:
         backup.schedule_backup()
     title = f"{KINDS[kind]['title']}{f' · {topic}' if topic else ''} brief"

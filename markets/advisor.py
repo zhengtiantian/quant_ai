@@ -576,11 +576,48 @@ def parse_plans(text: str, positions: List[Dict[str, Any]], session_date: date) 
     return orders, dropped
 
 
-def save_orders(brief_id: int, orders: List[Dict[str, Any]], issued_ts: float, path: Optional[Path] = None) -> None:
-    """A buy-back is saved as 'waiting' with parent_id set to its sale's row."""
+REAL_ADVICE = "(plan IS NULL OR (plan NOT LIKE 'pulse:%' AND plan NOT LIKE 'shadow:%'))"
+
+
+def save_orders(brief_id: Optional[int], orders: List[Dict[str, Any]], issued_ts: float, path: Optional[Path] = None,
+                replace: Optional[set] = None, held_whole: Optional[Dict[str, int]] = None) -> List[str]:
+    """Save a report's orders; a buy-back is saved as 'waiting' with parent_id set to its sale's row.
+
+    replace: symbols whose earlier advisor orders still open or waiting this report supersedes
+    (status 'replaced'). Before 2026-10-26 nothing was withdrawn, so nine reports in a day left
+    seven overlapping TSM plans selling 11 shares of a 6.75-share position.
+    held_whole: whole shares held per symbol. Sales beyond what is held, counting the sales still
+    open from earlier (advisor and earnings-pulse), are dropped with their buy-backs.
+    Returns the reasons for anything dropped."""
+    dropped: List[str] = []
     conn = _conn(path)
     try:
-        conn.execute("DELETE FROM advice_orders WHERE brief_id = ? AND status IN ('open', 'waiting')", (brief_id,))
+        if brief_id is not None:
+            conn.execute("DELETE FROM advice_orders WHERE brief_id = ? AND status IN ('open', 'waiting')", (brief_id,))
+        if replace:
+            marks = ", ".join("?" * len(replace))
+            conn.execute(f"UPDATE advice_orders SET status = 'replaced', note = COALESCE(note || ' ', '') || ? "
+                         f"WHERE status IN ('open', 'waiting') AND {REAL_ADVICE} AND symbol IN ({marks}) "
+                         f"AND (brief_id IS NULL OR brief_id != ?)",
+                         (f"[replaced by report {brief_id}]", *sorted(replace), brief_id if brief_id is not None else -1))
+        if held_whole is not None:
+            selling = {r[0]: r[1] or 0.0 for r in conn.execute(
+                "SELECT symbol, SUM(shares) FROM advice_orders WHERE side = 'sell' AND status = 'open' "
+                "AND (plan IS NULL OR plan NOT LIKE 'shadow:%') GROUP BY symbol")}
+            kept, index, cum = [], {}, dict(selling)
+            for i, o in enumerate(orders):
+                parent = o.get("parent")
+                if parent is not None and parent not in index:
+                    continue                                   # its sale was dropped
+                if o["side"] == "sell" and o["symbol"] in held_whole:
+                    have = held_whole[o["symbol"]] - cum.get(o["symbol"], 0.0)
+                    if (o.get("shares") or 0) > have:
+                        dropped.append(f"{o['symbol']}: selling {o.get('shares')} more would exceed the {held_whole[o['symbol']]} shares held")
+                        continue
+                    cum[o["symbol"]] = cum.get(o["symbol"], 0.0) + (o.get("shares") or 0)
+                index[i] = len(kept)
+                kept.append({**o, "parent": index[parent] if parent is not None else None})
+            orders = kept
         ids: List[int] = []
         for o in orders:
             parent = ids[o["parent"]] if o.get("parent") is not None else None
@@ -594,6 +631,7 @@ def save_orders(brief_id: int, orders: List[Dict[str, Any]], issued_ts: float, p
         conn.commit()
     finally:
         conn.close()
+    return dropped
 
 
 # ---------------------------------------------------------------- scoring (daily bars)
