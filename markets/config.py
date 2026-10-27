@@ -10,7 +10,7 @@ DB_PATH = DATA_DIR / "markets.db"
 BACKUP_PATH = Path(os.getenv(
     "MARKETS_BACKUP_PATH",
     "~/Library/CloudStorage/GoogleDrive-biaszh00001@gmail.com/My Drive/quant_ai_backup/markets.db")).expanduser()
-# job_agent's dashboard owns the budget: sale profits are pushed there, the USD rate read from it.
+# job_agent's dashboard owns the budget: the USD rate is read from it.
 JOB_AGENT_URL = os.getenv("JOB_AGENT_URL", "http://127.0.0.1:5050").rstrip("/")
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)

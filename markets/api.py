@@ -86,16 +86,8 @@ def portfolio_write(action: str, payload: Dict[str, Any]):
         result: Dict[str, Any] = {}
         if action == "tx/save":
             result["id"] = portfolio.save_transaction(payload.get("data") or {})
-            try:   # a sale's profit goes to the budget's 股票 item; the trade is saved either way
-                result["budget"] = portfolio.sync_budget().get(result["id"])
-            except Exception as e:  # noqa: BLE001
-                result["budget"] = {"error": f"{type(e).__name__}: {e}"}
         elif action == "tx/delete":
             portfolio.delete_transaction(int(payload["id"]))
-            try:
-                portfolio.sync_budget()     # the sale's line goes; later sales may change with the average
-            except Exception:  # noqa: BLE001
-                pass
         elif action == "watch/add":
             result["symbol"] = portfolio.add_watch(payload.get("symbol", ""), payload.get("note", ""))
         elif action == "watch/remove":

@@ -138,7 +138,8 @@ def init_db(path: Optional[Path] = None) -> None:
         if "request_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}:
             conn.execute("ALTER TABLE transactions ADD COLUMN request_id TEXT")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_request ON transactions(request_id)")
-        # budget_sync / budget_entry_id: a sale's profit is written to the budget's 股票 item (added 2026-10-20).
+        # budget_sync / budget_entry_id: a sale's profit was pushed to the budget's 股票 item (2026-10-20 to
+        # 2026-10-27); kept so the sale pushed then still shows its →budget mark.
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}
         if "budget_sync" not in cols:
             conn.execute("ALTER TABLE transactions ADD COLUMN budget_sync INTEGER NOT NULL DEFAULT 0")
@@ -199,14 +200,12 @@ def save_transaction(data: Dict[str, Any], path: Optional[Path] = None) -> int:
             raise ValueError("Dividend / fee amount must be greater than 0")
     tid = int(data["id"]) if data.get("id") not in (None, "") else None
     request_id = str(data.get("request_id") or "").strip()[:64] or None
-    # Sales record their profit in the budget unless the form unticks it; other types never do.
-    budget_sync = 1 if side == "sell" and str(data.get("budget_sync", "1")).lower() not in ("0", "false", "", "off") else 0
     fields = (trade_date, symbol, side, quantity, price, fee, "USD", str(data.get("note") or "").strip())
     conn = _write_conn(path)
     try:
         if tid:
             if not conn.execute("UPDATE transactions SET trade_date=?, symbol=?, side=?, quantity=?, price=?, fee=?, "
-                                "currency=?, note=?, budget_sync=? WHERE id=?", (*fields, budget_sync, tid)).rowcount:
+                                "currency=?, note=? WHERE id=?", (*fields, tid)).rowcount:
                 raise ValueError("This transaction no longer exists (it may have been deleted elsewhere). Refresh and try again")
         else:
             # The same form submitted twice (double click, retry, two tabs) carries the same key.
@@ -216,9 +215,8 @@ def save_transaction(data: Dict[str, Any], path: Optional[Path] = None) -> int:
                     conn.execute("ROLLBACK")
                     return row["id"]
             tid = conn.execute("INSERT INTO transactions (trade_date, symbol, side, quantity, price, fee, currency, "
-                               "note, created_at, request_id, budget_sync) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                               (*fields, datetime.now().isoformat(sep=" ", timespec="seconds"), request_id,
-                                budget_sync)).lastrowid
+                               "note, created_at, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                               (*fields, datetime.now().isoformat(sep=" ", timespec="seconds"), request_id)).lastrowid
         # A sale larger than the position at that date would make the books meaningless.
         _, problems = compute_holdings(_transactions(conn))
         if problems:
@@ -234,8 +232,7 @@ def save_transaction(data: Dict[str, Any], path: Optional[Path] = None) -> int:
 
 
 def delete_transaction(tid: int, path: Optional[Path] = None) -> None:
-    """Deleting a row that is already gone is a no-op, so a repeated click is harmless. A sale's
-    profit line in the budget goes with it on the next sync_budget (the caller runs one)."""
+    """Deleting a row that is already gone is a no-op, so a repeated click is harmless."""
     conn = _write_conn(path)
     try:
         conn.execute("DELETE FROM transactions WHERE id = ?", (tid,))
@@ -276,60 +273,6 @@ def remove_watch(symbol: str, path: Optional[Path] = None) -> None:
         conn.commit()
     finally:
         conn.close()
-
-
-# ---------------------------------------------------------------- budget link
-# A sale's profit (average-cost rule: shares x (price - average cost) - fee) becomes one line of
-# the budget's 股票 income item in job_agent, the itemised list the user keeps by hand. The line
-# follows the sale: edited with it, deleted with it, and recomputed when an earlier buy changes
-# the average. job_agent owns the budget, so this side only says which lines should exist
-# (markets/budget_link.py); when the dashboard is down the push waits and is retried.
-
-def budget_lines(path: Optional[Path] = None) -> List[Dict[str, Any]]:
-    """Every budget line the linked sales call for, keyed by transaction id."""
-    conn = _conn(path)
-    try:
-        txs = _transactions(conn)
-    finally:
-        conn.close()
-    positions, _ = compute_holdings(txs)
-    sales = {tid: s for p in positions.values() for tid, s in p["sales"].items()}
-    lines = []
-    for t in txs:
-        sale = sales.get(t["id"])
-        if t["side"] == "sell" and t.get("budget_sync") and sale:
-            lines.append({"key": f"tx:{t['id']}", "tx_id": t["id"], "day": t["trade_date"],
-                          "amount": round(sale["profit"], 2), "company": t["symbol"], "profit": sale["profit"],
-                          "avg_cost": sale["avg_cost"],
-                          "note": f"Auto from portfolio: sold {t['quantity']:g} shares @ ${t['price']:g}, "
-                                  f"avg cost ${sale['avg_cost']:.2f}"})
-    return lines
-
-
-def sync_budget(path: Optional[Path] = None) -> Dict[int, Dict[str, Any]]:
-    """Push the linked sales' lines to job_agent. Returns {transaction id: info}; when job_agent
-    cannot be reached the push is marked pending (budget_link retries it) and info says so."""
-    lines = budget_lines(path)
-    result = budget_link.push(lines, path)
-    conn = _conn(path)
-    try:
-        if result.get("entries") is not None:
-            ids = {int(k.split(":", 1)[1]): v for k, v in result["entries"].items()}
-            conn.execute("UPDATE transactions SET budget_entry_id = NULL")
-            conn.executemany("UPDATE transactions SET budget_entry_id = ? WHERE id = ?", [(v, k) for k, v in ids.items()])
-            conn.commit()
-    finally:
-        conn.close()
-    out = {}
-    for ln in lines:
-        info = {"profit": ln["profit"], "avg_cost": ln["avg_cost"]}
-        if result.get("error"):
-            info["pending"] = True
-            info["error"] = result["error"]
-        else:
-            info["entry_id"] = result["entries"].get(ln["key"])
-        out[ln["tx_id"]] = info
-    return out
 
 
 def _transactions(conn) -> List[Dict[str, Any]]:

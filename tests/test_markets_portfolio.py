@@ -239,68 +239,11 @@ class PortfolioTest(unittest.TestCase):
             pf.get_quotes(["NVDA", "AAPL"], path=self.db, ttl_by_symbol={"NVDA": 3, "AAPL": 60})
         self.assertEqual(fetched, ["NVDA"])             # per-symbol TTLs: 10 s is past 3 s, not past 60 s
 
-    def fake_budget(self, up=True):
-        """job_agent's /api/budget/external/sync in memory: lines keyed by key, replaced by each push."""
-        self.budget_lines, self.budget_up, ids = {}, up, iter(range(100, 1000))
-
-        def post(url, payload, timeout=10):
-            if not self.budget_up:
-                raise OSError("connection refused")
-            old = self.budget_lines
-            self.budget_lines = {e["key"]: {**e, "id": old[e["key"]]["id"] if e["key"] in old else next(ids)}
-                                 for e in payload["entries"]}
-            return {"status": "success", "entries": {k: v["id"] for k, v in self.budget_lines.items()}}
-        p = mock.patch.object(budget_link, "_post", side_effect=post)
-        p.start()
-        self.addCleanup(p.stop)
-
-    def test_sale_profit_goes_to_the_budget_stock_item_and_follows_the_sale(self):
-        self.fake_budget()
-        self.tx(quantity=10, price=10)
-        self.tx(quantity=12.5, price=8, trade_date="2026-09-02")          # average 200 / 22.5
-        sale = self.tx(side="sell", quantity=5, price=11, fee=1, trade_date="2026-09-03")
-        info = pf.sync_budget(self.db)[sale]
-        self.assertAlmostEqual(info["profit"], 5 * (11 - 200 / 22.5) - 1)
-        rows = list(self.budget_lines.values())
-        self.assertEqual(len(rows), 1)
-        self.assertEqual((rows[0]["day"], rows[0]["company"], rows[0]["amount"]), ("2026-09-03", "NVDA", round(info["profit"], 2)))
-        self.assertEqual(info["entry_id"], rows[0]["id"])
-        # editing the sale updates the same line; syncing again does not duplicate it
-        self.tx(id=sale, side="sell", quantity=5, price=12, fee=1, trade_date="2026-09-03")
-        pf.sync_budget(self.db); pf.sync_budget(self.db)
-        rows = list(self.budget_lines.values())
-        self.assertEqual(len(rows), 1)
-        self.assertAlmostEqual(rows[0]["amount"], round(5 * (12 - 200 / 22.5) - 1, 2))
-        # unticking the box takes the line out; deleting the sale also removes it
-        self.tx(id=sale, side="sell", quantity=5, price=12, fee=1, trade_date="2026-09-03", budget_sync="0")
-        pf.sync_budget(self.db)
-        self.assertEqual(self.budget_lines, {})
-        self.tx(id=sale, side="sell", quantity=5, price=12, fee=1, trade_date="2026-09-03", budget_sync="1")
-        pf.sync_budget(self.db)
-        self.assertEqual(len(self.budget_lines), 1)
-        pf.delete_transaction(sale, self.db)
-        pf.sync_budget(self.db)
-        self.assertEqual(self.budget_lines, {})
-
-    def test_buys_never_touch_the_budget(self):
-        self.fake_budget()
-        self.tx(quantity=1, price=100, budget_sync="1")
-        self.assertEqual(pf.sync_budget(self.db), {})
-        self.assertEqual(self.budget_lines, {})
-
-    def test_budget_push_waits_while_job_agent_is_down(self):
-        self.fake_budget(up=False)
-        self.tx(quantity=10, price=10)
-        sale = self.tx(side="sell", quantity=5, price=11, trade_date="2026-09-03")
-        info = pf.sync_budget(self.db)[sale]
-        self.assertTrue(info["pending"])
-        self.assertTrue(budget_link.pending(self.db))
-        self.assertFalse(budget_link.retry_pending(self.db))            # still down
-        self.budget_up = True
-        self.assertTrue(budget_link.retry_pending(self.db))
-        self.assertFalse(budget_link.pending(self.db))
-        self.assertEqual(len(self.budget_lines), 1)
-        self.assertFalse(budget_link.retry_pending(self.db))            # nothing left to send
+    def test_saving_a_sale_does_not_push_to_the_budget(self):
+        with mock.patch("urllib.request.urlopen") as url:
+            self.tx(quantity=10, price=10)
+            self.tx(side="sell", quantity=5, price=11, trade_date="2026-09-03", budget_sync="1")
+        url.assert_not_called()
 
     def test_extended_hours_print_outside_the_quote_uses_the_midpoint(self):
         self.assertEqual(pf._sane_extended_price(399.55, "post", 430.00, 430.50), (430.25, "mid"))

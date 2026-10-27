@@ -1,8 +1,7 @@
-"""The one place the portfolio talks to job_agent's budget.
+"""The one place the portfolio talks to job_agent's budget: the USD rate is read from it.
 
-A push sends every line that should exist; job_agent creates, updates and removes lines to
-match (budget.sync_external_entries), so repeating a push is harmless. When job_agent is not
-running the push is marked pending and retry_pending() sends it again later.
+Sale profits are no longer pushed to the budget's 股票 item (stopped 2026-10-27 at the user's
+request; the line pushed before stays in the budget). _meta() is the markets.db key-value table.
 """
 
 import json
@@ -10,13 +9,10 @@ import sqlite3
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from .config import DB_PATH, JOB_AGENT_URL
 
-SOURCE = "quant_ai.portfolio"
-BUDGET_STOCK_ITEM = "股票"          # the user's own item name in the budget; referenced, never renamed
-_FIELDS = ("key", "day", "amount", "company", "note")
 _fx_cache: Dict[str, Any] = {"rate": None, "at": 0.0}
 
 
@@ -32,41 +28,6 @@ def _meta(path: Optional[Path], key: str, value: Optional[str] = None, write: bo
         return row[0] if row else None
     finally:
         conn.close()
-
-
-def _post(url: str, payload: Dict[str, Any], timeout: float = 10) -> Dict[str, Any]:
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.load(resp)
-
-
-def push(lines: List[Dict[str, Any]], path: Optional[Path] = None) -> Dict[str, Any]:
-    """{"entries": {key: entry id}} on success, {"error": message, "entries": None} otherwise."""
-    payload = {"source": SOURCE, "item_name": BUDGET_STOCK_ITEM,
-               "entries": [{k: ln[k] for k in _FIELDS} for ln in lines]}
-    try:
-        d = _post(f"{JOB_AGENT_URL}/api/budget/external/sync", payload)
-        if d.get("status") != "success":
-            raise RuntimeError(d.get("message") or "job_agent refused the budget lines")
-    except Exception as e:  # noqa: BLE001 - kept for retry, never fails the save
-        _meta(path, "budget_pending", str(time.time()), write=True)
-        return {"error": f"Budget not updated yet ({type(e).__name__}: {e}); will retry", "entries": None}
-    _meta(path, "budget_pending", None, write=True)
-    return {"entries": d.get("entries") or {}}
-
-
-def pending(path: Optional[Path] = None) -> bool:
-    return bool(_meta(path, "budget_pending"))
-
-
-def retry_pending(path: Optional[Path] = None) -> bool:
-    """Called by the background loop; True if a pending push went through."""
-    if not pending(path):
-        return False
-    from . import portfolio
-    out = portfolio.sync_budget(path)
-    return not any(v.get("pending") for v in out.values()) and not pending(path)
 
 
 def usd_cny(max_age: float = 3600) -> Optional[float]:
