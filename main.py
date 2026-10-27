@@ -350,7 +350,9 @@ app.router.lifespan_context = lifespan
 MARKETS_ENABLED = os.getenv("MARKETS_ENABLED", "").strip() == "1"
 if MARKETS_ENABLED:
     from markets.api import router as markets_router
+    from markets.mobile import router as mobile_router
     app.include_router(markets_router)
+    app.include_router(mobile_router)
 
 
 @app.get("/health")
