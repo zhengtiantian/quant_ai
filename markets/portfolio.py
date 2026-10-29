@@ -353,8 +353,37 @@ def _get_json(url: str) -> Dict[str, Any]:
 
 
 def _nasdaq(symbol: str, endpoint: str, cls: str) -> Optional[Dict[str, Any]]:
-    d = _get_json(NASDAQ.format(sym=urllib.parse.quote(symbol.replace(".", "/")), endpoint=endpoint, cls=cls))
+    url = NASDAQ.format(sym=urllib.parse.quote(symbol.replace(".", "/")), endpoint=endpoint, cls=cls)
+    if endpoint == "extended-trading":
+        url += "&markettype=post"
+    d = _get_json(url)
     return d.get("data") if (d.get("status") or {}).get("rCode") == 200 else None
+
+
+# Once after-hours trading ends (20:00 ET) the info reply drops the after-hours price and shows the
+# regular close again until pre-market: on 2026-10-28 at 21:12 ET GOOGL read $324.89 there while it
+# had last traded at $292.50 after hours (-10%), so a holding refreshed after 20:00 showed the close
+# and one refreshed before showed the after-hours price. While closed, the last after-hours trade
+# comes from the extended-trading page instead, which keeps it until the next session starts.
+POST_CLOSE_TRADES = 10           # the median of the last trades, so one odd-lot print cannot set it
+_DATE_RE = re.compile(r"[A-Z][a-z]{2} \d{1,2}, \d{4}")
+
+
+def _post_close_price(ext: Optional[Dict[str, Any]], primary: Dict[str, Any]) -> Optional[float]:
+    """The last after-hours price from an extended-trading reply, or None when there is none or
+    it belongs to another day than the regular close in `primary`."""
+    if not isinstance(ext, dict):
+        return None
+    updated = _DATE_RE.search(" ".join(ext.get("lastUpdateInfo") or []))
+    closed = _DATE_RE.search(str(primary.get("lastTradeTimestamp") or ""))
+    if not updated or not closed or updated.group() != closed.group():
+        return None
+    rows = ((ext.get("tradeDetailTable") or {}).get("rows") or [])[:POST_CLOSE_TRADES]
+    prices = sorted(p for p in (_money(r.get("price")) for r in rows) if p)
+    if prices:
+        return prices[len(prices) // 2]
+    info_rows = (ext.get("infoTable") or {}).get("rows") or []
+    return _money(str(info_rows[0].get("consolidated") or "").split(" ")[0]) if info_rows else None
 
 
 def session_now(now: Optional[datetime] = None) -> str:
@@ -396,6 +425,8 @@ def fetch_quote(symbol: str, asset_class: Optional[str] = None, known_prev_close
     calls = [(cls, "info") for cls in classes]
     if known_prev_close is None:
         calls += [(cls, "summary") for cls in classes]
+    if session_now() == "closed":
+        calls += [(cls, "extended-trading") for cls in classes]
 
     def call(item):
         cls, ep = item
@@ -432,13 +463,27 @@ def fetch_quote(symbol: str, asset_class: Optional[str] = None, known_prev_close
         if price is None:
             raise ValueError(f"{symbol}: no price in Nasdaq reply")
         price, price_basis = _sane_extended_price(price, session, _money(primary.get("bidPrice")), _money(primary.get("askPrice")))
+        session_change, session_change_pct = _money(primary.get("netChange")), _money(primary.get("percentageChange"))
+        post = _post_close_price(replies.get((cls, "extended-trading")), primary) if session == "closed" else None
+        if post is not None:
+            # Same shape as an after-hours quote: the regular close beside the price, the day measured
+            # from the close before it, and the after-hours move as the session change.
+            regular_price, close = price, price
+            if session_change is not None:
+                prev_close = round(close - session_change, 4)
+            price, price_basis = post, "post_close"
+            session_change = round(post - close, 4)
+            session_change_pct = round(session_change / close * 100, 4) if close else None
+            regular_time = primary.get("lastTradeTimestamp")
+        else:
+            regular_time = secondary.get("lastTradeTimestamp")
         return {
             "symbol": symbol, "asset_class": cls, "name": info.get("companyName") or symbol,
             "price": price, "session": session, "market_status": info.get("marketStatus"),
             "trade_time": primary.get("lastTradeTimestamp"),
-            "session_change": _money(primary.get("netChange")), "session_change_pct": _money(primary.get("percentageChange")),
+            "session_change": session_change, "session_change_pct": session_change_pct,
             # During pre-market / after-hours Nasdaq puts the regular session's last price here.
-            "regular_price": regular_price, "regular_time": secondary.get("lastTradeTimestamp"),
+            "regular_price": regular_price, "regular_time": regular_time,
             # A previous close read while the market is closed (overnight, after midnight ET) may
             # be the stale one above, so it is not reused for the rest of the ET day.
             "prev_close": prev_close,
@@ -852,6 +897,10 @@ def get_state(force_quotes: bool = False, path: Optional[Path] = None, cached_qu
     finally:
         conn.close()
     positions, problems = compute_holdings(txs)
+    # Each sale shows the average cost it realised against and its profit (average-cost rule, fee included).
+    sales = {tid: sale for p in positions.values() for tid, sale in p["sales"].items()}
+    txs = [{**t, "sale_avg_cost": sales[t["id"]]["avg_cost"], "sale_profit": sales[t["id"]]["profit"]} if t["id"] in sales else t
+           for t in txs]
     open_syms = sorted(s for s, p in positions.items() if p["quantity"] > EPS)
     # A watched symbol that is now held shows in the holdings table only.
     watch_rows = [w for w in watch_rows if w["symbol"] not in open_syms]

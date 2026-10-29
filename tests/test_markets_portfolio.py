@@ -239,6 +239,16 @@ class PortfolioTest(unittest.TestCase):
             pf.get_quotes(["NVDA", "AAPL"], path=self.db, ttl_by_symbol={"NVDA": 3, "AAPL": 60})
         self.assertEqual(fetched, ["NVDA"])             # per-symbol TTLs: 10 s is past 3 s, not past 60 s
 
+    def test_a_sale_shows_its_average_cost_and_profit(self):
+        self.tx(quantity=10, price=10)
+        self.tx(quantity=12.5, price=8, trade_date="2026-09-02")          # average 200 / 22.5
+        sale = self.tx(side="sell", quantity=5, price=11, fee=1, trade_date="2026-09-03")
+        with mock.patch.object(pf, "fetch_quote", side_effect=lambda s, *a: None):
+            txs = {t["id"]: t for t in pf.get_state(path=self.db, cached_quotes=True)["transactions"]}
+        self.assertAlmostEqual(txs[sale]["sale_avg_cost"], 200 / 22.5)
+        self.assertAlmostEqual(txs[sale]["sale_profit"], 5 * (11 - 200 / 22.5) - 1)
+        self.assertNotIn("sale_profit", next(t for i, t in txs.items() if i != sale))
+
     def test_saving_a_sale_does_not_push_to_the_budget(self):
         with mock.patch("urllib.request.urlopen") as url:
             self.tx(quantity=10, price=10)
@@ -306,6 +316,37 @@ class PortfolioTest(unittest.TestCase):
             q = REAL_FETCH_QUOTE("INTC", "stocks")
         self.assertEqual(q["prev_close"], 92.96)                   # only the summary to go by
         self.assertIsNone(q["prev_close_date"])
+
+    def _closed_replies(self, ext_date="Oct 28, 2026", trades=("$292.5", "$292.5", "$292.4985")):
+        # GOOGL 2026-10-28 21:12 ET: info back on the regular close, the after-hours last on the extended page
+        info = {"marketStatus": "Closed", "companyName": "Alphabet",
+                "primaryData": {"lastSalePrice": "$324.89", "netChange": "+4.31", "percentageChange": "+1.34%",
+                                "lastTradeTimestamp": "Oct 28, 2026"}, "secondaryData": None}
+        ext = {"lastUpdateInfo": [f"Data last updated {ext_date} 08:00 PM ET.", "This page will resume updating on Oct 29, 2026 04:00 PM ET."],
+               "infoTable": {"rows": [{"consolidated": "$292.5 -28.08 (-8.76%)"}]},
+               "tradeDetailTable": {"rows": [{"time": "19:59:59", "price": p, "shareVolume": "10"} for p in trades]}}
+        summary = {"summaryData": {"PreviousClose": {"value": "$320.58"}}}
+        return lambda symbol, endpoint, cls: {"info": info, "extended-trading": ext}.get(endpoint, summary)
+
+    def test_closed_market_shows_the_last_after_hours_price(self):
+        with mock.patch.object(pf, "session_now", return_value="closed"), \
+             mock.patch.object(pf, "_nasdaq", side_effect=self._closed_replies()):
+            q = REAL_FETCH_QUOTE("GOOGL", "stocks")
+        self.assertEqual(q["session"], "closed")                   # no polling overnight
+        self.assertEqual((q["price"], q["price_basis"], q["regular_price"]), (292.5, "post_close", 324.89))
+        self.assertEqual(q["prev_close"], 320.58)                  # the day still runs from the close before
+        self.assertAlmostEqual(q["session_change"], -32.39)
+
+    def test_after_hours_odd_lot_print_does_not_set_the_closed_price(self):
+        with mock.patch.object(pf, "session_now", return_value="closed"), \
+             mock.patch.object(pf, "_nasdaq", side_effect=self._closed_replies(trades=("$270.00", "$292.5", "$292.4"))):
+            self.assertEqual(REAL_FETCH_QUOTE("GOOGL", "stocks")["price"], 292.4)
+
+    def test_after_hours_page_from_another_day_is_ignored(self):
+        with mock.patch.object(pf, "session_now", return_value="closed"), \
+             mock.patch.object(pf, "_nasdaq", side_effect=self._closed_replies(ext_date="Oct 27, 2026")):
+            q = REAL_FETCH_QUOTE("GOOGL", "stocks")
+        self.assertEqual((q["price"], q["price_basis"]), (324.89, "last"))
 
     def test_batch_row_with_volume_going_backwards_is_refetched(self):
         pf.get_quotes(["NVDA"], force=True, path=self.db)
