@@ -361,6 +361,91 @@ class PortfolioTest(unittest.TestCase):
         self.assertEqual(out["NVDA"]["price"], 213.0)          # the per-symbol fetch (fake) won, not 91.215
 
 
+    def test_explicit_lot_allocation_swing_profit_statuses_and_invariants(self):
+        # User's exact scenario: 10 sh @ $106 + 20 sh @ $73.14, then sell 20 @ $85 closing the $73.14 lot.
+        b_high = self.tx(symbol="NVDA", quantity=10, price=106.0, trade_date="2026-10-20")
+        b_low = self.tx(symbol="NVDA", quantity=20, price=73.14, trade_date="2026-10-29")
+        sale = self.tx(
+            symbol="NVDA", side="sell", entry_mode="lots", price=85.0, trade_date="2026-10-30",
+            lot_allocations=[{"buy_id": b_low, "quantity": 20}],
+        )
+        st = pf.get_state(path=self.db)
+        h = st["holdings"][0]
+        by_id = {bo["id"]: bo for bo in h["buy_orders"]}
+
+        # Selected low lot is closed with +$237.20 swing profit; high lot stays open
+        self.assertEqual(by_id[b_low]["status"], "closed")
+        self.assertAlmostEqual(by_id[b_low]["open_qty"], 0.0)
+        self.assertAlmostEqual(by_id[b_low]["closed_qty"], 20.0)
+        self.assertAlmostEqual(by_id[b_low]["realized_pnl"], 20 * (85.0 - 73.14))
+        self.assertEqual(by_id[b_high]["status"], "open")
+        self.assertAlmostEqual(by_id[b_high]["open_qty"], 10.0)
+
+        # Strict FIFO view on the same buy orders shows the opposite (oldest 10 closed + 10 of second lot)
+        self.assertEqual(by_id[b_high]["fifo_status"], "closed")
+        self.assertEqual(by_id[b_low]["fifo_status"], "partial")
+        self.assertAlmostEqual(by_id[b_low]["fifo_open_qty"], 10.0)
+
+        # Headline Mine avg_cost and Irish CGT FIFO avg_cost are completely unaffected by custom lot choice
+        expected_avg = (10 * 106.0 + 20 * 73.14) / 30.0
+        self.assertAlmostEqual(h["avg_cost"], expected_avg)
+        self.assertAlmostEqual(h["fifo_avg_cost"], 73.14)
+        self.assertAlmostEqual(h["open_lots_avg"], 106.0)
+        self.assertAlmostEqual(h["swing_realized"], 237.20)
+        # Net cash breakeven drops from $106.00 to $82.28 thanks to the +$237.20 swing gain
+        self.assertAlmostEqual(h["breakeven_price"], (1060.0 + 1462.80 - 1700.0) / 10.0)
+
+        # Fundamental conservation law: unrealized + realized is identical across all 3 accounting views
+        self.assertAlmostEqual(h["open_lots_unrealized"] + h["swing_realized"], h["unrealized"] + h["realized"])
+        self.assertAlmostEqual(h["fifo_unrealized"] + h["fifo_realized"], h["unrealized"] + h["realized"])
+
+        # Editing the sale's note without passing lot_allocations preserves custom lot selection
+        pf.save_transaction({
+            "id": sale, "symbol": "NVDA", "side": "sell", "trade_date": "2026-10-30",
+            "quantity": 20, "price": 85.0, "fee": 0, "note": "swing profit",
+        }, self.db)
+        h2 = pf.get_state(path=self.db)["holdings"][0]
+        self.assertAlmostEqual(h2["swing_realized"], 237.20)
+
+        # Explicitly clearing lot_allocations=[] reverts that sale back to FIFO
+        pf.save_transaction({
+            "id": sale, "symbol": "NVDA", "side": "sell", "trade_date": "2026-10-30",
+            "quantity": 20, "price": 85.0, "fee": 0, "note": "revert fifo", "lot_allocations": [],
+        }, self.db)
+        h3 = pf.get_state(path=self.db)["holdings"][0]
+        self.assertAlmostEqual(h3["swing_realized"], h3["fifo_realized"])
+
+    def test_partial_multi_lot_close_fractional_dust_and_validation(self):
+        b1 = self.tx(symbol="NVDA", entry_mode="amount", amount=1000, price=137.54376278, quantity="", trade_date="2026-10-20")
+        b2 = self.tx(symbol="NVDA", quantity=20, price=73.14, trade_date="2026-10-29")
+        st0 = pf.get_state(path=self.db)
+        q1 = next(bo["open_qty"] for bo in st0["holdings"][0]["buy_orders"] if bo["id"] == b1)
+
+        # Over-allocating beyond b2's open shares is rejected and rolled back
+        with self.assertRaises(ValueError):
+            self.tx(
+                symbol="NVDA", side="sell", entry_mode="lots", price=85.0, trade_date="2026-10-30",
+                lot_allocations=[{"buy_id": b2, "quantity": 20.5}],
+            )
+
+        # Closing 100% of 8-decimal fractional lot b1 + 8 shares of b2 in a single sale
+        self.tx(
+            symbol="NVDA", side="sell", entry_mode="lots", price=150.0, fee=2.0, trade_date="2026-10-30",
+            lot_allocations=[{"buy_id": b1, "quantity": q1}, {"buy_id": b2, "quantity": 8}],
+        )
+        h = pf.get_state(path=self.db)["holdings"][0]
+        by_id = {bo["id"]: bo for bo in h["buy_orders"]}
+        self.assertEqual(by_id[b1]["status"], "closed")
+        self.assertEqual(by_id[b1]["open_qty"], 0.0)
+        self.assertEqual(by_id[b2]["status"], "partial")
+        self.assertAlmostEqual(by_id[b2]["open_qty"], 12.0)
+        self.assertAlmostEqual(by_id[b2]["closed_qty"], 8.0)
+
+        # Deleting a buy order explicitly referenced by a sale is refused and rolled back
+        with self.assertRaises(ValueError):
+            pf.delete_transaction(b2, self.db)
+
+
 if __name__ == "__main__":
     unittest.main()
 

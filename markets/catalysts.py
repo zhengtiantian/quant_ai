@@ -138,6 +138,115 @@ OFFICIAL_MACRO_SCHEDULE: List[Dict[str, Any]] = [
      "note_en": "March FOMC rate decision and SEP dot plot"},
 ]
 
+# Verified semiconductor, AI & cloud conferences / investor summits (exact official dates & URLs).
+OFFICIAL_INDUSTRY_CONFERENCES: List[Dict[str, Any]] = [
+    {
+        "id": "conf:sc26",
+        "date": "2026-11-15",
+        "date_label": "11/15–11/20",
+        "kind": "product",
+        "primary": "INTC",
+        "direct_symbols": ["INTC", "NVDA", "AMD", "SMCI"],
+        "affected_symbols": ["INTC", "NVDA", "AMD", "SMCI", "STX", "SKHY", "MU", "TSM"],
+        "title_zh": "SC26 全球超算与数据中心算力大会 (Chicago)",
+        "title_en": "SC26 Supercomputing & HPC Summit (Chicago)",
+        "detail_zh": "英特尔展示 Xeon 6 / 数据中心加速路线图；NVIDIA、AMD、超微与高带宽存储/大容量盘厂商同台发布超算集群方案",
+        "detail_en": "Intel Xeon 6 / data-center accelerator showcase alongside NVIDIA, AMD, Supermicro, HBM & enterprise storage vendors",
+        "source_title": "SC26 Official Schedule",
+        "source_url": "https://sc26.supercomputing.org",
+    },
+    {
+        "id": "conf:ignite26",
+        "date": "2026-11-17",
+        "date_label": "11/17–11/20",
+        "kind": "product",
+        "primary": "MSFT",
+        "direct_symbols": ["MSFT", "INTC", "AMD", "NVDA"],
+        "affected_symbols": ["MSFT", "INTC", "AMD", "NVDA", "GOOGL", "ORCL"],
+        "title_zh": "Microsoft Ignite 2026 全球技术大会 (旧金山)",
+        "title_en": "Microsoft Ignite 2026 Conference (San Francisco)",
+        "detail_zh": "微软发布企业级 Copilot+ AI PC 新部署（直接检验 Intel Core Ultra 商用换机需求）及 Azure AI 算力基建进展",
+        "detail_en": "Enterprise Copilot+ AI PC rollout (key demand driver for Intel Core Ultra commercial refresh) & Azure AI silicon updates",
+        "source_title": "Microsoft Ignite",
+        "source_url": "https://ignite.microsoft.com",
+    },
+    {
+        "id": "conf:reinvent26",
+        "date": "2026-11-30",
+        "date_label": "11/30–12/04",
+        "kind": "product",
+        "primary": "AMZN",
+        "direct_symbols": ["AMZN", "INTC", "NVDA"],
+        "affected_symbols": ["AMZN", "INTC", "NVDA", "AMD", "MRVL", "STX", "SKHY", "TSM"],
+        "title_zh": "AWS re:Invent 2026 全球云计算大会 (拉斯维加斯)",
+        "title_en": "AWS re:Invent 2026 Cloud & AI Conference (Las Vegas)",
+        "detail_zh": "AWS 披露新一代云基础设施 Capex、与英特尔定制 Xeon 6 / 18A 代工芯片进展，以及大容量近线存储（STX）与 AI 训练集群需求",
+        "detail_en": "AWS cloud capex roadmap, custom Intel Xeon 6 / 18A foundry collaboration updates, and hyperscale storage/AI cluster demand",
+        "source_title": "AWS re:Invent",
+        "source_url": "https://reinvent.awsevents.com",
+    },
+    {
+        "id": "conf:ubs_tech26",
+        "date": "2026-12-01",
+        "date_label": "12/01–12/04",
+        "kind": "corporate",
+        "primary": "INTC",
+        "direct_symbols": ["INTC", "NVDA", "MU", "AMD", "MSFT", "GOOGL", "ORCL"],
+        "affected_symbols": ["INTC", "NVDA", "MU", "AMD", "MSFT", "GOOGL", "ORCL", "TSM", "SKHY"],
+        "title_zh": "UBS 全球科技与 AI 投资者峰会（英特尔高管炉边谈话）",
+        "title_en": "UBS Global Technology & AI Conference (Intel Fireside Chat)",
+        "detail_zh": "英特尔年末最关键投行沟通窗口：管理层按惯例更新 Q4 季中毛利率、Intel 18A 良率爬坡、外部代工客户及 Altera 独立运营进展",
+        "detail_en": "Key Q4 intra-quarter investor check-in: Intel management updates on 18A yields, foundry customer traction, margins & Altera",
+        "source_title": "UBS Tech Conference / Intel IR",
+        "source_url": "https://www.intc.com/news-events/ir-calendar",
+    },
+    {
+        "id": "conf:barclays_tech26",
+        "date": "2026-12-09",
+        "date_label": "12/09–12/10",
+        "kind": "corporate",
+        "primary": "INTC",
+        "direct_symbols": ["INTC", "STX", "WDC", "MU", "AMD", "AVGO"],
+        "affected_symbols": ["INTC", "STX", "WDC", "MU", "AMD", "AVGO", "SKHY"],
+        "title_zh": "Barclays 第24届全球科技投资者大会 (旧金山)",
+        "title_en": "Barclays 24th Annual Global Technology Conference (SF)",
+        "detail_zh": "半导体与存储（英特尔、希捷、美光、AMD）年末机构闭门/公开交流会，聚焦 PC/服务器库存水位与明年 Q1 订单能见度",
+        "detail_en": "Year-end institutional tech summit featuring Intel, Seagate, Micron & AMD updates on PC/server inventory and Q1 order book",
+        "source_title": "Barclays Tech Conference / Intel IR",
+        "source_url": "https://www.intc.com/news-events/ir-calendar",
+    },
+    {
+        "id": "conf:iedm26",
+        "date": "2026-12-12",
+        "date_label": "12/12–12/16",
+        "kind": "product",
+        "primary": "INTC",
+        "direct_symbols": ["INTC", "TSM", "SKHY"],
+        "affected_symbols": ["INTC", "TSM", "SKHY", "ASML", "AMAT", "LRCX", "KLAC", "MU"],
+        "title_zh": "IEDM 2026 国际电子器件顶会：Intel 18A/14A vs 台积电 2nm 正面交锋",
+        "title_en": "IEEE IEDM 2026: Intel 18A/14A vs TSMC 2nm/A16 Silicon Papers",
+        "detail_zh": "全球晶圆制程最高工程峰会：英特尔披露 18A/14A (RibbonFET + PowerVia 背面供电) 实测电学/良率论文，直接验证代工翻身底牌",
+        "detail_en": "Premier semiconductor node summit: Intel Foundry presents 18A/14A RibbonFET & PowerVia silicon data alongside TSMC 2nm/A16 & SK Hynix",
+        "source_title": "IEEE IEDM 2026",
+        "source_url": "https://www.ieee-iedm.org",
+    },
+    {
+        "id": "conf:ces27",
+        "date": "2027-01-06",
+        "date_label": "01/06–01/09",
+        "kind": "product",
+        "primary": "INTC",
+        "direct_symbols": ["INTC", "NVDA", "AMD"],
+        "affected_symbols": ["INTC", "NVDA", "AMD", "QCOM", "AAPL", "TSM", "SKHY", "GOOGL"],
+        "title_zh": "CES 2027 主题发布：英特尔自研 18A 芯片 Panther Lake 正式登场",
+        "title_en": "CES 2027 Keynote: Intel Panther Lake (18A AI PC) Official Launch",
+        "detail_zh": "英特尔开年头号产品催化剂：首款基于自研 18A 制程量产的客户端芯片 Panther Lake（Core Ultra 300 系列）与 OEM 整机阵容集中亮相",
+        "detail_en": "Intel's flagship client catalyst: formal launch & OEM laptop lineup for Panther Lake, its first high-volume in-house 18A AI PC chip",
+        "source_title": "CES 2027 Official",
+        "source_url": "https://www.ces.tech",
+    },
+]
+
 # Thematic / supply-chain groups used to map spillover events across ALL Holdings and Watchlist stocks.
 SECTOR_GROUPS: Dict[str, Tuple[str, str, Set[str]]] = {
     "ai_chips": (
@@ -546,8 +655,8 @@ def collect_l2_extracted(days: int = 45, path: Optional[Path] = None, today: Opt
         def _pull_rss(sym: str) -> Tuple[str, List[Dict[str, Any]]]:
             co = names.get(sym, "")
             term = f'"{sym}" OR "{co}"' if co and len(co) >= 3 else f'"{sym}"'
-            q = f'({term}) (upcoming OR conference OR keynote OR launch OR "investor day" OR tariff OR "export control" OR antitrust OR ruling OR guidance) when:7d'
-            return sym, fetch_google_news_rss(q, max_items=6, path=path, cache_key=f"gnrss:fwd:{sym}")
+            q = f'({term}) (upcoming OR conference OR keynote OR launch OR foundry OR 18A OR HBM4 OR HAMR OR "investor day" OR tariff OR "export control" OR "CHIPS Act" OR antitrust OR ruling) -"why" -"stock fell" when:14d'
+            return sym, fetch_google_news_rss(q, max_items=8, path=path, cache_key=f"gnrss:fwd2:{sym}")
 
         def _pull_sec(sym: str) -> Tuple[str, List[Dict[str, Any]]]:
             return sym, fetch_sec_recent_filings(sym, cik_map, since_days=14, path=path)
@@ -732,7 +841,8 @@ def _collect_l3_thematic_web_fallback(
         '("export control" OR "tariff" OR "CHIPS Act" OR "BIS") ("TSMC" OR "NVIDIA" OR "Intel" OR "SK Hynix" OR "AMD" OR "ASML") when:14d',
         '("antitrust" OR "DOJ" OR "remedies" OR "trial" OR "ruling" OR "EU") ("Google" OR "Apple" OR "Meta" OR "Microsoft" OR "Amazon" OR "NVIDIA") when:14d',
         '("Seagate" OR "HAMR" OR "data center storage" OR "HBM3E") (shipment OR qualification OR launch OR capacity OR conference) when:14d',
-        '("Intel 18A" OR "Panther Lake" OR "Blackwell" OR "Rubin" OR "MI350" OR "TPU") (launch OR shipment OR keynote OR event) when:14d',
+        '("Intel" OR "INTC") ("18A" OR "Panther Lake" OR "Clearwater Forest" OR "Intel Foundry" OR "Altera" OR "CHIPS Act" OR "Ohio" OR "Arizona") when:14d',
+        '("Blackwell" OR "Rubin" OR "MI350" OR "TPU" OR "HBM4") (launch OR shipment OR keynote OR event) when:14d',
         '("Tesla" OR "Robotaxi" OR "FSD" OR "Palantir" OR "Coinbase" OR "Oracle") (event OR regulatory OR deadline OR conference OR launch) when:14d',
         '("US election" OR "Federal Reserve" OR "FOMC" OR "tariff") ("semiconductors" OR "Big Tech" OR "Nasdaq") when:7d',
     ]
@@ -1165,7 +1275,7 @@ def upcoming_feed(
         cur += timedelta(days=1)
 
     near_weekdays = weekdays[:15]
-    all_stock_syms = [s for s in (list(held_map) + list(watch_map)) if s not in PURE_ETFS]
+    all_stock_syms = [s for s in (list(held_map) + list(watch_map) + sorted(bellwether_only)) if s not in PURE_ETFS]
 
     def _safe_earnings_on(d: date):
         try:
@@ -1374,6 +1484,44 @@ def upcoming_feed(
                 "source_url": "https://investor.tsmc.com/english/monthly-revenue-report",
             })
 
+    # ---------------- LAYER 1B2: Official Semiconductor, Cloud & Investor Conferences
+    for conf in OFFICIAL_INDUSTRY_CONFERENCES:
+        cd = date.fromisoformat(conf["date"])
+        if not (start <= cd <= end):
+            continue
+        prim = conf["primary"]
+        direct_syms = [s for s in conf["direct_symbols"] if s in pool_set]
+        aff_syms = [s for s in conf["affected_symbols"] if s in pool_set]
+        for s in direct_syms:
+            if s not in aff_syms:
+                aff_syms.insert(0, s)
+        if not aff_syms and not bellwether_only:
+            continue
+        rel_held = [s for s in aff_syms if s in held_set]
+        bucket = "held" if any(s in held_set for s in direct_syms) else ("watchlist" if direct_syms else "bellwether")
+        all_events.append({
+            "id": conf["id"],
+            "layer": "L1_calendar",
+            "kind": conf["kind"],
+            "bucket": bucket,
+            "symbol": prim if prim in pool_set else (direct_syms[0] if direct_syms else prim),
+            "name": names.get(prim, prim),
+            "date": conf["date"],
+            "date_precision": "exact",
+            "date_label": conf.get("date_label") or "",
+            "days_away": (cd - start).days,
+            "direct_symbols": direct_syms,
+            "affected_symbols": aff_syms,
+            "related_holdings": rel_held,
+            "impact_level": "high",
+            "title_zh": conf["title_zh"],
+            "title_en": conf["title_en"],
+            "detail_zh": conf["detail_zh"],
+            "detail_en": conf["detail_en"],
+            "source_title": conf["source_title"],
+            "source_url": conf["source_url"],
+        })
+
     # ---------------- LAYER 1C: Dividends & Splits
     for sym, rows in divs_by_sym.items():
         if sym not in pool_set:
@@ -1525,7 +1673,7 @@ def upcoming_feed(
             if country not in events.ECON_COUNTRIES or not ev_name or not events.ECON_KEYWORDS.search(ev_name):
                 continue
             # Keep timeline crisp: filter out noisy secondary sub-components & minor non-US releases
-            if re.search(r"(Continuing Jobless|4-Week Avg|GDP Sales|GDP Price Index|Consumer Credit|Inflation Expectation|Redbook|Bill Auction|Bond Auction)", ev_name, re.I):
+            if re.search(r"(Continuing Jobless|4-Week Avg|GDP Sales|GDP Price Index|Consumer Credit|Inflation Expectation|Redbook|Bill Auction|Bond Auction|ISM .* (?:Employment|New Orders|Prices|Business Activity))", ev_name, re.I):
                 continue
             if country != "United States" and not re.search(r"\b(Rate Decision|Interest Rate|ECB|BoE|BoJ|GDP|Exports|CPI)\b", ev_name, re.I):
                 continue
@@ -1638,16 +1786,26 @@ def upcoming_feed(
     all_events.sort(key=lambda x: (x["date"], bucket_rank.get(x["bucket"], 9), layer_rank.get(x["layer"], 9), x.get("symbol") or ""))
 
     # ---------------- Build Per-Stock Catalyst Map for EVERY Holding & Watchlist Stock
+    co_keywords = {
+        "INTC": ("intel", "英特尔"),
+        "SKHY": ("sk hynix", "hynix", "海力士"),
+        "TSM": ("tsmc", "台积电"),
+        "STX": ("seagate", "希捷"),
+        "GOOGL": ("google", "alphabet", "waymo", "谷歌"),
+    }
     per_stock: Dict[str, Dict[str, Any]] = {}
     for m in symbols_meta:
         sym = m["symbol"]
+        kws = co_keywords.get(sym, (sym.lower(),))
         direct: List[Dict[str, Any]] = []
         spillover: List[Dict[str, Any]] = []
         macro_list: List[Dict[str, Any]] = []
         for ev in all_events:
-            if ev["symbol"] == sym:
+            title_combo = f"{ev.get('title_en') or ''} {ev.get('title_zh') or ''}".lower()
+            named_in_title = sym in (ev.get("affected_symbols") or []) and any(k in title_combo for k in kws)
+            if ev["symbol"] == sym or sym in (ev.get("direct_symbols") or []) or (ev["layer"] != "L1_calendar" and named_in_title):
                 direct.append(ev)
-            elif ev["bucket"] == "macro" and ev["impact_level"] == "high" and sym in (ev.get("affected_symbols") or []):
+            elif ev["bucket"] == "macro" and (ev["impact_level"] == "high" or ev["kind"] == "policy") and sym in (ev.get("affected_symbols") or []):
                 macro_list.append(ev)
             elif sym in (ev.get("affected_symbols") or []):
                 spillover.append(ev)
@@ -1656,11 +1814,11 @@ def upcoming_feed(
             "direct_count": len(direct),
             "spillover_count": len(spillover),
             "macro_count": len(macro_list),
-            "total_count": len(direct) + len(spillover) + len(macro_list[:4]),
+            "total_count": len(direct) + len(spillover) + len(macro_list),
             "next_direct": direct[0] if direct else None,
             "direct": direct,
-            "spillover": spillover[:6],
-            "macro": macro_list[:4],
+            "spillover": spillover[:20],
+            "macro": macro_list[:16],
         }
 
     # Filter timeline to requested `scope` / `symbols`

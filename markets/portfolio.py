@@ -35,6 +35,7 @@ from .config import DB_PATH
 
 US_EAST = ZoneInfo("America/New_York")
 EPS = 1e-9
+SNAP_EPS = 5e-9  # half of 1e-8 (Revolut 8-decimal share precision)
 
 TX_TYPES = {"buy": "Buy", "sell": "Sell", "dividend": "Dividend", "fee": "Fee"}
 SESSIONS = {"pre": "Pre-market", "regular": "Market open", "post": "After hours", "closed": "Closed"}
@@ -145,6 +146,8 @@ def init_db(path: Optional[Path] = None) -> None:
             conn.execute("ALTER TABLE transactions ADD COLUMN budget_sync INTEGER NOT NULL DEFAULT 0")
         if "budget_entry_id" not in cols:
             conn.execute("ALTER TABLE transactions ADD COLUMN budget_entry_id INTEGER")
+        if "lot_allocations" not in cols:
+            conn.execute("ALTER TABLE transactions ADD COLUMN lot_allocations TEXT")
         conn.commit()
     finally:
         conn.close()
@@ -172,6 +175,47 @@ def _num(v, name: str, minimum: float = 0.0) -> float:
     return x
 
 
+def _parse_lot_allocations(raw: Any) -> Optional[List[Dict[str, Any]]]:
+    """Normalise explicit sell-to-buy lot allocations: [{"buy_id": int, "quantity": float}, ...]."""
+    if raw in (None, "", [], "{}"):
+        return None
+    if isinstance(raw, str):
+        raw_s = raw.strip()
+        if not raw_s:
+            return None
+        try:
+            parsed = json.loads(raw_s)
+        except json.JSONDecodeError as e:
+            raise ValueError("Invalid lot_allocations JSON") from e
+    elif isinstance(raw, list):
+        parsed = raw
+    else:
+        raise ValueError("lot_allocations must be a list")
+    if not isinstance(parsed, list):
+        raise ValueError("lot_allocations must be a list")
+    merged: Dict[int, float] = {}
+    order: List[int] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            raise ValueError("Each lot allocation must be an object")
+        try:
+            bid = int(item.get("buy_id"))
+        except (TypeError, ValueError) as e:
+            raise ValueError("Invalid buy_id in lot_allocations") from e
+        if bid <= 0:
+            raise ValueError("buy_id must be positive")
+        q = _num(item.get("quantity"), "Allocated quantity")
+        if q <= SNAP_EPS:
+            continue
+        if bid not in merged:
+            merged[bid] = 0.0
+            order.append(bid)
+        merged[bid] = round(merged[bid] + q, 8)
+    if not order:
+        return None
+    return [{"buy_id": bid, "quantity": merged[bid]} for bid in order]
+
+
 def save_transaction(data: Dict[str, Any], path: Optional[Path] = None) -> int:
     side = data.get("side") or "buy"
     if side not in TX_TYPES:
@@ -191,6 +235,14 @@ def save_transaction(data: Dict[str, Any], path: Optional[Path] = None) -> int:
         if amount <= 0 or price <= 0:
             raise ValueError("When entering by amount, both amount and price must be greater than 0")
         quantity = round(amount / price, 8)
+    has_alloc_key = "lot_allocations" in data
+    allocs = _parse_lot_allocations(data.get("lot_allocations")) if side == "sell" and has_alloc_key else None
+    if side == "sell" and allocs:
+        alloc_sum = round(sum(a["quantity"] for a in allocs), 8)
+        if data.get("entry_mode") == "lots" or quantity <= SNAP_EPS:
+            quantity = alloc_sum
+        elif alloc_sum > quantity + 1e-6:
+            raise ValueError(f"Selected lot shares ({alloc_sum:g}) exceed sell quantity ({quantity:g})")
     fee = _num(data.get("fee"), "Fee")
     if side in ("buy", "sell") and (quantity <= 0 or price <= 0):
         raise ValueError("Buy / sell quantity and price must both be greater than 0")
@@ -204,9 +256,22 @@ def save_transaction(data: Dict[str, Any], path: Optional[Path] = None) -> int:
     conn = _write_conn(path)
     try:
         if tid:
-            if not conn.execute("UPDATE transactions SET trade_date=?, symbol=?, side=?, quantity=?, price=?, fee=?, "
-                                "currency=?, note=? WHERE id=?", (*fields, tid)).rowcount:
+            old = conn.execute("SELECT symbol, side, lot_allocations FROM transactions WHERE id=?", (tid,)).fetchone()
+            if not old:
                 raise ValueError("This transaction no longer exists (it may have been deleted elsewhere). Refresh and try again")
+            if side == "sell":
+                if has_alloc_key:
+                    alloc_json = json.dumps(allocs) if allocs else None
+                elif old["side"] == "sell" and old["symbol"] == symbol and old["lot_allocations"]:
+                    old_allocs = _parse_lot_allocations(old["lot_allocations"])
+                    old_sum = sum(a["quantity"] for a in (old_allocs or []))
+                    alloc_json = old["lot_allocations"] if old_sum <= quantity + 1e-6 else None
+                else:
+                    alloc_json = None
+            else:
+                alloc_json = None
+            conn.execute("UPDATE transactions SET trade_date=?, symbol=?, side=?, quantity=?, price=?, fee=?, "
+                         "currency=?, note=?, lot_allocations=? WHERE id=?", (*fields, alloc_json, tid))
         else:
             # The same form submitted twice (double click, retry, two tabs) carries the same key.
             if request_id:
@@ -214,9 +279,10 @@ def save_transaction(data: Dict[str, Any], path: Optional[Path] = None) -> int:
                 if row:
                     conn.execute("ROLLBACK")
                     return row["id"]
+            alloc_json = json.dumps(allocs) if (side == "sell" and allocs) else None
             tid = conn.execute("INSERT INTO transactions (trade_date, symbol, side, quantity, price, fee, currency, "
-                               "note, created_at, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                               (*fields, datetime.now().isoformat(sep=" ", timespec="seconds"), request_id)).lastrowid
+                               "note, created_at, request_id, lot_allocations) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                               (*fields, datetime.now().isoformat(sep=" ", timespec="seconds"), request_id, alloc_json)).lastrowid
         # A sale larger than the position at that date would make the books meaningless.
         _, problems = compute_holdings(_transactions(conn))
         if problems:
@@ -280,25 +346,60 @@ def _transactions(conn) -> List[Dict[str, Any]]:
 
 
 def compute_holdings(txs: List[Dict[str, Any]]):
-    """(positions by symbol, problems), in trade-date order, under two cost rules at once:
+    """(positions by symbol, problems), in trade-date order, under three cost views at once:
 
     * average cost (the user's rule, the headline): a sale leaves the average unchanged and
       realises against it; only a buy changes the average.
     * FIFO (fifo_*): a sale consumes the oldest lots first, so the average of what remains
       moves. This is how disposals of shares are matched for Irish CGT.
+    * Lot / order matcher (buy_orders, sell_orders, swing_realized, open_lots_avg, breakeven_price):
+      each buy order carries an explicit status ('open' | 'partial' | 'closed'); a sale may
+      target specific open buy orders via lot_allocations (any unallocated remainder falls back
+      to FIFO), without altering the headline average cost or FIFO tax basis.
     Buy fees are part of a lot's cost; sell fees reduce that sale's realised gain."""
     pos: Dict[str, Dict[str, Any]] = {}
     problems: List[str] = []
     for t in sorted(txs, key=lambda x: (x["trade_date"], x["id"])):
-        p = pos.setdefault(t["symbol"], {"symbol": t["symbol"], "quantity": 0.0, "cost": 0.0, "realized": 0.0,
-                                         "dividends": 0.0, "fees": 0.0, "first_date": t["trade_date"], "trades": 0,
-                                         "lots": [], "fifo_realized": 0.0, "sales": {}})
+        p = pos.setdefault(
+            t["symbol"],
+            {
+                "symbol": t["symbol"], "quantity": 0.0, "cost": 0.0, "realized": 0.0,
+                "dividends": 0.0, "fees": 0.0, "first_date": t["trade_date"], "trades": 0,
+                "lots": [], "fifo_realized": 0.0, "sales": {},
+                "buy_orders": [], "sell_orders": [], "swing_realized": 0.0,
+                "_buy_by_id": {}, "_fifo_orders": [], "_cycle_net_cash": 0.0,
+            },
+        )
         p["trades"] += 1
         p["fees"] += t["fee"]
         if t["side"] == "buy":
+            unit_cost = (t["quantity"] * t["price"] + t["fee"]) / t["quantity"]
             p["quantity"] += t["quantity"]
             p["cost"] += t["quantity"] * t["price"] + t["fee"]
-            p["lots"].append([t["quantity"], (t["quantity"] * t["price"] + t["fee"]) / t["quantity"]])
+            p["lots"].append([t["quantity"], unit_cost])
+            p["_cycle_net_cash"] += t["quantity"] * t["price"] + t["fee"]
+            bo = {
+                "id": t["id"],
+                "trade_date": t["trade_date"],
+                "symbol": t["symbol"],
+                "quantity": t["quantity"],
+                "price": t["price"],
+                "fee": t["fee"],
+                "unit_cost": unit_cost,
+                "note": t.get("note") or "",
+                "open_qty": t["quantity"],
+                "closed_qty": 0.0,
+                "status": "open",
+                "realized_pnl": 0.0,
+                "matches": [],
+                "fifo_open_qty": t["quantity"],
+                "fifo_closed_qty": 0.0,
+                "fifo_status": "open",
+                "fifo_realized_pnl": 0.0,
+            }
+            p["buy_orders"].append(bo)
+            p["_buy_by_id"][t["id"]] = bo
+            p["_fifo_orders"].append(bo)
         elif t["side"] == "sell":
             if t["quantity"] > p["quantity"] + EPS:
                 problems.append(f"{t['trade_date']}: selling {t['quantity']:g} {t['symbol']} shares, but only {p['quantity']:g} were held then")
@@ -315,23 +416,178 @@ def compute_holdings(txs: List[Dict[str, Any]]):
                 if lot[0] < EPS:
                     p["lots"].pop(0)
             p["fifo_realized"] += t["quantity"] * t["price"] - t["fee"] - fifo_cost
-            p["sales"][t["id"]] = {"avg_cost": avg, "profit": t["quantity"] * (t["price"] - avg) - t["fee"],
-                                   "fifo_profit": t["quantity"] * t["price"] - t["fee"] - fifo_cost}
+
+            # Per-order strict FIFO tracking for UI toggle inspection
+            fifo_left = t["quantity"]
+            while fifo_left > SNAP_EPS and p["_fifo_orders"]:
+                fbo = p["_fifo_orders"][0]
+                ftake = fbo["fifo_open_qty"] if abs(fifo_left - fbo["fifo_open_qty"]) <= SNAP_EPS else min(fbo["fifo_open_qty"], fifo_left)
+                ff_fee = t["fee"] * (ftake / t["quantity"]) if t["quantity"] > EPS else 0.0
+                fbo["fifo_realized_pnl"] += ftake * (t["price"] - fbo["unit_cost"]) - ff_fee
+                fbo["fifo_open_qty"] -= ftake
+                fifo_left -= ftake
+                if fbo["fifo_open_qty"] < SNAP_EPS:
+                    fbo["fifo_open_qty"] = 0.0
+                    p["_fifo_orders"].pop(0)
+
+            # Explicit lot matching (falling back to FIFO for any unassigned remainder)
+            try:
+                explicit_allocs = _parse_lot_allocations(t.get("lot_allocations"))
+            except ValueError as err:
+                problems.append(f"{t['trade_date']} {t['symbol']}: {err}")
+                explicit_allocs = None
+            rem_sell = t["quantity"]
+            matched_cost = 0.0
+            matched_lots: List[Dict[str, Any]] = []
+            alloc_failed = False
+            if explicit_allocs:
+                alloc_sum = sum(a["quantity"] for a in explicit_allocs)
+                if alloc_sum > t["quantity"] + 1e-6:
+                    problems.append(
+                        f"{t['trade_date']}: selected {alloc_sum:g} {t['symbol']} lot shares exceed sale quantity {t['quantity']:g}"
+                    )
+                    alloc_failed = True
+                else:
+                    for a in explicit_allocs:
+                        bid, want = a["buy_id"], a["quantity"]
+                        bo = p["_buy_by_id"].get(bid)
+                        if bo is None:
+                            problems.append(
+                                f"{t['trade_date']}: sale references {t['symbol']} buy order #{bid}, which does not exist before this sale"
+                            )
+                            alloc_failed = True
+                            break
+                        if want > bo["open_qty"] + 1e-6:
+                            problems.append(
+                                f"{t['trade_date']}: cannot close {want:g} shares from {t['symbol']} buy #{bid} (@ ${bo['price']:g}), only {bo['open_qty']:g} shares open"
+                            )
+                            alloc_failed = True
+                            break
+                        take = bo["open_qty"] if abs(want - bo["open_qty"]) <= SNAP_EPS else min(want, bo["open_qty"], rem_sell)
+                        fee_slice = t["fee"] * (take / t["quantity"]) if t["quantity"] > EPS else 0.0
+                        pnl_slice = take * (t["price"] - bo["unit_cost"]) - fee_slice
+                        matched_cost += take * bo["unit_cost"]
+                        bo["open_qty"] -= take
+                        if bo["open_qty"] < SNAP_EPS:
+                            bo["open_qty"] = 0.0
+                        bo["realized_pnl"] += pnl_slice
+                        bo["matches"].append({
+                            "sell_id": t["id"],
+                            "trade_date": t["trade_date"],
+                            "quantity": round(take, 8),
+                            "sell_price": t["price"],
+                            "pnl": round(pnl_slice, 4),
+                            "explicit": True,
+                        })
+                        matched_lots.append({
+                            "buy_id": bo["id"],
+                            "buy_date": bo["trade_date"],
+                            "buy_price": bo["price"],
+                            "unit_cost": bo["unit_cost"],
+                            "quantity": round(take, 8),
+                            "pnl": round(pnl_slice, 4),
+                            "explicit": True,
+                        })
+                        rem_sell -= take
+            if not alloc_failed and rem_sell > SNAP_EPS:
+                for bo in p["buy_orders"]:
+                    if rem_sell <= SNAP_EPS:
+                        break
+                    if bo["open_qty"] <= SNAP_EPS:
+                        continue
+                    take = bo["open_qty"] if abs(rem_sell - bo["open_qty"]) <= SNAP_EPS else min(bo["open_qty"], rem_sell)
+                    fee_slice = t["fee"] * (take / t["quantity"]) if t["quantity"] > EPS else 0.0
+                    pnl_slice = take * (t["price"] - bo["unit_cost"]) - fee_slice
+                    matched_cost += take * bo["unit_cost"]
+                    bo["open_qty"] -= take
+                    if bo["open_qty"] < SNAP_EPS:
+                        bo["open_qty"] = 0.0
+                    bo["realized_pnl"] += pnl_slice
+                    bo["matches"].append({
+                        "sell_id": t["id"],
+                        "trade_date": t["trade_date"],
+                        "quantity": round(take, 8),
+                        "sell_price": t["price"],
+                        "pnl": round(pnl_slice, 4),
+                        "explicit": False,
+                    })
+                    matched_lots.append({
+                        "buy_id": bo["id"],
+                        "buy_date": bo["trade_date"],
+                        "buy_price": bo["price"],
+                        "unit_cost": bo["unit_cost"],
+                        "quantity": round(take, 8),
+                        "pnl": round(pnl_slice, 4),
+                        "explicit": False,
+                    })
+                    rem_sell -= take
+
+            swing_profit = t["quantity"] * t["price"] - t["fee"] - matched_cost
+            swing_unit_cost = matched_cost / t["quantity"] if t["quantity"] > EPS else 0.0
+            p["swing_realized"] += swing_profit
+            p["_cycle_net_cash"] -= t["quantity"] * t["price"] - t["fee"]
+
+            sale_info = {
+                "avg_cost": avg,
+                "profit": t["quantity"] * (t["price"] - avg) - t["fee"],
+                "fifo_profit": t["quantity"] * t["price"] - t["fee"] - fifo_cost,
+                "swing_unit_cost": swing_unit_cost,
+                "swing_profit": swing_profit,
+                "lot_allocations": explicit_allocs,
+                "matched_lots": matched_lots,
+            }
+            p["sales"][t["id"]] = sale_info
+            p["sell_orders"].append({
+                "id": t["id"],
+                "trade_date": t["trade_date"],
+                "symbol": t["symbol"],
+                "quantity": t["quantity"],
+                "price": t["price"],
+                "fee": t["fee"],
+                "note": t.get("note") or "",
+                **sale_info,
+            })
             p["cost"] -= avg * t["quantity"]
             p["quantity"] -= t["quantity"]
             if p["quantity"] < EPS:
                 p["quantity"], p["cost"], p["lots"] = 0.0, 0.0, []
+                p["_fifo_orders"] = []
+                p["_cycle_net_cash"] = 0.0
+                for bo in p["buy_orders"]:
+                    bo["open_qty"] = 0.0
+                    bo["fifo_open_qty"] = 0.0
         elif t["side"] == "dividend":
             p["dividends"] += t["price"] - t["fee"]
+            if p["quantity"] > EPS:
+                p["_cycle_net_cash"] -= t["price"] - t["fee"]
         else:   # fee
             p["realized"] -= t["price"] + t["fee"]
             p["fifo_realized"] -= t["price"] + t["fee"]
+            p["swing_realized"] -= t["price"] + t["fee"]
             p["fees"] += t["price"]
+            if p["quantity"] > EPS:
+                p["_cycle_net_cash"] += t["price"] + t["fee"]
     for p in pos.values():
+        p.pop("_buy_by_id", None)
+        p.pop("_fifo_orders", None)
+        cycle_net_cash = p.pop("_cycle_net_cash", 0.0)
         p["avg_cost"] = p["cost"] / p["quantity"] if p["quantity"] > EPS else None
         p["fifo_cost"] = sum(q * c for q, c in p["lots"])
         p["fifo_avg_cost"] = p["fifo_cost"] / p["quantity"] if p["quantity"] > EPS else None
         p["lots"] = [{"quantity": q, "unit_cost": c} for q, c in p["lots"]]
+        for bo in p["buy_orders"]:
+            bo["open_qty"] = round(bo["open_qty"], 8)
+            bo["closed_qty"] = round(max(0.0, bo["quantity"] - bo["open_qty"]), 8)
+            bo["status"] = "closed" if bo["open_qty"] <= SNAP_EPS else ("partial" if bo["closed_qty"] > SNAP_EPS else "open")
+            bo["realized_pnl"] = round(bo["realized_pnl"], 4)
+            bo["fifo_open_qty"] = round(bo["fifo_open_qty"], 8)
+            bo["fifo_closed_qty"] = round(max(0.0, bo["quantity"] - bo["fifo_open_qty"]), 8)
+            bo["fifo_status"] = "closed" if bo["fifo_open_qty"] <= SNAP_EPS else ("partial" if bo["fifo_closed_qty"] > SNAP_EPS else "open")
+            bo["fifo_realized_pnl"] = round(bo["fifo_realized_pnl"], 4)
+        p["open_lots_cost"] = sum(bo["open_qty"] * bo["unit_cost"] for bo in p["buy_orders"] if bo["open_qty"] > SNAP_EPS)
+        p["open_lots_avg"] = p["open_lots_cost"] / p["quantity"] if p["quantity"] > EPS else None
+        p["breakeven_price"] = max(0.0, cycle_net_cash / p["quantity"]) if p["quantity"] > EPS else None
+        p["raw_breakeven_price"] = cycle_net_cash / p["quantity"] if p["quantity"] > EPS else None
     return pos, problems
 
 
@@ -899,8 +1155,21 @@ def get_state(force_quotes: bool = False, path: Optional[Path] = None, cached_qu
     positions, problems = compute_holdings(txs)
     # Each sale shows the average cost it realised against and its profit (average-cost rule, fee included).
     sales = {tid: sale for p in positions.values() for tid, sale in p["sales"].items()}
-    txs = [{**t, "sale_avg_cost": sales[t["id"]]["avg_cost"], "sale_profit": sales[t["id"]]["profit"]} if t["id"] in sales else t
-           for t in txs]
+    txs = [
+        {
+            **t,
+            "lot_allocations": sales[t["id"]]["lot_allocations"],
+            "sale_avg_cost": sales[t["id"]]["avg_cost"],
+            "sale_profit": sales[t["id"]]["profit"],
+            "sale_fifo_profit": sales[t["id"]]["fifo_profit"],
+            "sale_swing_cost": sales[t["id"]]["swing_unit_cost"],
+            "sale_swing_profit": sales[t["id"]]["swing_profit"],
+            "matched_lots": sales[t["id"]]["matched_lots"],
+        }
+        if t["id"] in sales
+        else {**t, "lot_allocations": None}
+        for t in txs
+    ]
     open_syms = sorted(s for s, p in positions.items() if p["quantity"] > EPS)
     # A watched symbol that is now held shows in the holdings table only.
     watch_rows = [w for w in watch_rows if w["symbol"] not in open_syms]
@@ -935,9 +1204,25 @@ def get_state(force_quotes: bool = False, path: Optional[Path] = None, cached_qu
             continue
         q = quotes.get(s) or {}
         price = q.get("price")
-        h = {**p, "quote": q}
+        h = {
+            **p,
+            "quote": q,
+            "buy_orders": [
+                {
+                    **bo,
+                    "live_price": price,
+                    "price_diff_pct": (price - bo["unit_cost"]) / bo["unit_cost"] * 100 if price is not None and bo["unit_cost"] > EPS else None,
+                    "open_market_value": bo["open_qty"] * price if price is not None and bo["open_qty"] > SNAP_EPS else 0.0,
+                    "open_cost": bo["open_qty"] * bo["unit_cost"] if bo["open_qty"] > SNAP_EPS else 0.0,
+                    "open_pnl": bo["open_qty"] * (price - bo["unit_cost"]) if price is not None and bo["open_qty"] > SNAP_EPS else 0.0,
+                    "open_pnl_pct": (price - bo["unit_cost"]) / bo["unit_cost"] * 100 if price is not None and bo["open_qty"] > SNAP_EPS and bo["unit_cost"] > EPS else None,
+                }
+                for bo in p["buy_orders"]
+            ],
+        }
         if price is not None:
             h["market_value"] = price * p["quantity"]
+            h["open_lots_unrealized"] = h["market_value"] - p["open_lots_cost"]
             h["unrealized"] = h["market_value"] - p["cost"]
             h["unrealized_pct"] = h["unrealized"] / p["cost"] * 100 if p["cost"] > EPS else None
             h["fifo_unrealized"] = h["market_value"] - p["fifo_cost"]
