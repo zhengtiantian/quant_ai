@@ -207,6 +207,38 @@ def pipeline_health_route(refresh: str = ""):
         return _error(e, 500)
 
 
+@router.get("/tasks/monitor")
+def tasks_monitor_route():
+    """All scheduled and background task status: Airflow pipelines, job_agent (:5050), and daemons."""
+    from . import task_monitor
+    try:
+        return task_monitor.get_task_monitor_status()
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
+@router.get("/tasks/log")
+def tasks_log_route(
+    source: str = "airflow",
+    target_id: str = "",
+    run_id: str = "",
+    task_id: str = "",
+    lines: int = 150,
+):
+    """Tail live log output for an Airflow DAG/task or Job Agent or daemon."""
+    from . import task_monitor
+    try:
+        return task_monitor.get_task_log(
+            source=source,
+            target_id=target_id,
+            run_id=run_id or None,
+            task_id=task_id or None,
+            lines=lines,
+        )
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
 @router.get("/catalysts")
 def catalysts_feed(scope: str = "all", days: int = 30, symbols: str = "", bellwethers: str = "1", force: str = ""):
     """3-layer upcoming catalysts + per-stock breakdown for My Holdings & Watchlist."""
