@@ -191,3 +191,72 @@ def pipeline_health_route(refresh: str = ""):
         return {"status": "success", **(pipeline_health.check() if refresh == "1" else pipeline_health.latest())}
     except Exception as e:  # noqa: BLE001
         return _error(e, 500)
+
+
+@router.get("/catalysts")
+def catalysts_feed(scope: str = "all", days: int = 30, symbols: str = "", bellwethers: str = "1", force: str = ""):
+    """3-layer upcoming catalysts + per-stock breakdown for My Holdings & Watchlist."""
+    from . import catalysts
+    try:
+        sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()] if symbols else None
+        feed = catalysts.upcoming_feed(
+            scope=scope,
+            days=days,
+            symbols=sym_list,
+            include_bellwethers=bellwethers != "0",
+            force=force == "1",
+        )
+        return {"status": "success", **feed, "recent_queries": catalysts.list_queries(12)}
+    except ValueError as e:
+        return _error(e, 400)
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
+@router.post("/catalysts/collect")
+def catalysts_collect(payload: Dict[str, Any]):
+    """Trigger background Layer 2 (RSS/SEC/Mongo LLM extraction) and/or Layer 3 (Claude web sweep)."""
+    from . import catalysts
+    try:
+        layer = str(payload.get("layer") or "l2").lower()
+        days = int(payload.get("days") or 45)
+        return {"status": "success", **catalysts.trigger_collection(layer=layer, days=days)}
+    except ValueError as e:
+        return _error(e, 400)
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
+@router.post("/catalysts/query")
+def catalysts_query(payload: Dict[str, Any]):
+    """Interactive AI query over the 3-layer catalyst store + live web search."""
+    from . import catalysts
+    try:
+        raw_syms = payload.get("symbols")
+        sym_list = [str(s).strip().upper() for s in raw_syms if str(s).strip()] if isinstance(raw_syms, list) else None
+        res = catalysts.query_catalysts(
+            question=str(payload.get("question") or ""),
+            scope=str(payload.get("scope") or "all"),
+            days=int(payload.get("days") or 30),
+            symbols=sym_list,
+            mode=str(payload.get("mode") or "fast"),
+            lang=str(payload.get("lang") or "zh"),
+        )
+        return {"status": "success", "result": res, "recent_queries": catalysts.list_queries(12)}
+    except ValueError as e:
+        return _error(e, 400)
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
+@router.post("/catalysts/history/delete")
+def catalysts_history_delete(payload: Dict[str, Any]):
+    from . import catalysts
+    try:
+        qid = int(payload["id"]) if payload.get("id") is not None else None
+        catalysts.delete_query(qid=qid, clear_all=bool(payload.get("clear_all")))
+        return {"status": "success", "recent_queries": catalysts.list_queries(12)}
+    except (ValueError, TypeError) as e:
+        return _error(e, 400)
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)

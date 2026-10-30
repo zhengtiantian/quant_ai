@@ -30,6 +30,11 @@ def _loop() -> None:
             pass
         except Exception as e:  # noqa: BLE001 - the next tick tries again
             print(f"[markets] briefs check failed: {type(e).__name__}: {e}")
+        try:
+            from . import catalysts
+            catalysts.run_due()
+        except Exception as e:  # noqa: BLE001
+            print(f"[markets] catalysts check failed: {type(e).__name__}: {e}")
         time.sleep(TICK)
 
 

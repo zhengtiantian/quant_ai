@@ -167,8 +167,8 @@ def finnhub_earnings(symbol: str, start: date, end: date, path: Optional[Path] =
                 when = "after the close (Seoul morning)" if listed.endswith(".KS") else "time not given"
             out.append({"symbol": symbol, "listed_as": listed, "date": r.get("date"), "when": when,
                         "eps_forecast": r.get("epsEstimate"), "revenue_forecast": r.get("revenueEstimate"),
-                        # per share of the listing Finnhub found: won for 000660.KS, not per ADR in dollars
-                        "forecast_currency": "KRW" if listed.endswith(".KS") else "USD",
+                        # per share of the listing Finnhub found: won for 000660.KS, TWD for 2330.TW, EUR for ASML.AS
+                        "forecast_currency": _listing_currency(listed),
                         "fiscal_quarter": f"Q{r.get('quarter')} {r.get('year')}", "source": "finnhub"})
         return out
     return _cache(path, f"finnhub_earnings:{symbol}:{start.isoformat()}:{end.isoformat()}", fetch)
@@ -217,6 +217,105 @@ def upcoming(symbols: List[str], days: int = 5, path: Optional[Path] = None,
             earnings.append(item)
     earnings.sort(key=lambda e: e.get("date") or "")
     return {"from": today.isoformat(), "trading_days": days, "earnings": earnings, "economic": econ[:60]}
+
+
+
+DIVIDENDS_URL = "https://api.nasdaq.com/api/quote/{sym}/dividends?assetclass={cls}"
+SPLITS_URL = "https://api.nasdaq.com/api/calendar/splits?date={d}"
+DIVIDENDS_TTL = 12 * 3600
+
+
+def _listing_currency(listed: str) -> str:
+    u = (listed or "").upper()
+    for suffix, cur in ((".KS", "KRW"), (".KQ", "KRW"), (".TW", "TWD"), (".TWO", "TWD"),
+                        (".AS", "EUR"), (".PA", "EUR"), (".DE", "EUR"), (".T", "JPY"),
+                        (".L", "GBP"), (".HK", "HKD")):
+        if u.endswith(suffix):
+            return cur
+    return "USD"
+
+
+def _parse_mdy(val: Any) -> Optional[str]:
+    s = str(val or "").strip()
+    if not s or s.upper() == "N/A":
+        return None
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s[:10], fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _known_asset_class(symbol: str, path: Optional[Path] = None) -> Optional[str]:
+    pf.init_db(path)
+    conn = pf._conn(path)
+    try:
+        row = conn.execute("SELECT asset_class FROM quotes WHERE symbol = ?", (symbol.upper(),)).fetchone()
+        return row["asset_class"] if row and row["asset_class"] else None
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        conn.close()
+
+
+def dividends_for(symbol: str, asset_class: Optional[str] = None, path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Dividend declarations / history for `symbol` from Nasdaq, cached for 12 hours."""
+    sym = symbol.strip().upper()
+    cls_hint = asset_class or _known_asset_class(sym, path)
+    classes = [cls_hint] if cls_hint else ["stocks", "etf"]
+
+    def fetch():
+        for cls in classes:
+            try:
+                resp = pf._get_json(DIVIDENDS_URL.format(sym=sym, cls=cls))
+            except Exception:  # noqa: BLE001
+                continue
+            data = resp.get("data") or {}
+            rows = ((data.get("dividends") or {}).get("rows")) or []
+            if not rows:
+                continue
+            out = []
+            for r in rows[:8]:
+                ex_d = _parse_mdy(r.get("exOrEffDate"))
+                pay_d = _parse_mdy(r.get("paymentDate"))
+                amt = pf._money(r.get("amount"))
+                if not (ex_d or pay_d) or amt is None:
+                    continue
+                out.append({
+                    "symbol": sym,
+                    "ex_date": ex_d,
+                    "pay_date": pay_d,
+                    "record_date": _parse_mdy(r.get("recordDate")),
+                    "declaration_date": _parse_mdy(r.get("declarationDate")),
+                    "amount": amt,
+                    "currency": str(r.get("currency") or "USD").strip() or "USD",
+                    "div_type": str(r.get("type") or "Cash").strip(),
+                })
+            return out
+        return []
+
+    return _cache(path, f"dividends:{sym}", fetch, ttl=DIVIDENDS_TTL)
+
+
+def splits_on(d: date, path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Stock splits scheduled on `d` from Nasdaq, cached per day."""
+    def fetch():
+        rows = ((pf._get_json(SPLITS_URL.format(d=d.isoformat())).get("data") or {}).get("rows")) or []
+        out = []
+        for r in rows:
+            sym = str(r.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+            out.append({
+                "symbol": sym,
+                "name": r.get("name"),
+                "ratio": r.get("ratio"),
+                "execution_date": _parse_mdy(r.get("executionDate")) or d.isoformat(),
+            })
+        return out
+
+    return _cache(path, f"splits:{d.isoformat()}", fetch, ttl=DIVIDENDS_TTL)
 
 
 # ---------------------------------------------------------------- flash triggers
