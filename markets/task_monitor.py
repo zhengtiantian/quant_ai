@@ -362,10 +362,19 @@ def _get_airflow_data() -> Dict[str, Any]:
                 }
 
             # Human-friendly schedule description
-            sched_str = str(sched) if sched else "手动/上游触发"
+            sched_str = str(sched) if sched else ""
             if sched_str.startswith('"') and sched_str.endswith('"'):
                 sched_str = sched_str[1:-1]
-            if sched_str == "0 2 * * *":
+            if not sched_str or sched_str.lower() in ("null", "none"):
+                if d_id == "daily_signal_pipeline":
+                    sched_display = "上游联动触发 (backfill_2 完成后自动执行 · 约 03:06 UTC / 11:06 本地)"
+                elif d_id == "backfill_2_enrich_and_features":
+                    sched_display = "上游联动触发 (backfill_1 完成后自动执行 · 约 02:28 UTC / 10:28 本地)"
+                elif d_id == "quant_news_validation":
+                    sched_display = "按需手动触发 (On-demand 离线质检与抽样)"
+                else:
+                    sched_display = "按需 / 上游联动触发"
+            elif sched_str == "0 2 * * *":
                 sched_display = "每日 02:00 UTC (10:00 本地)"
             elif sched_str == "30 6 * * *":
                 sched_display = "每日 06:30 UTC (14:30 本地)"
@@ -634,3 +643,4 @@ def get_task_log(
             "lines": [],
             "path": str(target_file),
         }
+

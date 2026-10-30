@@ -26,3 +26,4 @@ def test_get_task_log():
     res_sched = task_monitor.get_task_log(source="scheduler", target_id="scheduler", lines=10)
     assert res_sched["status"] == "success"
     assert len(res_sched["log"]) > 0
+
