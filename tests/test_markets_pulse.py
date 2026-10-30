@@ -177,5 +177,24 @@ class WatchTest(unittest.TestCase):
         self.assertEqual([e["symbol"] for e in pulse.reporting_today(held, DAY, cal_fn=lambda s: cal)], ["INTC"])
 
 
+    def test_scrub_extended_bars_ignores_late_close_phantom_wick(self):
+        # Exact INTC 2026-10-29 regression: regular close 92.07, plunge to 75 after 16:01,
+        # orders issued at 16:02 @ 80 (+8/10/12% -> 86.4/88.0/89.6), then 16:15 & 16:16 carry h=92.07 TRF late print.
+        def bar(h, m, o, hi, lo, c, day=29):
+            return {"t": datetime(2026, 10, day, h, m, tzinfo=NY), "o": o, "h": hi, "l": lo, "c": c}
+        bars = [
+            bar(15, 59, 92.05, 92.10, 92.00, 92.07),
+            bar(16, 1, 92.29, 92.29, 78.11, 80.85),
+            bar(16, 2, 80.55, 81.10, 76.00, 80.00),
+            bar(16, 14, 75.47, 76.40, 75.02, 75.99),
+            bar(16, 15, 75.99, 92.07, 74.56, 74.91),   # late-reported closing-price print!
+            bar(16, 16, 74.92, 92.07, 74.89, 76.00),   # late-reported closing-price print!
+            bar(16, 17, 75.96, 76.00, 75.30, 75.85),
+            bar(9, 30, 70.50, 71.20, 69.80, 70.10, day=30),
+        ]
+        res = pulse.replay_leg(86.4, 80.0, at(16, 2, 5), "lim3", bars, at(17, 0))
+        self.assertFalse(res["filled"])
+
+
 if __name__ == "__main__":
     unittest.main()

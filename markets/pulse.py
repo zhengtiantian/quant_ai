@@ -288,10 +288,64 @@ def minute_bars(symbol: str, start: datetime, end: datetime) -> List[Dict[str, A
             return out
 
 
+def scrub_extended_bars(bars: List[Dict[str, Any]], regular_close: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Remove off-exchange TRF / late-closing-cross phantom wicks from extended-hours 1-min SIP bars.
+
+    Example: on 2026-10-29 INTC closed at 92.07, plunged to ~75 after 16:01, yet 16:15 and 16:16 SIP
+    bars carried h=92.07 (o=75.99/74.92, c=74.91/76.00) from late-reported closing-price prints.
+    """
+    n = len(bars)
+    if n == 0:
+        return bars
+    c16 = float(regular_close or 0.0)
+    if c16 <= 0:
+        reg_pre = [b["c"] for b in bars if 570 <= b["t"].hour * 60 + b["t"].minute < 960 and b["t"].date() == bars[0]["t"].date()]
+        if reg_pre:
+            c16 = float(reg_pre[-1])
+    first_day = bars[0]["t"].date()
+    out: List[Dict[str, Any]] = []
+    for i, b in enumerate(bars):
+        t = b["t"]
+        mins = t.hour * 60 + t.minute
+        if 570 <= mins < 960 or (t.date() == first_day and mins in (960, 961)):
+            out.append(b)
+            continue
+        o, h, l, c = float(b["o"]), float(b["h"]), float(b["l"]), float(b["c"])
+        body_hi, body_lo = max(o, c), min(o, c)
+        loc_hi, loc_lo = body_hi, body_lo
+        for j in (i - 1, i + 1):
+            if 0 <= j < n:
+                bj = bars[j]
+                mj = bj["t"].hour * 60 + bj["t"].minute
+                if not (570 <= mj < 960) and abs((bj["t"] - t).total_seconds()) <= 300:
+                    loc_hi = max(loc_hi, float(bj["o"]), float(bj["c"]))
+                    loc_lo = min(loc_lo, float(bj["o"]), float(bj["c"]))
+        loc_span_pct = (loc_hi - loc_lo) / max(loc_lo, 1e-6) * 100.0
+
+        up_wick_pct = (h / max(loc_hi, 1e-6) - 1.0) * 100.0
+        near_c16_hi = c16 > 0 and loc_hi < c16 * 0.98 and abs(h - c16) / c16 <= 0.008 and up_wick_pct >= 1.5
+        isolated_hi = up_wick_pct >= 2.5 and loc_span_pct < 3.0 and up_wick_pct >= 5.0 * max(loc_span_pct, 0.20)
+        if near_c16_hi or isolated_hi:
+            h = body_hi
+
+        dn_wick_pct = (1.0 - l / max(loc_lo, 1e-6)) * 100.0
+        near_c16_lo = c16 > 0 and loc_lo > c16 * 1.02 and abs(l - c16) / c16 <= 0.008 and dn_wick_pct >= 1.5
+        isolated_lo = dn_wick_pct >= 2.5 and loc_span_pct < 3.0 and dn_wick_pct >= 5.0 * max(loc_span_pct, 0.20)
+        if near_c16_lo or isolated_lo:
+            l = body_lo
+
+        if h != b["h"] or l != b["l"]:
+            out.append({**b, "h": h, "l": l})
+        else:
+            out.append(b)
+    return out
+
+
 def replay_leg(sell_limit: float, p0: float, issued: datetime, buyback: str, bars: List[Dict[str, Any]],
                call: datetime) -> Dict[str, Any]:
     """One ladder step on the evening's 1-minute bars: when (if) the sale filled, when and at what the
     shares came back, and the gain against holding in % of the price when the orders were given."""
+    bars = scrub_extended_bars(bars)
     after = [b for b in bars if b["t"] >= issued.replace(second=0, microsecond=0) + timedelta(minutes=1)]
     sale = next((b for b in after if b["h"] >= sell_limit), None)
     if sale is None:
@@ -338,7 +392,8 @@ def score_due(path: Optional[Path] = None, now: Optional[datetime] = None, bars_
             continue
         issued = datetime.fromtimestamp(s["issued_ts"], NY)
         try:
-            bars = (bars_fn or minute_bars)(s["symbol"], issued - timedelta(minutes=5),
+            bar_start = min(issued - timedelta(minutes=5), issued.replace(hour=15, minute=55, second=0, microsecond=0)) if issued.hour >= 12 else issued - timedelta(minutes=5)
+            bars = (bars_fn or minute_bars)(s["symbol"], bar_start,
                                             datetime(until.year, until.month, until.day, 10, 30, tzinfo=NY))
         except Exception as e:  # noqa: BLE001 - tried again on the next tick
             print(f"[pulse] scoring bars for {s['symbol']} failed: {type(e).__name__}: {e}")

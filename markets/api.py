@@ -68,6 +68,20 @@ def portfolio_symbols():
         return _error(e, 500)
 
 
+@router.get("/portfolio/lot-advice")
+def portfolio_lot_advice(symbol: str = "", buy_price: str = ""):
+    """Empirically calibrated dip-entry spacing check & per-lot ATR swing exit targets (Q.10)."""
+    from . import lot_advisor
+    try:
+        portfolio.init_db()
+        bp = float(buy_price) if buy_price and buy_price.strip() else None
+        return {"status": "success", **lot_advisor.analyze_symbol(symbol, proposed_buy_price=bp)}
+    except ValueError as e:
+        return _error(e, 400)
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
 @router.get("/portfolio/chart")
 def portfolio_chart(symbol: str = "", range: str = "1d"):  # noqa: A002 - the page's parameter name
     try:
@@ -157,7 +171,7 @@ def pulse_scorecard():
     try:
         return {"status": "success", **pulse.scorecard()}
     except Exception as e:  # noqa: BLE001
-        return _error(e)
+        return _error(e, 500)
 
 
 @router.get("/advisor")
