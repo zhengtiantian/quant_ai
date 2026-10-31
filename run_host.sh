@@ -6,6 +6,8 @@ export LM_STUDIO_URL="http://127.0.0.1:1234/v1"
 export QUANT_API="http://localhost:18081"
 export KNOWLEDGE_PATHS="$(pwd)/knowledge"
 export PORT=18000
+# Home devices (iPad, phone) on the Wi-Fi reach /api/markets when signed in (markets/lan_auth.py, 2026-10-31)
+export MARKETS_LAN_ACCESS=1
 # R.3: rerank /api/ask/news answers (fused top-30, 256 tokens, ~1 s; see news_rag.py). The host
 # venv has torch via requirements-eval.txt; the Docker image does not, so it stays off there.
 export NEWS_RERANK="${NEWS_RERANK:-1}"

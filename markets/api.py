@@ -11,14 +11,19 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import backup, global_markets, portfolio
+from . import backup, global_markets, lan_auth, portfolio
 
 LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 
 
 def local_only(request: Request) -> None:
-    if not request.client or request.client.host not in LOOPBACK:
-        raise HTTPException(status_code=403, detail="markets data is only served to this machine")
+    """This machine; or a device on the home network that is signed in (lan_auth)."""
+    host = request.client.host if request.client else None
+    if host in LOOPBACK:
+        return
+    if lan_auth.allowed(host, request.headers.get("authorization"), request.cookies.get("qt_token")):
+        return
+    raise HTTPException(status_code=403, detail="markets data is only served to this machine and signed-in home devices")
 
 
 router = APIRouter(prefix="/api/markets", dependencies=[Depends(local_only)])
