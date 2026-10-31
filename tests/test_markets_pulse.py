@@ -74,6 +74,22 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(w.close, 100.0)
         self.assertIsNone(w.release)
 
+    def test_closing_cross_noise_is_not_the_release(self):
+        """STX 2026-10-27: +0.6% at 16:00:22 from the closing cross; the release moved it at 16:05."""
+        w = pulse.Watch("STX", 6, 700.0, 667.85, DAY, {}, predict=FakeModel())
+        w.step(at(15, 59), 667.85)
+        for t, p in [(at(16, 0, 22), 672.0), (at(16, 1, 34), 670.5), (at(16, 2, 59), 668.65), (at(16, 4, 52), 667.19),
+                     (at(16, 5, 15), 644.17)]:
+            w.step(t, p)
+        self.assertEqual(w.release, at(16, 5))
+
+    def test_a_large_move_right_after_the_close_is_the_release(self):
+        """INTC 2026-07-23 released at 16:00: +4.8% on the 16:00 bar."""
+        w = pulse.Watch("INTC", 10, None, 100.0, DAY, {}, predict=FakeModel())
+        w.step(at(15, 59), 100.0)
+        w.step(at(16, 0, 20), 104.8)
+        self.assertEqual(w.release, at(16, 0))
+
     def test_shares_split_by_the_policy_weights(self):
         self.assertEqual(pulse.shares_for(98.9, [1, 1, 1]), [10, 10, 9])           # 29 shares (30% of 98)
         self.assertEqual(pulse.shares_for(98.9, [0.6, 0.3, 0.1]), [17, 9, 3])

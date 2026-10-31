@@ -1,5 +1,5 @@
 import pytest
-from quant_ai.markets import task_monitor
+from markets import task_monitor
 
 
 def test_get_task_monitor_status():

@@ -68,6 +68,17 @@ def portfolio_symbols():
         return _error(e, 500)
 
 
+@router.get("/portfolio/daily-action")
+def portfolio_daily_action(force: str = ""):
+    """Today's action per holding through the risk gate (Q.12 / Q.13; a pilot on DAILY_ACTION_SYMBOLS)."""
+    from . import daily_action
+    try:
+        portfolio.init_db()
+        return {"status": "success", **daily_action.get(force=bool(force))}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
 @router.get("/portfolio/lot-advice")
 def portfolio_lot_advice(symbol: str = "", buy_price: str = ""):
     """Empirically calibrated dip-entry spacing check & per-lot ATR swing exit targets (Q.10)."""

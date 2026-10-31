@@ -8,7 +8,8 @@ runs it on report days:
 
   15:55 ET    a holding reports after the close today: the watch starts; the pre-release context
               (run-up, volatility, typical report move, news) comes from quant_data
-  every 5 s   the quote; the release minute is the first after 16:00 with a 0.5% move
+  every 5 s   the quote; the release minute is the first after 16:00 with a 0.5% move (2% in the
+              first three minutes, when closing-cross prints still move the quote)
   placements  1/3/5/10/20/30 min after the release, 5 min before the call: the model scores every
               step it could put in now (12 levels x 7 buy-back rules) for gain and downside and
               composes the plan (how many steps, which levels, what weights); the first plan that
@@ -41,6 +42,9 @@ QUANT_DATA = Path(os.getenv("QUANT_DATA_DIR", "/Users/xiz/Quant_trade/quant_data
 PREDICT = [str(QUANT_DATA / ".venv311" / "bin" / "python"), str(QUANT_DATA / "research" / "models" / "earnings_pulse.py"), "predict"]
 POLL = 5
 RELEASE_MOVE = 0.5                     # % from the close that marks the release minute (as in training)
+# Closing-cross and late prints move the quote up to ~1% in the first minutes after 16:00 (STX 2026-10-27:
+# +0.6% at 16:00:22, the release came at 16:05), so then only a larger move counts as the release.
+RELEASE_EARLY_MIN, RELEASE_EARLY_MOVE = 3, 2.0
 AFTER_RELEASE = (1, 3, 5, 10, 20, 30)
 DEFAULT_CALL = (17, 0)
 DEFAULT_CALL_BMO = (8, 30)             # a before-the-open report's call
@@ -141,7 +145,9 @@ class Watch:
             if self.session == "amc" and now < self._at(16, 0):
                 self.close = price                     # until the bell, the close is the last price
             self.ticks.append((now, price))
-            if self.release is None and now >= self.start() and abs(price / self.close - 1) * 100 >= RELEASE_MOVE:
+            early = self.session == "amc" and now < self.start() + timedelta(minutes=RELEASE_EARLY_MIN)
+            need = RELEASE_EARLY_MOVE if early else RELEASE_MOVE
+            if self.release is None and now >= self.start() and abs(price / self.close - 1) * 100 >= need:
                 self.release = now.replace(second=0, microsecond=0)
         if self.orders and (self.shadow_orders or not self.has_shadow):
             return None
