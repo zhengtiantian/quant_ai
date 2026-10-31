@@ -55,6 +55,12 @@ class GateTest(unittest.TestCase):
         g = risk_rules.gate({"symbol": "GOOGL", "side": "buy", "shares": 20, "limit": 300.0}, ex, held=3)
         self.assertEqual(g["shares"], 6)                            # 30% of 10,000 = 3,000; 2,000 of room left
 
+    def test_a_buy_keeps_the_cash_target(self):
+        ex = risk_rules.exposure({"holdings": [{"symbol": "GOOGL", "market_value": 9000.0}], "cash": 1500.0})
+        g = risk_rules.gate({"symbol": "AAPL", "side": "buy", "shares": 3, "limit": 200.0}, ex)
+        self.assertEqual(g["shares"], 2)                            # 10% of 10,500 stays: 450 to spend
+        self.assertTrue(any(b.startswith("Cash is 0.0%") for b in risk_rules.summary(risk_rules.exposure(state()))))
+
 
 class DailyActionTest(unittest.TestCase):
     def test_overweight_intc_is_trimmed_into_a_rebound_and_buys_are_blocked(self):
@@ -63,7 +69,9 @@ class DailyActionTest(unittest.TestCase):
         self.assertEqual(a["action"], "trim")
         self.assertEqual([(o["shares"], o["limit"]) for o in a["orders"]], [(23, 75.18), (22, 78.61)])   # +1.5 / +2 x ATR
         self.assertFalse(a["buy_allowed"])
-        self.assertTrue(any("Irish CGT" in r for r in a["reasons"]))           # the limits are below the average cost
+        self.assertFalse(any("CGT" in r or "tax" in r for r in a["reasons"]))  # the user asked for no tax notes
+        self.assertEqual(a["after"]["cash_pct"], 13.8)                          # 45 x 64.89 of 21,180
+        self.assertGreater(a["after"]["cluster_excess"], 0)                     # chips still above 70% after INTC
 
     def test_report_night_comes_first(self):
         st = state()
@@ -78,7 +86,7 @@ class DailyActionTest(unittest.TestCase):
         st["holdings"].append({"symbol": "MSFT", "quantity": 10, "avg_cost": 300, "market_value": 3000.0, "quote": {"price": 300.0}})
         a = daily_action.decide("INTC", st["holdings"][0], risk_rules.exposure(st), advice(stabilized=True, events=False))
         self.assertEqual(a["action"], "hold")
-        self.assertIn("Cash $0.00 buys 0 shares at $65.00", a["blocks"])
+        self.assertIn("Cash $0.00 buys 0 shares at $65.00 (keeping 10% in cash)", a["blocks"])
 
     def test_compute_keeps_the_answer_for_scoring(self):
         with tempfile.TemporaryDirectory() as d:

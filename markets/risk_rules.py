@@ -6,7 +6,8 @@ all, and how much of it. Its rules are fixed, not learned: with a few stocks and
 year there is not the data to learn them, and a cap is a choice, not a prediction.
 
   shares    a sale cannot exceed the whole shares held
-  cash      a buy needs the cash for its whole shares
+  cash      a buy needs the cash for its whole shares, and must leave MIN_CASH_PCT of the portfolio in
+            cash (with no cash the dip rules can never act)
   symbol    a buy may not take one stock above MAX_SYMBOL_PCT of the portfolio (holdings + cash);
             a holding above it is trimmed back to it (trim_shares)
   cluster   the same for the semiconductor / memory / storage names together, MAX_CLUSTER_PCT
@@ -15,7 +16,8 @@ year there is not the data to learn them, and a cap is a choice, not a predictio
   spacing   a buy sits at least MIN_SPACING_ATR x ATR below the cheapest open lot, EVENT_SPACING_ATR
             when a high-impact event is within 7 days (Q.10)
 
-The caps are placeholders until the user sets them (env RISK_MAX_SYMBOL_PCT / RISK_MAX_CLUSTER_PCT).
+Targets agreed with the user on 2026-10-31: 10% cash, chips / memory below 70%; the single-stock cap
+30% (env RISK_MAX_SYMBOL_PCT / RISK_MAX_CLUSTER_PCT / RISK_MIN_CASH_PCT).
 """
 
 import math
@@ -26,6 +28,7 @@ from .lot_advisor import SEMI_MEMORY_CLUSTER
 
 MAX_SYMBOL_PCT = float(os.getenv("RISK_MAX_SYMBOL_PCT", "30"))
 MAX_CLUSTER_PCT = float(os.getenv("RISK_MAX_CLUSTER_PCT", "70"))
+MIN_CASH_PCT = float(os.getenv("RISK_MIN_CASH_PCT", "10"))
 MIN_SPACING_ATR, EVENT_SPACING_ATR = 1.5, 2.0
 
 
@@ -36,8 +39,9 @@ def exposure(state: Dict[str, Any]) -> Dict[str, Any]:
     total = sum(mv.values()) + cash
     cluster = sum(v for s, v in mv.items() if s in SEMI_MEMORY_CLUSTER)
     pct = lambda v: round(v / total * 100, 1) if total > 0 else 0.0
-    return {"mv": mv, "cash": cash, "total": total, "weights": {s: pct(v) for s, v in mv.items()},
-            "cluster_mv": cluster, "cluster_pct": pct(cluster), "max_symbol_pct": MAX_SYMBOL_PCT, "max_cluster_pct": MAX_CLUSTER_PCT}
+    return {"mv": mv, "cash": cash, "total": total, "weights": {s: pct(v) for s, v in mv.items()}, "cash_pct": pct(cash),
+            "cluster_mv": cluster, "cluster_pct": pct(cluster), "max_symbol_pct": MAX_SYMBOL_PCT, "max_cluster_pct": MAX_CLUSTER_PCT,
+            "min_cash_pct": MIN_CASH_PCT}
 
 
 def trim_shares(quantity: float, mv: float, total: float, cap_pct: float = MAX_SYMBOL_PCT) -> int:
@@ -73,9 +77,10 @@ def gate(order: Dict[str, Any], ex: Dict[str, Any], held: float = 0.0, atr: Opti
     total, mv = ex["total"], ex["mv"].get(sym, 0.0)
     fits = shares
     if limit > 0:
-        fits = min(fits, int(ex["cash"] // limit))
+        spendable = ex["cash"] - MIN_CASH_PCT / 100 * total
+        fits = min(fits, max(0, int(spendable // limit)))
         if fits < shares:
-            notes.append(f"Cash ${ex['cash']:,.2f} buys {max(fits, 0)} shares at ${limit:.2f}")
+            notes.append(f"Cash ${ex['cash']:,.2f} buys {fits} shares at ${limit:.2f} (keeping {MIN_CASH_PCT:g}% in cash)")
         room = MAX_SYMBOL_PCT / 100 * total - mv
         if int(room // limit) < fits:
             fits = max(0, int(room // limit))
@@ -96,4 +101,6 @@ def summary(ex: Dict[str, Any]) -> List[str]:
            if w > MAX_SYMBOL_PCT]
     if ex["cluster_pct"] > MAX_CLUSTER_PCT:
         out.append(f"Chips / memory are {ex['cluster_pct']:.1f}% of the portfolio (cap {MAX_CLUSTER_PCT:g}%)")
+    if ex.get("cash_pct", 0.0) < MIN_CASH_PCT:
+        out.append(f"Cash is {ex.get('cash_pct', 0.0):.1f}% of the portfolio (target {MIN_CASH_PCT:g}%)")
     return out

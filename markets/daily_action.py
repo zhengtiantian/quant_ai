@@ -86,12 +86,11 @@ def decide(sym: str, holding: Dict[str, Any], ex: Dict[str, Any], advice: Dict[s
                               f"({n} shares over at today's price)")
         out["reasons"].append("Limits at +1.5 and +2 x ATR: after large drops (2023-2026) the high reached them within "
                               f"15 sessions in {REBOUND_HIT[1.5]}% and {REBOUND_HIT[2.0]}% of cases; selling at today's low is not needed")
-        avg = holding.get("avg_cost")
-        if avg and orders and max(o["limit"] for o in orders) < avg:
-            out["reasons"].append(f"Below your average cost (${avg:.2f}): a loss for tax; buying {sym} back within 4 weeks "
-                                  "restricts that loss under Irish CGT")
-        if ex["cluster_pct"] > risk_rules.MAX_CLUSTER_PCT:
-            out["reasons"].append(f"Chips / memory are {ex['cluster_pct']:.1f}% of the portfolio (cap {risk_rules.MAX_CLUSTER_PCT:g}%)")
+        out["after"] = after = _after_sales(sym, orders, ex, price)
+        out["reasons"].append(f"If both fill: cash {after['cash_pct']:.1f}% (target {risk_rules.MIN_CASH_PCT:g}%), "
+                              f"chips / memory {after['cluster_pct']:.1f}% (cap {risk_rules.MAX_CLUSTER_PCT:g}%)"
+                              + (f"; ${after['cluster_excess']:,.0f} more of chip names to sell to reach the cap"
+                                 if after["cluster_excess"] > 0 else ""))
         return out
 
     if out.get("buy_allowed"):
@@ -99,6 +98,16 @@ def decide(sym: str, holding: Dict[str, Any], ex: Dict[str, Any], advice: Dict[s
         return out
     out.update(action="hold", headline="Hold: no rule or tested signal calls for an order", evidence="default")
     return out
+
+
+def _after_sales(sym: str, orders: List[Dict[str, Any]], ex: Dict[str, Any], price: float) -> Dict[str, Any]:
+    """The portfolio once the trim limits fill, at today's prices (shares become cash; the total stays)."""
+    sold = sum(o["shares"] for o in orders) * price
+    total, cash = ex["total"], ex["cash"] + sold
+    cluster = ex["cluster_mv"] - (sold if sym in lot_advisor.SEMI_MEMORY_CLUSTER else 0.0)
+    pct = lambda v: round(v / total * 100, 1) if total > 0 else 0.0
+    return {"cash_pct": pct(cash), "cluster_pct": pct(cluster),
+            "cluster_excess": round(max(0.0, cluster - risk_rules.MAX_CLUSTER_PCT / 100 * total), 2)}
 
 
 def compute(path: Optional[Path] = None, state: Optional[Dict[str, Any]] = None,
@@ -119,8 +128,9 @@ def compute(path: Optional[Path] = None, state: Optional[Dict[str, Any]] = None,
             continue
         actions.append(decide(sym, h, ex, advice))
     out = {"generated_at": datetime.now(NY).isoformat(timespec="seconds"), "symbols": SYMBOLS, "actions": actions,
-           "portfolio": {"total": round(ex["total"], 2), "cash": ex["cash"], "cluster_pct": ex["cluster_pct"],
+           "portfolio": {"total": round(ex["total"], 2), "cash": ex["cash"], "cash_pct": ex["cash_pct"], "cluster_pct": ex["cluster_pct"],
                          "max_symbol_pct": risk_rules.MAX_SYMBOL_PCT, "max_cluster_pct": risk_rules.MAX_CLUSTER_PCT,
+                         "min_cash_pct": risk_rules.MIN_CASH_PCT,
                          "breaches": risk_rules.summary(ex)}}
     _keep(out, path)
     return out
