@@ -29,7 +29,7 @@ QUANT_DATA_ENV = Path(os.getenv("QUANT_DATA_ENV", "/Users/xiz/Quant_trade/quant_
 #   lag in weekdays for daily outputs, hours for the intraday news
 STAGES = [
     ("intraday news", "news_articles", "objectid", {"hours": 6}, "quant_intraday_news (every 30 min)"),
-    ("company match", "news_articles_company_matched_v2", "objectid", {"days": 2}, "backfill_1 company_match (02:00 UTC)"),
+    ("company match", "news_articles_company_matched_v2", "objectid", {"days": 2}, "backfill_1 company_match (04:00 UTC)"),
     ("prices", "stock_prices_history", "price", {"weekdays": 2}, "price_history_backfill / daily_price"),
     ("macro", "macro_indicators", "date", {"weekdays": 2}, "daily_signal_pipeline macro"),
     ("features", "daily_symbol_features", "trade_date", {"weekdays": 2}, "daily_signal_pipeline daily_features"),
