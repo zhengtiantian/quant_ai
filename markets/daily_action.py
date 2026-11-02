@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from . import lot_advisor, risk_rules
+from . import lot_advisor, optimizer, risk_rules
 from . import portfolio as pf
 from .config import DB_PATH
 
@@ -59,7 +59,8 @@ CACHE_SECONDS = 600
 _cache: Dict[str, Any] = {"at": 0.0, "out": None}
 
 
-def decide(sym: str, holding: Dict[str, Any], ex: Dict[str, Any], advice: Dict[str, Any]) -> Dict[str, Any]:
+def decide(sym: str, holding: Dict[str, Any], ex: Dict[str, Any], advice: Dict[str, Any],
+           plan: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One holding's action from its position, the portfolio's exposure and the Q.10 analysis."""
     stats = advice.get("stats") or {}
     price = float((holding.get("quote") or {}).get("price") or 0.0) or None
@@ -86,7 +87,9 @@ def decide(sym: str, holding: Dict[str, Any], ex: Dict[str, Any], advice: Dict[s
         out["reasons"].append(reports[0].get("title", "Earnings"))
         return out
 
-    n = risk_rules.trim_shares(qty, ex["mv"].get(sym, 0.0), ex["total"])
+    n_cap = risk_rules.trim_shares(qty, ex["mv"].get(sym, 0.0), ex["total"])
+    planned = ((plan or {}).get("sell") or {}).get(sym) or {}
+    n = max(n_cap, min(int(math.floor(qty)), planned.get("shares") or 0))   # the risk plan may sell more for the cluster / cash
     if n > 0 and price and atr:
         cause = drop_cause(stats.get("big_drop"))
         rates = REBOUND.get(cause or "", {})
@@ -103,7 +106,16 @@ def decide(sym: str, holding: Dict[str, Any], ex: Dict[str, Any], advice: Dict[s
                             + ", ".join(f"{o['shares']} @ ${o['limit']:.2f}" for o in orders),
                    evidence="rule (symbol cap) + reach rates by drop cause" if cause else "rule (symbol cap)")
         out["reasons"].append(f"{sym} is {weight:.1f}% of the portfolio; the cap is {risk_rules.MAX_SYMBOL_PCT:g}% "
-                              f"({n} shares over at today's price)")
+                              f"({n_cap} shares over at today's price)")
+        if plan and plan.get("sell"):
+            parts = ", ".join(f"{s} ${r['usd']:,.0f}" for s, r in sorted(plan["sell"].items(), key=lambda kv: -kv[1]["usd"]))
+            vol = (f"; portfolio volatility {plan['vol_before_pct']}% -> {plan['vol_after_pct']}% a year"
+                   if plan.get("vol_before_pct") is not None else "")
+            out["reasons"].append(
+                f"Risk plan for every cap (chips / memory {risk_rules.MAX_CLUSTER_PCT:g}%, cash {risk_rules.MIN_CASH_PCT:g}%): sell "
+                f"${plan['total_usd']:,.0f} in all: {parts}. Beyond each stock's own excess, each dollar comes from the holding "
+                f"whose sale lowers the portfolio's variance most (6-month covariance); no return forecast is used{vol}")
+            out["evidence"] += " + risk plan"
         if cause:
             out["reasons"].append(
                 f"Limits at +1.5 and +2 x ATR: after {rates['label']} (102 stocks, 2016-2026, {rates['n']} cases) the high "
@@ -152,9 +164,15 @@ def _after_sales(sym: str, orders: List[Dict[str, Any]], ex: Dict[str, Any], pri
 
 
 def compute(path: Optional[Path] = None, state: Optional[Dict[str, Any]] = None,
-            analyze: Callable[..., Dict[str, Any]] = lot_advisor.analyze_symbol) -> Dict[str, Any]:
+            analyze: Callable[..., Dict[str, Any]] = lot_advisor.analyze_symbol,
+            plan_fn: Optional[Callable[..., Dict[str, Any]]] = None) -> Dict[str, Any]:
+    plan_fn = plan_fn or optimizer.build
     st = state if state is not None else pf.get_state(path=path, cached_quotes=True)
     ex = risk_rules.exposure(st)
+    try:
+        plan = plan_fn(st, ex, path=path)
+    except Exception:  # noqa: BLE001 - without a plan the symbol cap alone sizes the trim
+        plan = None
     actions = []
     for sym in SYMBOLS:
         h = next((x for x in st.get("holdings") or [] if x["symbol"] == sym), None)
@@ -170,12 +188,12 @@ def compute(path: Optional[Path] = None, state: Optional[Dict[str, Any]] = None,
         drop = (advice.get("stats") or {}).get("big_drop")
         if drop and "earnings" not in drop:
             drop["earnings"] = reported_into(sym, drop, path)
-        actions.append(decide(sym, h, ex, advice))
+        actions.append(decide(sym, h, ex, advice, plan))
     out = {"generated_at": datetime.now(NY).isoformat(timespec="seconds"), "symbols": SYMBOLS, "actions": actions,
            "portfolio": {"total": round(ex["total"], 2), "cash": ex["cash"], "cash_pct": ex["cash_pct"], "cluster_pct": ex["cluster_pct"],
                          "max_symbol_pct": risk_rules.MAX_SYMBOL_PCT, "max_cluster_pct": risk_rules.MAX_CLUSTER_PCT,
                          "min_cash_pct": risk_rules.MIN_CASH_PCT,
-                         "breaches": risk_rules.summary(ex)}}
+                         "breaches": risk_rules.summary(ex), "plan": plan}}
     _keep(out, path)
     return out
 

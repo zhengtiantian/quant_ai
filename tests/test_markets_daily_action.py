@@ -101,6 +101,16 @@ class DailyActionTest(unittest.TestCase):
         with mock.patch("markets.events.earnings_on", side_effect=RuntimeError("down")):
             self.assertIsNone(daily_action.reported_into("INTC", drop))
 
+    def test_risk_plan_can_size_the_trim_above_the_symbol_cap(self):
+        st = state()
+        plan = {"sell": {"INTC": {"usd": 4000.0, "shares": 62}, "SKHY": {"usd": 600.0, "shares": 4}}, "total_usd": 4600.0,
+                "vol_before_pct": 60.1, "vol_after_pct": 52.3}
+        a = daily_action.decide("INTC", st["holdings"][0], risk_rules.exposure(st), advice(), plan)
+        self.assertEqual(sum(o["shares"] for o in a["orders"]), 62)              # the cap alone: 45
+        self.assertIn("45 shares over", a["reasons"][0])
+        self.assertTrue(any(r.startswith("Risk plan for every cap") and "INTC $4,000, SKHY $600" in r for r in a["reasons"]))
+        self.assertTrue(a["evidence"].endswith("+ risk plan"))
+
     def test_report_night_comes_first(self):
         st = state()
         a = daily_action.decide("INTC", st["holdings"][0], risk_rules.exposure(st), advice(report=True))
@@ -119,7 +129,8 @@ class DailyActionTest(unittest.TestCase):
     def test_compute_keeps_the_answer_for_scoring(self):
         with tempfile.TemporaryDirectory() as d:
             db = Path(d) / "m.db"
-            out = daily_action.compute(path=db, state=state(), analyze=lambda s, path=None, state=None: advice())
+            out = daily_action.compute(path=db, state=state(), analyze=lambda s, path=None, state=None: advice(),
+                                       plan_fn=lambda st, ex, path=None: None)
             self.assertEqual(out["actions"][0]["action"], "trim")
             import sqlite3
             rows = sqlite3.connect(db).execute("SELECT symbol, action FROM daily_actions").fetchall()
