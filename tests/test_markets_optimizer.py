@@ -35,6 +35,27 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(max(p["sell"], key=lambda s: p["sell"][s]["usd"]), "GOOGL")   # the largest first without covariance
         self.assertFalse(p["risk_model"])
 
+    def test_loss_budget_after_the_caps(self):
+        e = ex({"GOOGL": 2500.0, "AAPL": 2500.0, "MSFT": 2500.0, "INTC": 1000.0}, cash=1500.0)   # within every cap
+        day = np.diag([0.02, 0.02, 0.02, 0.05]) ** 2                                           # daily sd 2% / 5%
+        p = optimizer.plan(e, {"GOOGL": 300.0, "AAPL": 200.0, "MSFT": 400.0, "INTC": 60.0}, None, day, budget_usd=100.0)
+        self.assertGreater(p["bad_day_loss_before"], 100.0)
+        self.assertLessEqual(p["bad_day_loss_after"], 100.0)
+        self.assertGreater(p["total_usd"], 0)
+        p0 = optimizer.plan(e, {}, None, day, budget_usd=None)
+        self.assertEqual(p0["sell"], {})
+
+    def test_shares_never_exceed_the_holding(self):
+        e = ex({"SKHY": 6763.0, "GOOGL": 237.0})                                  # 45.1 shares at 149.95
+        day = np.diag([0.08, 0.01]) ** 2
+        px = {"SKHY": 149.95, "GOOGL": 237.0}
+        p = optimizer.plan(e, px, None, day, budget_usd=10.0)                    # stops with ~$75 of SKHY left
+        self.assertFalse(p["sell"]["SKHY"]["all"])
+        self.assertLessEqual(p["sell"]["SKHY"]["shares"], 45)
+        p = optimizer.plan(e, px, None, day, budget_usd=0.001)                   # nothing may stay: the exact fraction
+        self.assertTrue(p["sell"]["SKHY"]["all"])
+        self.assertAlmostEqual(p["sell"]["SKHY"]["shares"], 6763.0 / 149.95, places=3)
+
     def test_within_every_cap_sells_nothing(self):
         e = ex({"GOOGL": 2500.0, "AAPL": 2500.0, "MSFT": 2500.0, "INTC": 1000.0}, cash=1500.0)
         self.assertEqual(optimizer.plan(e, {}, None)["sell"], {})

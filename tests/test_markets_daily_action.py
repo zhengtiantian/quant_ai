@@ -1,4 +1,5 @@
 """Risk gate (Q.12) and today's action (Q.13). No network: the state and the Q.10 analysis are given."""
+import math
 import os
 import sys
 import tempfile
@@ -108,13 +109,52 @@ class DailyActionTest(unittest.TestCase):
         a = daily_action.decide("INTC", st["holdings"][0], risk_rules.exposure(st), advice(), plan)
         self.assertEqual(sum(o["shares"] for o in a["orders"]), 62)              # the cap alone: 45
         self.assertIn("45 shares over", a["reasons"][0])
-        self.assertTrue(any(r.startswith("Risk plan for every cap") and "INTC $4,000, SKHY $600" in r for r in a["reasons"]))
+        self.assertTrue(any(r.startswith("Risk plan: sell $4,600") and "INTC $4,000, SKHY $600" in r for r in a["reasons"]))
         self.assertTrue(a["evidence"].endswith("+ risk plan"))
 
-    def test_report_night_comes_first(self):
+    def test_report_night_comes_first_and_is_sized_to_the_loss_budget(self):
         st = state()
-        a = daily_action.decide("INTC", st["holdings"][0], risk_rules.exposure(st), advice(report=True))
+        ex = risk_rules.exposure(st)
+        straddle = lambda sym, d, px: {"implied_move_pct": 9.0, "expiry": "2026-10-31"}       # 9% straddle -> 7.6% typical
+        a = daily_action.decide("INTC", st["holdings"][0], ex, advice(report=True), implied_fn=straddle)
+        self.assertEqual(a["action"], "earnings")
+        self.assertAlmostEqual(a["event"]["loss_pct"], 20.0, delta=0.1)                      # 2.635 x 7.6%
+        keep = daily_action.risk_budget.BUDGET_PCT / 100 * ex["total"] / 0.20
+        self.assertEqual(a["orders"][0]["shares"], math.ceil((ex["mv"]["INTC"] - keep) / 64.89))
+        self.assertTrue(a["orders"][0]["before_report"])
+        self.assertIn("over the", a["headline"])
+        small = state(intc_qty=5)                                                              # within the budget: hold through
+        a = daily_action.decide("INTC", small["holdings"][0], risk_rules.exposure(small), advice(report=True), implied_fn=straddle)
         self.assertEqual((a["action"], a["orders"]), ("earnings", []))
+
+    def test_every_line_in_english_and_chinese(self):
+        st = state()
+        plan = {"sell": {"INTC": {"usd": 4000.0, "shares": 62}}, "total_usd": 4000.0, "vol_before_pct": 60.1, "vol_after_pct": 52.3,
+                "bad_day_loss_before": 1500.0, "bad_day_loss_after": 600.0}
+        drop = {"date": "2026-10-30", "prev_date": "2026-10-29", "sessions_ago": 0, "drop_atr": 5.1, "earnings": True}
+        a = daily_action.decide("INTC", st["holdings"][0], risk_rules.exposure(st), advice(big_drop=drop), plan, None,
+                                implied_fn=lambda *x: None)
+        self.assertTrue(a["headline_zh"].startswith("等反弹减仓 62 股"))
+        self.assertTrue(all(n["en"] and n["zh"] and n["zh"] != n["en"] for n in a["notes"]))
+        self.assertGreaterEqual(sum(n["key"] for n in a["notes"]), 3)
+        self.assertLess(sum(n["key"] for n in a["notes"]), len(a["notes"]))     # some lines wait under "more"
+        self.assertEqual(a["orders"][0]["text"]["zh"], "卖 31 股 @ $75.18 · 历史成交率 39%")
+        self.assertEqual(a["evidence_zh"], "规则（单只上限） + 按下跌原因的成交率 + 风险计划")
+        self.assertIn("大跌后尚未企稳，暂不买入", a["blocks_zh"])
+
+    def test_every_action_ends_with_budget_and_market(self):
+        st = state()
+        plan = {"sell": {}, "total_usd": 0.0, "bad_day_loss_before": 1500.0, "bad_day_loss_after": 600.0}
+        market = {"state": "tense", "label": "VIX in its top 20% of the year", "vix": 22.0, "vix_pctile": 0.85, "spy_5d_pct": -1.2,
+                  "n": 152, "up5": 61, "mean5": 0.37, "p10_5": -3.9}
+        adv = advice()
+        adv["catalysts_7d"].append({"title": "US Midterm Elections", "impact": "high", "bucket": "macro", "category": "macro", "days_away": 1})
+        a = daily_action.decide("INTC", st["holdings"][0], risk_rules.exposure(st), adv, plan, market, implied_fn=lambda *x: None)
+        text = " | ".join(a["reasons"])
+        self.assertIn("a 1-in-20 bad day would lose $1,500", text)
+        self.assertIn("after the plan's sales $600", text)
+        self.assertIn("Market: VIX in its top 20% of the year", text)
+        self.assertIn("5 US election days", text)
 
     def test_hold_when_within_the_caps(self):
         st = {"holdings": [{"symbol": "INTC", "quantity": 10, "avg_cost": 80, "market_value": 650.0, "quote": {"price": 65.0}},
@@ -130,7 +170,8 @@ class DailyActionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             db = Path(d) / "m.db"
             out = daily_action.compute(path=db, state=state(), analyze=lambda s, path=None, state=None: advice(),
-                                       plan_fn=lambda st, ex, path=None: None)
+                                       plan_fn=lambda st, ex, path=None: None, market_fn=lambda path=None: None,
+                                       model_fn=lambda *a, **k: None)
             self.assertEqual(out["actions"][0]["action"], "trim")
             import sqlite3
             rows = sqlite3.connect(db).execute("SELECT symbol, action FROM daily_actions").fetchall()

@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 
 from . import portfolio as pf
+from . import risk_budget
 from .lot_advisor import SEMI_MEMORY_CLUSTER
 from .risk_rules import MAX_CLUSTER_PCT, MAX_SYMBOL_PCT, MIN_CASH_PCT
 
@@ -47,8 +48,10 @@ def covariance(symbols: List[str], chart_fn: Optional[Callable] = None, path=Non
     return (1 - SHRINK) * cov + SHRINK * np.diag(np.diag(cov))
 
 
-def plan(ex: Dict[str, Any], prices: Dict[str, float], cov: Optional[np.ndarray]) -> Dict[str, Any]:
-    """Dollars (and whole shares) to sell per holding so every cap holds, chosen by risk."""
+def plan(ex: Dict[str, Any], prices: Dict[str, float], cov: Optional[np.ndarray],
+         day_cov: Optional[np.ndarray] = None, budget_usd: Optional[float] = None) -> Dict[str, Any]:
+    """Dollars (and whole shares) to sell per holding so every cap holds, chosen by risk; then, with a
+    daily covariance and a budget, until a 1-in-20 bad day loses no more than the budget."""
     syms = list(ex["mv"])
     v = np.array([ex["mv"][s] for s in syms], float)
     total, cash = float(ex["total"]), float(ex["cash"])
@@ -83,6 +86,16 @@ def plan(ex: Dict[str, Any], prices: Dict[str, float], cov: Optional[np.ndarray]
             if i is None:
                 break
             sell[i] += min(STEP_USD, need(), v[i] - sell[i])
+    loss_before = risk_budget.day_loss(v, day_cov)
+    if day_cov is not None and budget_usd:
+        # 3. the loss budget: each step from the holding whose sale cuts the bad-day loss most
+        while (risk_budget.day_loss(v - sell, day_cov) or 0.0) > budget_usd:
+            held = v - sell
+            left = held > 1e-6
+            if not left.any():
+                break
+            i = int(np.argmax(np.where(left, day_cov @ held, -np.inf)))
+            sell[i] += min(STEP_USD, held[i])
 
     held_after = v - sell
     vol = lambda h: math.sqrt(variance(h)) / total * 100 if cov is not None and total > 0 else None
@@ -90,13 +103,19 @@ def plan(ex: Dict[str, Any], prices: Dict[str, float], cov: Optional[np.ndarray]
     for i, s in enumerate(syms):
         if sell[i] > 0.5:
             px = prices.get(s) or 0.0
-            rows[s] = {"usd": round(float(sell[i]), 2), "shares": int(math.ceil(sell[i] / px)) if px > 0 else None,
+            whole = sell[i] >= v[i] - 1.0                      # the whole holding: its exact (fractional) quantity
+            shares = (round(v[i] / px, 4) if whole else min(int(math.ceil(sell[i] / px)), int(math.floor(v[i] / px + 1e-9)))) if px > 0 else None
+            rows[s] = {"usd": round(float(sell[i]), 2), "shares": shares, "all": bool(whole),
                        "weight_before": round(v[i] / total * 100, 1), "weight_after": round(held_after[i] / total * 100, 1)}
     contrib = {}
     if cov is not None and variance(v) > 0:
         rc = v * (cov @ v) / variance(v) * 100
         contrib = {s: round(float(rc[i]), 1) for i, s in enumerate(syms)}
+    loss_after = risk_budget.day_loss(held_after, day_cov)
     return {"sell": rows, "total_usd": round(float(sell.sum()), 2), "risk_model": cov is not None,
+            "budget_usd": None if not budget_usd else round(budget_usd, 2),
+            "bad_day_loss_before": None if loss_before is None else round(loss_before, 2),
+            "bad_day_loss_after": None if loss_after is None else round(loss_after, 2),
             "vol_before_pct": None if vol(v) is None else round(vol(v), 1),
             "vol_after_pct": None if vol(held_after) is None else round(vol(held_after), 1),
             "risk_share_before": contrib,
@@ -109,7 +128,8 @@ def build(state: Dict[str, Any], ex: Dict[str, Any], chart_fn: Optional[Callable
     syms = [s for s in ex["mv"] if ex["mv"][s] > 0]
     try:
         cov = covariance(syms, chart_fn, path) if syms else None
+        day_cov = risk_budget.ewma_cov(syms, chart_fn, path) if syms else None
     except Exception:  # noqa: BLE001 - no bars: the plan falls back to selling the largest first
-        cov = None
+        cov = day_cov = None
     sub = {**ex, "mv": {s: ex["mv"][s] for s in syms}}
-    return plan(sub, prices, cov)
+    return plan(sub, prices, cov, day_cov, risk_budget.BUDGET_PCT / 100 * ex["total"])

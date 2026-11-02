@@ -56,24 +56,27 @@ def gate(order: Dict[str, Any], ex: Dict[str, Any], held: float = 0.0, atr: Opti
     """order {symbol, side, shares, limit}. Returns the order as the portfolio can take it: allowed,
     shares (possibly fewer), blocked_by (rule codes) and notes (one line each, shown to the user)."""
     sym, side, limit = order["symbol"], order["side"], float(order["limit"])
-    shares, blocked, notes = int(order["shares"]), [], []
+    shares, blocked, notes, notes_zh = int(order["shares"]), [], [], []   # notes_zh: the same lines in Chinese
     if side == "sell":
         if shares > math.floor(held):
             shares = int(math.floor(held))
             notes.append(f"Only {shares} whole shares held")
+            notes_zh.append(f"只持有 {shares} 整股")
         if shares <= 0:
             blocked.append("shares")
-        return {**order, "shares": shares, "allowed": not blocked, "blocked_by": blocked, "notes": notes}
+        return {**order, "shares": shares, "allowed": not blocked, "blocked_by": blocked, "notes": notes, "notes_zh": notes_zh}
 
     if stabilized is False:
         blocked.append("falling")
         notes.append("Not stabilised after a large drop: no buys yet")
+        notes_zh.append("大跌后尚未企稳，暂不买入")
     if atr and lowest_lot:
         need = EVENT_SPACING_ATR if event_7d else MIN_SPACING_ATR
         ceiling = round(lowest_lot - need * atr, 2)
         if limit > ceiling:
             blocked.append("spacing")
             notes.append(f"Too close to your cheapest lot (${lowest_lot:.2f}): buy at ${ceiling:.2f} or lower ({need:g} x ATR)")
+            notes_zh.append(f"离你最便宜的一批（${lowest_lot:.2f}）太近：${ceiling:.2f} 或更低才买（{need:g} 倍 ATR）")
     total, mv = ex["total"], ex["mv"].get(sym, 0.0)
     fits = shares
     if limit > 0:
@@ -81,18 +84,21 @@ def gate(order: Dict[str, Any], ex: Dict[str, Any], held: float = 0.0, atr: Opti
         fits = min(fits, max(0, int(spendable // limit)))
         if fits < shares:
             notes.append(f"Cash ${ex['cash']:,.2f} buys {fits} shares at ${limit:.2f} (keeping {MIN_CASH_PCT:g}% in cash)")
+            notes_zh.append(f"现金 ${ex['cash']:,.2f}，在 ${limit:.2f} 只能买 {fits} 股（保留 {MIN_CASH_PCT:g}% 现金）")
         room = MAX_SYMBOL_PCT / 100 * total - mv
         if int(room // limit) < fits:
             fits = max(0, int(room // limit))
             notes.append(f"{sym} is {ex['weights'].get(sym, 0):.1f}% of the portfolio (cap {MAX_SYMBOL_PCT:g}%)")
+            notes_zh.append(f"{sym} 占组合 {ex['weights'].get(sym, 0):.1f}%（上限 {MAX_SYMBOL_PCT:g}%）")
         if sym in SEMI_MEMORY_CLUSTER:
             room_c = MAX_CLUSTER_PCT / 100 * total - ex["cluster_mv"]
             if int(room_c // limit) < fits:
                 fits = max(0, int(room_c // limit))
                 notes.append(f"Chips / memory are {ex['cluster_pct']:.1f}% of the portfolio (cap {MAX_CLUSTER_PCT:g}%)")
+                notes_zh.append(f"芯片 / 存储类占组合 {ex['cluster_pct']:.1f}%（上限 {MAX_CLUSTER_PCT:g}%）")
     if fits <= 0:
         blocked.append("size")
-    return {**order, "shares": max(fits, 0), "allowed": not blocked, "blocked_by": blocked, "notes": notes}
+    return {**order, "shares": max(fits, 0), "allowed": not blocked, "blocked_by": blocked, "notes": notes, "notes_zh": notes_zh}
 
 
 def summary(ex: Dict[str, Any]) -> List[str]:
