@@ -114,6 +114,7 @@ def _bar_stats(
 
     return {
         "bars": len(done),
+        "big_drop": _last_big_drop(done),
         "atr14": round(atr14, 4),
         "atr14_pct": round(atr14 / ref_px * 100.0, 2) if ref_px > 0 else None,
         "rsi14": _compute_rsi14(closes[:-1] + [ref_px] if same_bar else closes + [ref_px]),
@@ -124,6 +125,25 @@ def _bar_stats(
         "drop_3d_atr": round(drop_3d_atr, 2),
         "stabilized": stabilized,
     }
+
+
+BIG_DROP_ATR = 2.0
+BIG_DROP_LOOKBACK = 5        # completed sessions
+
+
+def _last_big_drop(done: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The latest close-to-close drop of >= 2 x ATR14 (ATR as of the session before) in the last five
+    completed sessions: the event the reach rates in daily_action were measured on
+    (quant_data research/models/drop_rebound.py)."""
+    for j in range(len(done) - 1, max(15, len(done) - BIG_DROP_LOOKBACK) - 1, -1):
+        trs = [max(c["high"] - c["low"], abs(c["high"] - p["close"]), abs(c["low"] - p["close"]))
+               for p, c in zip(done[j - 15:j - 1], done[j - 14:j])]
+        atr = sum(trs) / len(trs)
+        drop_atr = (float(done[j - 1]["close"]) - float(done[j]["close"])) / atr if atr > 0 else 0.0
+        if drop_atr >= BIG_DROP_ATR:
+            return {"date": done[j].get("time"), "prev_date": done[j - 1].get("time"),
+                    "sessions_ago": len(done) - 1 - j, "drop_atr": round(drop_atr, 2)}
+    return None
 
 
 def _upcoming_7d_catalysts(

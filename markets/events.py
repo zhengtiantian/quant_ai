@@ -96,13 +96,16 @@ def earnings_on(d: date, path: Optional[Path] = None) -> List[Dict[str, Any]]:
 
 
 def econ_on(d: date, path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    # Nasdaq's economic calendar lists under ?date=D the releases of the day before: Wednesday's
+    # MBA data under Thursday, Thursday's jobless claims under Friday, Friday's payrolls under
+    # Saturday (checked 2026-10-02..11-06). So day d is asked for as d + 1 (2026-11-02).
     def fetch():
-        rows = ((pf._get_json(ECON_URL.format(d=d.isoformat())).get("data") or {}).get("rows")) or []
+        rows = ((pf._get_json(ECON_URL.format(d=(d + timedelta(days=1)).isoformat())).get("data") or {}).get("rows")) or []
         clean = lambda v: (str(v or "").replace("&nbsp;", "").strip() or None)
         return [{"gmt": r.get("gmt"), "country": r.get("country"), "event": r.get("eventName"),
                  "consensus": clean(r.get("consensus")), "previous": clean(r.get("previous")), "actual": clean(r.get("actual"))}
                 for r in rows]
-    return _cache(path, f"econ:{d.isoformat()}", fetch)
+    return _cache(path, f"econ1:{d.isoformat()}", fetch)   # new key: entries cached under the old one are a day off
 
 
 def implied_move(symbol: str, on: date, price: Optional[float]) -> Optional[Dict[str, Any]]:

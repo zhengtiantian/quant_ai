@@ -65,7 +65,8 @@
 <script>
 // Reads state (the portfolio cut down for this page, see markets/mobile.py) and re-reads it as often
 // as the server asks (refresh_seconds: 5 s in trading hours; 60 s otherwise), only while the page is
-// visible. The last reply is kept in localStorage and shown marked offline when quant_ai is not reachable.
+// visible, and again whenever it comes back to the front. The last reply is kept in localStorage and
+// shown marked offline when quant_ai is not reachable.
 const SESSION = { pre: ["Pre-market", "#f59e0b"], regular: ["Open", "#10b981"], post: ["After hours", "#a855f7"], closed: ["Closed", "#94a3b8"] };
 const SESSION_TAG = { pre: "pre", regular: "open", post: "after", closed: "closed" };
 const SESSION_HOURS = { pre: "04:00–09:30", regular: "09:30–16:00", post: "16:00–20:00", closed: "pre 04:00" };
@@ -212,24 +213,43 @@ function render(d, offline) {
     </div>`;
 }
 
-let timer = null;
+// One read at a time, each given up after FETCH_TIMEOUT_MS: a request left hanging when the phone
+// locked or the network dropped would otherwise stop the refresh loop for good.
+const FETCH_TIMEOUT_MS = 10000;
+let timer = null, inflight = null, startedAt = 0, nextWait = 60;
 async function load() {
   clearTimeout(timer);
+  if (inflight) inflight.abort();                     // a newer read replaces the one in flight
+  const ctl = new AbortController();
+  inflight = ctl; startedAt = Date.now();
+  const kill = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
   let wait = 30;
   try {
-    const r = await fetch("state", { cache: "no-store" });
+    const r = await fetch("state", { cache: "no-store", signal: ctl.signal });
     const d = await r.json();
+    if (ctl !== inflight) return;
     if (d.status !== "success") throw new Error(d.message || "error");
     render(d, false);
     try { localStorage.setItem(KEY, JSON.stringify(d)); } catch (e) {}
     wait = Math.max(5, d.refresh_seconds || 60);
   } catch (e) {
+    if (ctl !== inflight) return;                     // replaced by a newer read: that one renders
     let last = null;
     try { last = JSON.parse(localStorage.getItem(KEY)); } catch (e2) {}
     render(last, true);
+  } finally {
+    clearTimeout(kill);
   }
+  inflight = null; nextWait = wait;
   if (!document.hidden) timer = setTimeout(load, wait * 1000);
 }
+// Back in front: iOS does not always send visibilitychange when a home-screen page is reopened,
+// so pageshow, focus and online read again too; a read already under way for a moment is kept.
+const wake = () => {
+  if (document.hidden) return;
+  if (inflight && Date.now() - startedAt < 3000) return;
+  load();
+};
 // Taps on a country (or "Expand all") re-render from the last reply at once, without a fetch.
 document.getElementById("card").addEventListener("click", (ev) => {
   const top = ev.target.closest("[data-country]"), all = ev.target.closest("[data-toggle-all]");
@@ -245,7 +265,10 @@ document.getElementById("card").addEventListener("click", (ev) => {
   saveOpen();
   if (lastData) render(lastData, lastOffline);
 });
-document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); else clearTimeout(timer); });
+document.addEventListener("visibilitychange", () => { if (document.hidden) clearTimeout(timer); else wake(); });
+["pageshow", "focus", "online"].forEach((ev) => window.addEventListener(ev, wake));
+// Watchdog: timers can be dropped while the page is suspended; read again once two intervals pass.
+setInterval(() => { if (!document.hidden && !inflight && Date.now() - startedAt > 2 * nextWait * 1000) load(); }, 15000);
 load();
 </script>
 </body>

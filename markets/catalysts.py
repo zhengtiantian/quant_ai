@@ -66,17 +66,40 @@ RSS_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
 }
 
+# Every Form 8-K item, so the extraction model reads what an item is instead of guessing from its
+# number (2026-11-02: an Item 2.03 debt issue had been described as a merger agreement).
 SEC_ITEM_LABELS = {
     "1.01": "Material Definitive Agreement (重大协议)",
-    "1.02": "Termination of Material Agreement",
+    "1.02": "Termination of Material Agreement (终止重大协议)",
+    "1.03": "Bankruptcy or Receivership (破产/接管)",
+    "1.05": "Material Cybersecurity Incident (重大网络安全事件)",
     "2.01": "Acquisition or Disposition of Assets (资产并购/处置)",
-    "2.02": "Results of Operations & Financial Condition",
+    "2.02": "Results of Operations & Financial Condition (经营业绩)",
+    "2.03": "Direct Financial Obligation: debt issued or borrowed (发债/新增借款)",
+    "2.04": "Financial Obligation Accelerated (债务加速到期)",
     "2.05": "Restructuring / Cost Exit Activities (重组/裁员计划)",
-    "3.01": "Listing / Delisting Notice",
+    "2.06": "Material Impairment (重大资产减值)",
+    "3.01": "Listing / Delisting Notice (上市/退市通知)",
+    "3.02": "Unregistered Sale of Equity (非公开发行股份)",
+    "3.03": "Change to Security Holders' Rights (证券持有人权利变更)",
+    "4.01": "Change of Auditor (更换审计师)",
+    "4.02": "Prior Financial Statements Not Reliable (财报重述)",
+    "5.01": "Change in Control (控制权变更)",
     "5.02": "Executive / Board Change (高管或董事变动)",
+    "5.03": "Bylaws or Charter Amendment (章程修订)",
+    "5.07": "Shareholder Vote Results (股东投票结果)",
     "7.01": "Regulation FD Disclosure / Investor Update (投资者披露/指引)",
     "8.01": "Other Material Events (重大事项公告)",
 }
+# Securities class-action solicitations ("Lead Plaintiff Deadline", "Investors who lost money"):
+# a law firm's advert, not an event that moves the stock.
+LAW_FIRM_AD_RE = re.compile(
+    r"lead plaintiff|class action|securities fraud|investors? who (?:lost|purchased)|shareholder alert|investor alert|"
+    r"reminds (?:investors|shareholders)|encourages .*(?:investors|shareholders)|deadline alert|"
+    r"rosen law|pomerantz|levi & korsinsky|bragar eagel|glancy prongay|faruqi|bronstein|kessler topaz|"
+    r"robbins geller|sueWallSt|claimsfiler|schall law|portnoy law|gainey mckenna|howard g\. smith|kirby mcinerney",
+    re.I,
+)
 
 # Authoritative US macro, central bank & market-structure schedule (covers full 30-120d horizon).
 OFFICIAL_MACRO_SCHEDULE: List[Dict[str, Any]] = [
@@ -548,14 +571,11 @@ def fetch_sec_recent_filings(symbol: str, cik_map: Dict[str, str], since_days: i
                 if acc_clean and doc_name
                 else f"https://www.sec.gov/edgar/browse/?CIK={cik}"
             )
-            labels = [SEC_ITEM_LABELS.get(c, f"Item {c}") for c in item_codes if c != "9.01"]
-            desc = "; ".join(labels) if labels else ("Foreign Issuer Report (6-K)" if f == "6-K" else "Current Report (8-K)")
             out.append({
                 "symbol": sym,
                 "form": f,
                 "date": fdate,
                 "items": item_codes,
-                "title": f"{sym} SEC {f} Filing: {desc}",
                 "url": filing_url,
                 "source": "SEC EDGAR",
             })
@@ -568,7 +588,18 @@ def fetch_sec_recent_filings(symbol: str, cik_map: Dict[str, str], since_days: i
     except Exception:  # noqa: BLE001
         return []
     cutoff = (_us_today() - timedelta(days=since_days)).isoformat()
-    return [r for r in rows if (r.get("date") or "") >= cutoff]
+    # The title is built from the item codes on every read, so a cached filing picks up new labels.
+    return [{**r, "title": f"{sym} SEC {r.get('form')} Filing: {sec_text(r.get('form') or '', r.get('items') or [])[0]}"}
+            for r in rows if (r.get("date") or "") >= cutoff]
+
+
+def sec_text(form: str, items: List[str]) -> Tuple[str, str]:
+    """(English, Chinese) description of a filing from its item codes alone."""
+    labels = [SEC_ITEM_LABELS.get(c, f"Item {c}") for c in items if c != "9.01"]
+    if not labels:
+        return ("Foreign Issuer Report (6-K)", "外国发行人报告 (6-K)") if form == "6-K" else ("Current Report (8-K)", "临时报告 (8-K)")
+    pairs = [re.match(r"^(.*?)(?: \((.*)\))?$", lab).groups() for lab in labels]
+    return "; ".join(en for en, _ in pairs), "；".join(zh or en for en, zh in pairs)
 
 
 def _get_llm(temperature: float = 0.15):
@@ -623,6 +654,89 @@ def _upsert_collected(rows: List[Dict[str, Any]], layer: str, today: date, path:
     finally:
         conn.close()
     return saved
+
+
+# Checks on extracted events (2026-11-02). The local model sees a headline only (Layer 2, and Layer 3
+# when Claude is unavailable) and used to fill the gaps itself: an "iPhone 16 launch" from a headline
+# about iPhone estimates, a mid-November date for a headline that gave none, five differently worded
+# events from one article. Such an event is now kept only when its headline backs both its date and
+# the model numbers / versions in its title. Claude's web sweep is checked on its date label.
+_MONTH_RE = re.compile(r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|"
+                       r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b", re.I)
+_MAY_RE = re.compile(r"\bmay\s+\d{1,2}\b|\b(?:in|mid-?|early|late|end of)\s+may\b", re.I)   # "may" the month, not the verb
+_RELATIVE_DATE_RE = re.compile(r"\b(today|tonight|tomorrow|this week|next week|this month|next month|"
+                               r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|\b\d{1,2}/\d{1,2}\b", re.I)
+_YEAR_OR_CN_DATE_RE = re.compile(r"\b20\d\d\b|\d+\s*(?:月|日|号|年)")
+_CODE_TOKEN_RE = re.compile(r"[A-Za-z]*\d+[A-Za-z0-9]*")
+L2_MAX_SOURCE_AGE_DAYS = 21       # older items are dropped: the feeds sometimes return last year's article
+L2_RELATIVE_DATE_DAYS = 2         # "next week" is relative to the article, so only a fresh one can place it
+
+
+def _months_named(text: str) -> Set[int]:
+    names = [m.group(1)[:3].lower() for m in _MONTH_RE.finditer(text)] + (["may"] if _MAY_RE.search(text) else [])
+    order = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+    return {order.index(n) + 1 for n in names}
+
+
+def _unbacked_tokens(text: str, headline: str) -> List[str]:
+    """Model numbers / versions in an extracted title (iPhone 16, M6, Q4) that the headline does not
+    carry; years and Chinese dates are the event's date, checked separately."""
+    h = headline.lower()
+    return [t for t in _CODE_TOKEN_RE.findall(_YEAR_OR_CN_DATE_RE.sub(" ", text))
+            if not re.search(r"(?<![a-z0-9])" + re.escape(t.lower()) + r"(?![a-z0-9])", h)]
+
+
+def _headline_vet(obj: Dict[str, Any], item: Dict[str, Any], start_d: date, end_d: date) -> Optional[Tuple[str, str, str]]:
+    """(event_date, date_precision, date_label) for an extracted event its source backs, else None."""
+    headline = item.get("title") or ""
+    try:
+        ev: Optional[date] = date.fromisoformat(str(obj.get("event_date") or "")[:10])
+    except ValueError:
+        ev = None
+    precision = "approx" if obj.get("date_precision") == "approx" else "exact"
+    label = str(obj.get("date_label") or "")[:40]
+    if item.get("source") == "SEC EDGAR":          # a filing acts from now unless it names a date ahead
+        if ev and start_d <= ev <= end_d:          # (its title is rebuilt from the item labels)
+            return ev.isoformat(), precision, label
+        return start_d.isoformat(), "approx", "近期催化 / Active catalyst"
+    if any(_unbacked_tokens(str(obj.get(f) or ""), headline) for f in ("title_en", "title_zh")):
+        return None
+    if ev is None or not (start_d <= ev <= end_d):  # past events are dropped, not moved to today
+        return None
+    quote = re.sub(r"\s+", " ", str(obj.get("date_quote") or "")).strip().lower()
+    if not quote or quote not in re.sub(r"\s+", " ", headline).lower():
+        return None
+    months = _months_named(quote)
+    if months:
+        return (ev.isoformat(), precision, label) if ev.month in months else None
+    if not _RELATIVE_DATE_RE.search(quote):
+        return None
+    try:
+        fresh = date.fromisoformat((item.get("published") or "")[:10]) >= start_d - timedelta(days=L2_RELATIVE_DATE_DAYS)
+    except ValueError:
+        fresh = False
+    return (ev.isoformat(), precision, label) if fresh else None
+
+
+_ESTIMATE_RE = re.compile(r"\best\b|estimat|估", re.I)
+_MOVED_RE = re.compile(r"\boriginal(?:ly)?\b|postponed|extended to|delayed to|原定|已延|延至|推迟至", re.I)
+
+
+def _web_event_kept(obj: Dict[str, Any], ev: date) -> bool:
+    """An event from Claude's web sweep: not one already moved to another date ("original deadline,
+    now extended to..."), and an approximate date only inside a month its label names, never one
+    it estimates ("Early Dec (est. appeal window)", "Q4 2026")."""
+    if _MOVED_RE.search(" ".join(str(obj.get(k) or "") for k in ("title_en", "title_zh", "date_label"))):
+        return False
+    if obj.get("date_precision") != "approx":
+        return True
+    label = str(obj.get("date_label") or "")
+    return not _ESTIMATE_RE.search(label) and ev.month in _months_named(label)
+
+
+def _l3_key(sym: str, url: str, ev_date: str) -> str:
+    """Keyed by source and date, not wording: a later sweep's reading of the same event replaces it."""
+    return f"L3:{sym}:src:{hashlib.sha1(f'{url}|{ev_date}'.encode()).hexdigest()[:16]}"
 
 
 def collect_l2_extracted(days: int = 45, path: Optional[Path] = None, today: Optional[date] = None) -> int:
@@ -692,6 +806,14 @@ def collect_l2_extracted(days: int = 45, path: Optional[Path] = None, today: Opt
                     continue
                 if item.get("source") != "SEC EDGAR" and not FORWARD_HINT_RE.search(title):
                     continue
+                if LAW_FIRM_AD_RE.search(title):
+                    continue
+                pub =(item.get("date") or item.get("time_utc") or "")[:10]
+                try:
+                    if date.fromisoformat(pub) < start_d - timedelta(days=L2_MAX_SOURCE_AGE_DAYS):
+                        continue
+                except ValueError:
+                    pass
                 seen_titles.add(t_key)
                 candidates.append({
                     "symbol": sym,
@@ -699,6 +821,8 @@ def collect_l2_extracted(days: int = 45, path: Optional[Path] = None, today: Opt
                     "title": title,
                     "source": item.get("source") or "News",
                     "url": item.get("url") or "",
+                    "form": item.get("form") or "",
+                    "items": item.get("items") or [],
                 })
                 per_sym += 1
                 if per_sym >= 5:
@@ -714,6 +838,7 @@ def collect_l2_extracted(days: int = 45, path: Optional[Path] = None, today: Opt
 
         valid_universe = set(all_syms) | {"MACRO"}
         extracted_rows: List[Dict[str, Any]] = []
+        used_sources: Set[Tuple[int, int]] = set()   # (batch, source_id): one event per headline
 
         # Process in compact batches of 18 headlines per call so the local 9B model stays crisp and fast.
         batch_size = 18
@@ -730,9 +855,10 @@ Valid portfolio symbols: {', '.join(all_syms)}.
 Rules:
 1. Extract ONLY events that (a) happen in the future within [{start_d.isoformat()}, {end_d.isoformat()}] (conferences, product launches, keynotes, investor days, court/antitrust hearings, tariff/export-control deadlines, scheduled announcements), OR (b) are newly filed SEC 8-K/6-K corporate actions or major forward guidance/policy shifts published in the last 7 days with ongoing forward impact.
 2. SKIP routine past price commentary ("Why X rose 3% today", "Top stocks to buy") AND skip plain "X sets Q3 earnings call date" announcements (scheduled earnings dates are already in Layer 1).
-3. If an event has an exact date in [{start_d.isoformat()}, {end_d.isoformat()}], set `event_date` = "YYYY-MM-DD" and `date_precision` = "exact". If only a month/window is known (e.g. "mid-November", "December"), set `event_date` to an estimated YYYY-MM-DD inside [{start_d.isoformat()}, {end_d.isoformat()}], `date_precision` = "approx", and `date_label` (e.g. "2026-11 中旬 / Mid-Nov"). For an active recent SEC 8-K / policy catalyst with immediate forward impact, use `{start_d.isoformat()}` and `date_precision` = "approx", `date_label` = "近期催化 / Active catalyst".
-4. Deduplicate: emit at most ONE object per distinct real-world event.
-5. Output ONLY a valid JSON array (or `[]` if none qualify):
+3. The date must come from the headline itself. Copy the words of the headline that state it (e.g. "November 18", "next week", "in December") into `date_quote`, exactly as written. If the headline states no date, month or day, SKIP it: never estimate or guess a date. With an exact day set `date_precision` = "exact"; with only a month or window (e.g. "mid-November") set an `event_date` inside that month within [{start_d.isoformat()}, {end_d.isoformat()}], `date_precision` = "approx" and `date_label` (e.g. "2026-11 中旬 / Mid-Nov"). For an SEC 8-K / 6-K with immediate forward impact, use `{start_d.isoformat()}`, `date_precision` = "approx", `date_label` = "近期催化 / Active catalyst", `date_quote` = "".
+4. Use only facts in the headline: do not add product names, model numbers, versions or people it does not state. For an SEC filing, describe only what its item labels say (e.g. a debt issue is not a merger), and do not mention items it does not list.
+5. Deduplicate: emit at most ONE object per headline and per distinct real-world event.
+6. Output ONLY a valid JSON array (or `[]` if none qualify):
 [
   {{
     "source_id": <int 1..{len(batch)}>,
@@ -740,6 +866,7 @@ Rules:
     "affected_symbols": ["<other affected tickers from valid symbols>"],
     "kind": "product|policy|legal|corporate|analyst",
     "event_date": "YYYY-MM-DD",
+    "date_quote": "<the headline's own words stating the date>",
     "date_precision": "exact|approx",
     "date_label": "<optional label>",
     "impact_level": "high|medium",
@@ -771,22 +898,17 @@ Rules:
                     sid = int(obj.get("source_id") or 0)
                 except (TypeError, ValueError):
                     sid = 0
-                if not (1 <= sid <= len(batch)):
+                if not (1 <= sid <= len(batch)) or (b_start, sid) in used_sources:
                     continue
                 src_item = batch[sid - 1]
+                vetted = _headline_vet(obj, src_item, start_d, end_d)
+                if vetted is None:
+                    continue
+                used_sources.add((b_start, sid))
+                ev_date_str, precision, date_label = vetted
                 sym = str(obj.get("symbol") or src_item["symbol"]).upper().strip()
                 if sym not in valid_universe:
                     sym = src_item["symbol"]
-                ev_date_str = str(obj.get("event_date") or "")[:10]
-                try:
-                    ev_d = date.fromisoformat(ev_date_str)
-                except ValueError:
-                    ev_d = start_d
-                    ev_date_str = start_d.isoformat()
-                if ev_d < start_d:
-                    ev_date_str = start_d.isoformat()
-                elif ev_d > end_d:
-                    continue
                 kind = str(obj.get("kind") or "corporate").lower()
                 if kind not in ("product", "policy", "legal", "corporate", "analyst", "macro"):
                     kind = "corporate"
@@ -796,23 +918,32 @@ Rules:
                     continue
                 t_zh = t_zh or t_en
                 t_en = t_en or t_zh
+                d_zh = str(obj.get("detail_zh") or src_item["title"])
+                d_en = str(obj.get("detail_en") or src_item["title"])
+                if src_item["source"] == "SEC EDGAR":
+                    # Told what each item is, the model still wrote "may involve a merger" for a debt
+                    # issue: a filing is described by its item labels alone.
+                    en, zh = sec_text(src_item["form"], src_item["items"])
+                    t_en, t_zh = f"{src_item['symbol']} {src_item['form']}: {en}", f"{src_item['symbol']} {src_item['form']}：{zh}"
+                    d_en, d_zh = f"Filed items: {en}. Read the filing for its terms.", f"公告事项：{zh}。具体条款见公告原文。"
                 aff = [s.upper() for s in (obj.get("affected_symbols") or []) if isinstance(s, str) and s.upper() in valid_universe]
                 if sym != "MACRO" and sym not in aff:
                     aff = [sym] + aff
-                topic_sig = hashlib.sha1(f"L2|{sym}|{kind}|{ev_date_str[:7]}|{t_en[:36].lower()}".encode()).hexdigest()[:16]
+                # Keyed by the article, not the model's wording: a later run's reading replaces this one.
+                src_sig = hashlib.sha1((src_item["url"] or src_item["title"]).encode()).hexdigest()[:16]
                 extracted_rows.append({
-                    "dedupe_key": f"L2:{sym}:{topic_sig}",
+                    "dedupe_key": f"L2:{src_item['symbol']}:src:{src_sig}",
                     "kind": kind,
                     "symbol": sym,
                     "affected_symbols": aff,
                     "event_date": ev_date_str,
-                    "date_precision": "approx" if obj.get("date_precision") == "approx" else "exact",
-                    "date_label": str(obj.get("date_label") or "")[:40],
+                    "date_precision": precision,
+                    "date_label": date_label,
                     "impact_level": "high" if obj.get("impact_level") == "high" else "medium",
                     "title_zh": t_zh[:80],
                     "title_en": t_en[:100],
-                    "detail_zh": str(obj.get("detail_zh") or src_item["title"])[:220],
-                    "detail_en": str(obj.get("detail_en") or src_item["title"])[:240],
+                    "detail_zh": d_zh[:220],
+                    "detail_en": d_en[:240],
                     "source_title": f"{src_item['source']}: {src_item['title'][:80]}",
                     "source_url": src_item["url"],
                 })
@@ -868,7 +999,7 @@ def _collect_l3_thematic_web_fallback(
         for it in sub_l:
             u = it.get("url") or ""
             t = screen((it.get("title") or "").strip()).text
-            if not t or not u or u in seen_u:
+            if not t or not u or u in seen_u or LAW_FIRM_AD_RE.search(t):
                 continue
             seen_u.add(u)
             items.append({"published": (it.get("date") or "")[:10], "title": t, "source": it.get("source") or "Web", "url": u})
@@ -891,6 +1022,7 @@ Portfolio & Watchlist tickers: {', '.join(all_syms)} (or use "MACRO" for market-
 
 Extract ONLY genuine upcoming or active forward-looking catalysts (industry conferences like Ignite/SC26/re:Invent/CES, product/node/HBM launches, export-control/tariff rules, antitrust/court rulings, major capex/supply-chain catalysts).
 SKIP plain quarterly earnings date announcements and routine stock price recaps.
+The date must come from the headline itself: copy the headline's words that state it (e.g. "November 18", "in December") into `date_quote`, exactly as written. If the headline states no date or month, SKIP it: never estimate a date. Use only facts in the headline (no product names, model numbers or people it does not state).
 Output ONLY a JSON array:
 [
   {{
@@ -899,6 +1031,7 @@ Output ONLY a JSON array:
     "affected_symbols": ["<all impacted tickers from list>"],
     "kind": "product|policy|legal|corporate|macro",
     "event_date": "YYYY-MM-DD",
+    "date_quote": "<the headline's own words stating the date>",
     "date_precision": "exact|approx",
     "date_label": "<optional window label>",
     "impact_level": "high|medium",
@@ -934,16 +1067,10 @@ Output ONLY a JSON array:
             sym = str(obj.get("symbol") or "").upper().strip()
             if sym not in valid_universe:
                 continue
-            ev_date_str = str(obj.get("event_date") or "")[:10]
-            try:
-                ev_d = date.fromisoformat(ev_date_str)
-            except ValueError:
-                ev_d = start_d
-                ev_date_str = start_d.isoformat()
-            if ev_d < start_d:
-                ev_date_str = start_d.isoformat()
-            elif ev_d > end_d + timedelta(days=15):
+            vetted = _headline_vet(obj, src, start_d, end_d + timedelta(days=15))
+            if vetted is None:
                 continue
+            ev_date_str, precision, date_label = vetted
             kind = str(obj.get("kind") or "corporate").lower()
             if kind not in ("product", "policy", "legal", "corporate", "analyst", "macro"):
                 kind = "corporate"
@@ -954,15 +1081,14 @@ Output ONLY a JSON array:
             aff = [s.upper() for s in (obj.get("affected_symbols") or []) if isinstance(s, str) and s.upper() in valid_universe]
             if sym != "MACRO" and sym not in aff:
                 aff = [sym] + aff
-            sig = hashlib.sha1(f"L3|{sym}|{kind}|{ev_date_str[:7]}|{(t_en or t_zh)[:36].lower()}".encode()).hexdigest()[:16]
             rows.append({
-                "dedupe_key": f"L3:{sym}:{sig}",
+                "dedupe_key": _l3_key(sym, src["url"], ev_date_str),
                 "kind": kind,
                 "symbol": sym,
                 "affected_symbols": aff,
                 "event_date": ev_date_str,
-                "date_precision": "approx" if obj.get("date_precision") == "approx" else "exact",
-                "date_label": str(obj.get("date_label") or "")[:40],
+                "date_precision": precision,
+                "date_label": date_label,
                 "impact_level": "high" if obj.get("impact_level") == "high" else "medium",
                 "title_zh": (t_zh or t_en)[:80],
                 "title_en": (t_en or t_zh)[:100],
@@ -1007,6 +1133,8 @@ Use WebSearch (6 to 10 focused searches) to find NON-EARNINGS upcoming catalysts
 2. Regulatory, antitrust, court & trade/tariff milestones (e.g. DOJ/EU antitrust hearings or remedies on GOOGL/AAPL/META/NVDA, US BIS semiconductor export control rules, CHIPS Act awards, China/US tariff deadlines)
 3. Major supply-chain / product roadmap milestones (e.g. Blackwell/Rubin shipments, HBM3E/HBM4 qualification or pricing, foundry node milestones).
 
+Dates: use only a date or month your source states. If it gives only a quarter or season ("Q4", "fall") or nothing, or you would have to estimate it, leave the event out. Leave out deadlines that have already been moved, postponed or cancelled, and law-firm class-action "lead plaintiff deadline" notices.
+
 Reply with ONLY JSON lines between =====EVENTS===== and =====END===== (8 to 18 verified events; every item MUST include a real https:// source_url you found):
 =====EVENTS=====
 {{"symbol": "<primary ticker from Holdings/Watchlist or MACRO>", "affected_symbols": ["<tickers>"], "kind": "product|policy|legal|corporate", "event_date": "YYYY-MM-DD", "date_precision": "exact|approx", "date_label": "<e.g. Nov 18-22 or Mid-Nov>", "impact_level": "high|medium", "title_zh": "<Chinese title>", "title_en": "<English title>", "detail_zh": "<Chinese impact explanation>", "detail_en": "<English impact explanation>", "source_title": "<Publisher / Page title>", "source_url": "https://..."}}
@@ -1040,10 +1168,10 @@ Reply with ONLY JSON lines between =====EVENTS===== and =====END===== (8 to 18 v
                 ev_d = date.fromisoformat(ev_date_str)
             except ValueError:
                 continue
-            if not (start_d <= ev_d <= end_d + timedelta(days=15)):
+            if not (start_d <= ev_d <= end_d + timedelta(days=15)) or not _web_event_kept(obj, ev_d):
                 continue
             url = str(obj.get("source_url") or "").strip()
-            if not url.startswith("http"):
+            if not url.startswith("http") or LAW_FIRM_AD_RE.search(f"{obj.get('title_en') or ''} {obj.get('source_title') or ''}"):
                 continue
             kind = str(obj.get("kind") or "corporate").lower()
             if kind not in ("product", "policy", "legal", "corporate", "analyst", "macro"):
@@ -1055,9 +1183,8 @@ Reply with ONLY JSON lines between =====EVENTS===== and =====END===== (8 to 18 v
             aff = [s.upper() for s in (obj.get("affected_symbols") or []) if isinstance(s, str) and s.upper() in valid_universe]
             if sym != "MACRO" and sym not in aff:
                 aff = [sym] + aff
-            sig = hashlib.sha1(f"L3|{sym}|{kind}|{ev_date_str[:7]}|{(t_en or t_zh)[:36].lower()}".encode()).hexdigest()[:16]
             rows.append({
-                "dedupe_key": f"L3:{sym}:{sig}",
+                "dedupe_key": _l3_key(sym, url, ev_date_str),
                 "kind": kind,
                 "symbol": sym,
                 "affected_symbols": aff,

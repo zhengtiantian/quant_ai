@@ -94,5 +94,21 @@ class LotAdvisorTest(unittest.TestCase):
         self.assertEqual(by_id[1]["status_code"], "underwater_swing")
 
 
+class BigDropTest(unittest.TestCase):
+    def test_latest_drop_of_two_atr_in_the_last_five_sessions(self):
+        from markets import lot_advisor
+        bars = [{"time": f"d{i}", "open": 100, "high": 101, "low": 99, "close": 100} for i in range(30)]   # ATR 2
+        self.assertIsNone(lot_advisor._last_big_drop(bars))
+        bars[27] = {"time": "d27", "open": 99, "high": 99, "low": 95, "close": 95.5}                       # -4.5 = 2.25 x ATR
+        bars[28] = {"time": "d28", "open": 96, "high": 97, "low": 95, "close": 96}
+        bars[29] = {"time": "d29", "open": 96, "high": 97, "low": 95, "close": 96.5}
+        d = lot_advisor._last_big_drop(bars)
+        self.assertEqual((d["date"], d["prev_date"], d["sessions_ago"], d["drop_atr"]), ("d27", "d26", 2, 2.25))
+        bars[22] = {"time": "d22", "open": 99, "high": 99, "low": 90, "close": 90}                         # 6 sessions back: too old
+        bars[27] = {"time": "d27", "open": 100, "high": 101, "low": 99, "close": 100}
+        bars[28] = bars[29] = {"time": "dx", "open": 100, "high": 101, "low": 99, "close": 100}
+        self.assertIsNone(lot_advisor._last_big_drop(bars[:23] + [{"time": f"e{i}", "open": 90, "high": 91, "low": 89, "close": 90} for i in range(6)]))
+
+
 if __name__ == "__main__":
     unittest.main()

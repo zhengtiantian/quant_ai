@@ -114,6 +114,7 @@ class ThreeLayerCatalystsTest(unittest.TestCase):
                 "affected_symbols": ["NVDA", "TSM"],
                 "kind": "product",
                 "event_date": "2026-11-18",
+                "date_quote": "November 18",
                 "date_precision": "exact",
                 "date_label": "",
                 "impact_level": "high",
@@ -220,6 +221,84 @@ class CatalystsApiRouteTest(unittest.TestCase):
 
             remote = self._client("198.51.100.7")
             self.assertEqual(remote.get("/api/markets/catalysts").status_code, 403)
+
+
+class L2VetTest(unittest.TestCase):
+    """An extracted event is kept only when its headline backs its date and its model numbers (2026-11-02)."""
+    START, END = date(2026, 11, 2), date(2026, 12, 17)
+
+    def vet(self, title, published="2026-11-01", source="Seeking Alpha", **obj):
+        item = {"title": title, "published": published, "source": source}
+        base = {"title_en": "Event", "title_zh": "事件", "event_date": "2026-11-18", "date_precision": "exact"}
+        return catalysts._headline_vet({**base, **obj}, item, self.START, self.END)
+
+    def test_kept_when_the_headline_states_the_date(self):
+        self.assertEqual(self.vet("Microsoft Ignite keynote set for November 18", date_quote="November 18",
+                                  title_en="Microsoft Ignite keynote")[0], "2026-11-18")
+        self.assertIsNotNone(self.vet("Apple to debut AI features in China in December", date_quote="in December",
+                                      event_date="2026-12-10", date_precision="approx"))
+
+    def test_no_date_in_the_headline_is_dropped(self):
+        h = "Apple in focus as BofA questions Wall Street estimates amid staggered iPhone launches"
+        self.assertIsNone(self.vet(h, date_quote="", event_date="2026-11-15", date_precision="approx"))
+        self.assertIsNone(self.vet(h, date_quote="mid-November", event_date="2026-11-15"))   # not the headline's words
+
+    def test_invented_model_number_is_dropped(self):
+        h = "Apple iPhone launch set for November 18"
+        self.assertIsNone(self.vet(h, date_quote="November 18", title_en="Apple iPhone 16 launch event"))
+        self.assertIsNone(self.vet(h, date_quote="November 18", title_zh="苹果 iPhone 16 系列发布活动"))
+        self.assertIsNotNone(self.vet(h, date_quote="November 18", title_zh="苹果 11月18日 iPhone 发布", title_en="Apple iPhone launch 2026"))
+
+    def test_date_outside_the_quoted_month_or_past_is_dropped(self):
+        self.assertIsNone(self.vet("Apple event in December", date_quote="in December", event_date="2026-11-15"))
+        self.assertIsNone(self.vet("Keynote on October 28", date_quote="October 28", event_date="2026-10-28"))
+
+    def test_relative_date_needs_a_fresh_article(self):
+        h = "Next Week Brings Apple Earnings"
+        self.assertIsNotNone(self.vet(h, published="2026-11-01", date_quote="Next Week", event_date="2026-11-05"))
+        self.assertIsNone(self.vet(h, published="2026-10-24", date_quote="Next Week", event_date="2026-11-05"))
+        self.assertIsNone(self.vet("Apple may launch a cheaper iPhone", date_quote="may", event_date="2026-11-05"))
+
+    def test_sec_filing_acts_from_today(self):
+        self.assertEqual(self.vet("8-K: entry into a material agreement", source="SEC EDGAR", event_date=""),
+                         ("2026-11-02", "approx", "近期催化 / Active catalyst"))
+
+
+class WebSweepAndCalendarFixesTest(unittest.TestCase):
+    """2026-11-02: Nasdaq's economic calendar is a day late; Claude's sweep estimated dates; 8-K items
+    were guessed from their numbers; law-firm adverts were taken for events."""
+
+    def test_econ_day_is_asked_for_as_the_next_day(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(events.pf, "_get_json", return_value={"data": {"rows": [
+                    {"country": "United States", "eventName": "Initial Jobless Claims", "gmt": "08:30"}]}}) as get:
+            rows = events.econ_on(date(2026, 11, 5), Path(tmp) / "m.db")
+        self.assertIn("date=2026-11-06", get.call_args[0][0])
+        self.assertEqual(rows[0]["event"], "Initial Jobless Claims")
+
+    def test_web_event_dates(self):
+        kept = lambda ev, **o: catalysts._web_event_kept(o, ev)
+        self.assertTrue(kept(date(2026, 11, 15), date_precision="exact", title_en="SC26", date_label="Nov 15-20"))
+        self.assertTrue(kept(date(2026, 11, 20), date_precision="approx", date_label="Mid-Nov"))
+        self.assertFalse(kept(date(2026, 12, 1), date_precision="approx", date_label="Early Dec (est. appeal window)"))
+        self.assertFalse(kept(date(2026, 11, 16), date_precision="approx", date_label="Fall / Q4 2026"))
+        self.assertFalse(kept(date(2026, 11, 10), date_precision="exact", date_label="Nov 10 (original truce expiry, now extended)",
+                              title_zh="美中关税休战原定到期日（已延至2027年1月10日）"))
+
+    def test_law_firm_adverts(self):
+        self.assertTrue(catalysts.LAW_FIRM_AD_RE.search("SueWallSt Reminds Shareholders of a Lead Plaintiff Deadline of December 1, 2026"))
+        self.assertFalse(catalysts.LAW_FIRM_AD_RE.search("Microsoft Ignite keynote set for November 18"))
+
+    def test_every_8k_item_has_a_label(self):
+        self.assertIn("debt", catalysts.SEC_ITEM_LABELS["2.03"])
+        for item in ("1.05", "2.06", "3.02", "3.03", "4.02", "5.03", "5.07"):
+            self.assertIn(item, catalysts.SEC_ITEM_LABELS)
+
+    def test_filing_described_by_its_items_alone(self):
+        en, zh = catalysts.sec_text("8-K", ["2.03", "9.01"])
+        self.assertEqual((en, zh), ("Direct Financial Obligation: debt issued or borrowed", "发债/新增借款"))
+        self.assertEqual(catalysts.sec_text("8-K", ["1.01", "3.03"])[1], "重大协议；证券持有人权利变更")
+        self.assertEqual(catalysts.sec_text("6-K", [])[0], "Foreign Issuer Report (6-K)")
 
 
 if __name__ == "__main__":

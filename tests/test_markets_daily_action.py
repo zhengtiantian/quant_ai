@@ -16,11 +16,12 @@ def state(intc_qty=142.18, intc_px=64.89, others=(("SKHY", 6755.82), ("TSM", 276
     return {"holdings": hs, "cash": cash}
 
 
-def advice(stabilized=False, lowest=64.44, events=True, report=False):
+def advice(stabilized=False, lowest=64.44, events=True, report=False, big_drop=None):
     cats = [{"title": "Apple earnings", "impact": "high", "bucket": "spillover", "category": "earnings", "days_away": 2}] if events else []
     if report:
         cats.append({"title": "INTC earnings", "impact": "high", "bucket": "direct", "category": "earnings", "days_away": 0})
-    return {"stats": {"atr14": 6.86, "stabilized": stabilized}, "catalysts_7d": cats, "dip_guardrail": {"anchor_cost": lowest}}
+    return {"stats": {"atr14": 6.86, "stabilized": stabilized, "big_drop": big_drop}, "catalysts_7d": cats,
+            "dip_guardrail": {"anchor_cost": lowest}}
 
 
 class GateTest(unittest.TestCase):
@@ -72,6 +73,33 @@ class DailyActionTest(unittest.TestCase):
         self.assertFalse(any("CGT" in r or "tax" in r for r in a["reasons"]))  # the user asked for no tax notes
         self.assertEqual(a["after"]["cash_pct"], 13.8)                          # 45 x 64.89 of 21,180
         self.assertGreater(a["after"]["cluster_excess"], 0)                     # chips still above 70% after INTC
+
+    def test_reach_rates_follow_the_drop_cause(self):
+        st = state()
+        intc = {"date": "2026-10-30", "prev_date": "2026-10-29", "sessions_ago": 0, "drop_atr": 5.1, "earnings": True}
+        a = daily_action.decide("INTC", st["holdings"][0], risk_rules.exposure(st), advice(big_drop=intc))
+        self.assertEqual([o["hit_pct"] for o in a["orders"]], [39, 28])
+        self.assertIn("an earnings drop of >= 4 x ATR", a["reasons"][1])
+        other = {**intc, "drop_atr": 2.4, "earnings": False}
+        a = daily_action.decide("INTC", st["holdings"][0], risk_rules.exposure(st), advice(big_drop=other))
+        self.assertEqual([o["hit_pct"] for o in a["orders"]], [65, 54])
+        for drop in (None, {**intc, "earnings": None}):          # no recent drop, or its cause unknown: no rate quoted
+            a = daily_action.decide("INTC", st["holdings"][0], risk_rules.exposure(st), advice(big_drop=drop))
+            self.assertEqual([o["hit_pct"] for o in a["orders"]], [None, None])
+            self.assertEqual(a["evidence"], "rule (symbol cap)")
+
+    def test_report_into_the_drop_from_the_calendar(self):
+        from unittest import mock
+        drop = {"date": "2026-10-30", "prev_date": "2026-10-29"}
+        cal = lambda rows: (lambda d, path=None: rows.get(d.isoformat(), []))
+        for rows, expected in (({"2026-10-29": [{"symbol": "INTC", "when": "time not given"}]}, True),     # after the close, time unknown
+                               ({"2026-10-30": [{"symbol": "INTC", "when": "before the open"}]}, True),
+                               ({"2026-10-29": [{"symbol": "INTC", "when": "before the open"}]}, False),   # a day earlier: not this drop
+                               ({}, False)):
+            with mock.patch("markets.events.earnings_on", side_effect=cal(rows)):
+                self.assertEqual(daily_action.reported_into("INTC", drop), expected, rows)
+        with mock.patch("markets.events.earnings_on", side_effect=RuntimeError("down")):
+            self.assertIsNone(daily_action.reported_into("INTC", drop))
 
     def test_report_night_comes_first(self):
         st = state()
