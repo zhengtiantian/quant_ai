@@ -57,6 +57,33 @@ class ModelAdviceTest(unittest.TestCase):
         self.assertEqual((a["action"], a["orders"]), ("hold", []))
         self.assertIn("没有可靠的方向信号", a["headline_zh"])
 
+    def test_getting_out_shows_the_models_view_without_sizing(self):
+        f = forecast(reliable=False)
+        st = lambda u, l, n, hm, hw, bm, bw: {"sell_at": u, "stop_at": l, "n": n, "hold_mean": hm, "hold_worst5": hw, "barrier_mean": bm,
+                                              "barrier_worst5": bw, "upper_first": 52.2, "lower_first": 32.3}
+        f["symbols"]["INTC"]["barrier"] = {"situation": "deep_badnews", "model_5": {"p_upper": 47.6, "p_lower": 1.9, "p_none": 50.5},
+                                           "news_20": {"guide_cut_20": 28.0},
+                                           "sets": {"5": st(66.95, 49.5, 4793, 0.55, -10.8, 0.21, -9.0), "20": st(70.44, 46.01, 4758, 2.13, -18.0, 0.62, -14.0)}}
+        f["news_study"] = {"guidance cut": {"days": 916, "60d_vs_all": {"mean": -2.35, "t": -3.62}}}
+        held = {**HOLD, "avg_cost": 87.69}
+        a = model_advice.render("INTC", held, STATS, 64.44, 0.0, f, total=20200.0, budget_pct=5.0)
+        self.assertEqual((a["action"], a["orders"]), ("hold", []))
+        rec = [n["zh"] for n in a["notes"] if n["section"] == "recover"]
+        self.assertTrue(any("先反弹到 $66.95 的概率 48%" in r for r in rec))
+        self.assertTrue(any("不要补仓" in r for r in rec))
+        self.assertFalse(any("风险预算" in n["zh"] for n in a["notes"]))
+
+    def test_events_ahead_with_their_history(self):
+        f = forecast(reliable=False)
+        f["calendar_study"] = {"fomc_ahead_5d": {"mean": 0.046}, "no_fomc_5d": {"mean": 0.319}, "opex_week": {"mean": -0.092, "t": -2.21},
+                               "day_before_report": {"mean": 0.155, "t": 3.16}}
+        f["symbols"]["INTC"]["barrier"] = {"calendar": {"to_fomc": 3, "to_opex": 2, "to_nfp": 9, "pre_holiday": False, "to_report_days": 1}}
+        a = model_advice.render("INTC", HOLD, STATS, 64.44, 0.0, f)
+        ev = [n["zh"] for n in a["notes"] if n["section"] == "events"]
+        self.assertTrue(any("3 个交易日后美联储议息" in e and "+0.05%" in e for e in ev))
+        self.assertTrue(any("期权到期周" in e for e in ev))
+        self.assertTrue(any("1 天后发财报" in e and "+0.15%" in e for e in ev) or any("1 天后发财报" in e and "+0.16%" in e for e in ev))
+
     def test_no_forecast_or_stale(self):
         self.assertIsNone(model_advice.render("TSM", HOLD, STATS, None, 0.0, forecast()))
         a = model_advice.render("INTC", HOLD, STATS, 64.44, 0.0, forecast(generated="2026-10-01T00:00:00+00:00"))

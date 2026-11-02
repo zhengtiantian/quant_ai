@@ -319,7 +319,8 @@ def compute(path: Optional[Path] = None, state: Optional[Dict[str, Any]] = None,
         rule = decide(sym, h, ex, advice, plan, market)
         # What the user reads is the models' advice (2026-11-02); the rule-based action is kept with it.
         try:
-            m = model_fn(sym, h, advice.get("stats") or {}, (advice.get("dip_guardrail") or {}).get("anchor_cost"), float(st.get("cash") or 0.0))
+            m = model_fn(sym, h, advice.get("stats") or {}, (advice.get("dip_guardrail") or {}).get("anchor_cost"), float(st.get("cash") or 0.0),
+                         total=ex["total"], budget_pct=risk_budget.BUDGET_PCT)
         except Exception:  # noqa: BLE001 - no forecast: the rule-based action is shown
             m = None
         if m:

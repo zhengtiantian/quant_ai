@@ -30,11 +30,11 @@ ADD_SPACING_ATR = 2.0
 REDUCE_SHARE = 1 / 3            # a "reduce" call sells a third of the position
 ADD_SHARE = 0.10                # an "add" buys 10% of the shares held
 STALE_HOURS = 36
-SECTION_ORDER = {"why": 0, "odds": 1, "add": 2, "quality": 3}
+SECTION_ORDER = {"why": 0, "recover": 1, "events": 2, "odds": 3, "add": 4, "quality": 5}
 
-CALLS = {"reduce": ("Reduce", "减仓"), "hold": ("Hold", "持有"), "add": ("Add", "加仓")}
+CALLS = {"reduce": ("Reduce", "减仓"), "hold": ("Hold", "持有"), "add": ("Add", "加仓"), "recover": ("Recover", "解套")}
 HZ = {"5": ("next 5 days", "未来 5 天"), "20": ("next 20 days", "未来 20 天"), "60": ("next 60 days", "未来 60 天")}
-LABELS = {"why": {"en": "Why it fell", "zh": "为什么跌"}, "odds": {"en": "Outlook", "zh": "预测"},
+LABELS = {"why": {"en": "Why it fell", "zh": "为什么跌"}, "recover": {"en": "Getting out", "zh": "解套"}, "events": {"en": "Coming up", "zh": "近期事件"}, "odds": {"en": "Outlook", "zh": "预测"},
           "add": {"en": "Adding", "zh": "补仓"}, "quality": {"en": "How good is the model", "zh": "模型可信度"},
           "more": {"en": "More", "zh": "更多细节"}, "less": {"en": "Less", "zh": "收起"},
           "basis": {"en": "Basis", "zh": "依据"}, "blocked": {"en": "Buying is blocked", "zh": "买入被拦截"}}
@@ -55,7 +55,8 @@ def _hours_old(ts: str) -> float:
 
 
 def render(sym: str, holding: Dict[str, Any], stats: Dict[str, Any], lowest_lot: Optional[float],
-           cash: float, data: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+           cash: float, data: Optional[Dict[str, Any]] = None, total: Optional[float] = None,
+           budget_pct: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """The model's action for one holding, or None when there is no forecast for it."""
     data = data if data is not None else load()
     m = (data or {}).get("symbols", {}).get(sym)
@@ -104,6 +105,15 @@ def render(sym: str, holding: Dict[str, Any], stats: Dict[str, Any], lowest_lot:
                  "来源：" + " | ".join(x["title"] for x in e["sources"][:2]), key=False)
     if not events:
         note("why", "No session down 5% or more in the last 30", "最近 30 个交易日没有单日跌 5% 以上")
+
+    # getting out (Q.16.7): the barriers, what similar situations did held or managed, and the loss budget
+    rec_orders = _recover(sym, m, price, qty, cost=float(holding.get("avg_cost") or 0.0), total=total, budget_pct=budget_pct,
+                          study=(data or {}).get("news_study") or {}, note=note)
+    if rec_orders and call == "hold":
+        orders, call = rec_orders, "recover"
+        label_en, label_zh = "Recover", "解套"
+
+    _events_ahead(sym, m, (data or {}).get("calendar_study") or {}, note)
 
     # the outlook: calibrated odds and the 80% range per horizon
     if not reliable:
@@ -156,11 +166,92 @@ def render(sym: str, holding: Dict[str, Any], stats: Dict[str, Any], lowest_lot:
     notes.sort(key=lambda n: SECTION_ORDER.get(n["section"], 9))
     x20 = h.get("20") or h.get(20)
     no_sig_en, no_sig_zh = ("" if reliable else " (no reliable direction signal)"), ("" if reliable else "（没有可靠的方向信号）")
-    head_en = f"Model: {label_en.lower()}{no_sig_en}" + (f" — {orders[0]['text']['en']}" if orders else "") + \
-        f". 20 days: 8 in 10 between {x20['q10']:+.0f}% and {x20['q90']:+.0f}%"
-    head_zh = f"模型建议：{label_zh}{no_sig_zh}" + (f"——{orders[0]['text']['zh']}" if orders else "") + \
-        f"。未来 20 天十有八九在 {x20['q10']:+.0f}% ~ {x20['q90']:+.0f}% 之间"
+    if call == "recover":
+        head_en = "Getting out: " + "; ".join(o["text"]["en"] for o in orders)
+        head_zh = "解套：" + "；".join(o["text"]["zh"] for o in orders)
+    else:
+        head_en = f"Model: {label_en.lower()}{no_sig_en}" + (f" — {orders[0]['text']['en']}" if orders else "") + \
+            f". 20 days: 8 in 10 between {x20['q10']:+.0f}% and {x20['q90']:+.0f}%"
+        head_zh = f"模型建议：{label_zh}{no_sig_zh}" + (f"——{orders[0]['text']['zh']}" if orders else "") + \
+            f"。未来 20 天十有八九在 {x20['q10']:+.0f}% ~ {x20['q90']:+.0f}% 之间"
     return {"action": call, "action_label": {"en": label_en, "zh": label_zh}, "headline": head_en, "headline_zh": head_zh,
             "notes": notes, "orders": orders, "evidence": "models (LightGBM walk-forward 2019-2026) + news causes (local model)",
             "evidence_zh": "模型（LightGBM，2019–2026 年滚动样本外验证）+ 新闻原因（本地大模型）", "model": m, "stale": age > STALE_HOURS,
             "labels": LABELS}
+
+
+def _recover(sym: str, m: Dict[str, Any], price: float, qty: float, cost: float, total: Optional[float], budget_pct: Optional[float],
+             study: Dict[str, Any], note) -> List[Dict[str, Any]]:
+    """For a holding under water: the 5-day barrier odds (the one barrier model that beat the base rate,
+    calibrated), what similar situations did over 20 sessions held to the end or managed with a sell at
+    +1.5 x ATR and a stop at -2 x ATR, and the news drift. No orders and no loss-budget sizing: the user
+    asked for the models' and the data's view only. The barrier outcomes come from the walk-forward days of 102 stocks (2019-2026; today's large
+    caps, so holding looks better there than it would across all stocks)."""
+    b = m.get("barrier")
+    if not b or qty <= 0 or price >= cost:
+        return []
+    s5, s20 = b["sets"]["5"], b["sets"]["20"]
+    m5 = b["model_5"]
+    value = qty * price
+    sit_en = {"deep_badnews": "30%+ under its 1-year high after bad news / a guidance cut", "deep": "30%+ under its 1-year high",
+              "normal_badnews": "after bad news / a guidance cut", "normal": "no special situation"}[b["situation"]]
+    sit_zh = {"deep_badnews": "距一年高点 30% 以上，且近期有坏消息 / 指引下调", "deep": "距一年高点 30% 以上",
+              "normal_badnews": "近期有坏消息 / 指引下调", "normal": "无特殊情况"}[b["situation"]]
+    note("recover", f"Next 5 days (model, calibrated): {m5['p_upper']:.0f}% a rebound to ${s5['sell_at']:.2f} comes first, "
+         f"{m5['p_lower']:.0f}% a fall to ${s5['stop_at']:.2f}, {m5['p_none']:.0f}% neither",
+         f"未来 5 天（模型，已校准）：先反弹到 ${s5['sell_at']:.2f} 的概率 {m5['p_upper']:.0f}%，先跌到 ${s5['stop_at']:.2f} 的概率 "
+         f"{m5['p_lower']:.0f}%，都碰不到 {m5['p_none']:.0f}%")
+    hold_loss, bar_loss = value * -s20["hold_worst5"] / 100, value * -s20["barrier_worst5"] / 100
+    note("recover", f"20 days in this situation ({sit_en}; {s20['n']:,} past cases): holding averaged {s20['hold_mean']:+.1f}%, worst 5% "
+         f"{s20['hold_worst5']:.0f}% (${hold_loss:,.0f} on this position); selling at ${s20['sell_at']:.2f} or stopping at ${s20['stop_at']:.2f} "
+         f"averaged {s20['barrier_mean']:+.1f}%, worst 5% {s20['barrier_worst5']:.0f}% (${bar_loss:,.0f})",
+         f"20 天，同类情况（{sit_zh}；历史 {s20['n']:,} 例）：一直拿着平均 {s20['hold_mean']:+.1f}%，最坏 5% {s20['hold_worst5']:.0f}%"
+         f"（这个仓位约 ${hold_loss:,.0f}）；挂 ${s20['sell_at']:.2f} 止盈、${s20['stop_at']:.2f} 止损，平均 {s20['barrier_mean']:+.1f}%，"
+         f"最坏 5% {s20['barrier_worst5']:.0f}%（约 ${bar_loss:,.0f}）")
+    gc = study.get("guidance cut") or {}
+    if b.get("news_20", {}).get("guide_cut_20", 0) > 0 and gc.get("60d_vs_all"):
+        x = gc["60d_vs_all"]
+        note("recover", f"{int(b['news_20']['guide_cut_20'])} guidance-cut articles in 20 sessions: after guidance cuts stocks trailed the market "
+             f"by {abs(x['mean']):.1f}% more over 60 sessions (t {x['t']}, {gc.get('days', 0):,} cases). Do not add",
+             f"近 20 天有 {int(b['news_20']['guide_cut_20'])} 篇指引下调的报道：历史上指引下调后 60 天平均再跑输大盘 {abs(x['mean']):.1f}%"
+             f"（t {x['t']}，{gc.get('days', 0):,} 例）。不要补仓")
+    note("recover", "Holding averaged more because these 102 stocks are today's large caps (survivors); the stop is what caps the worst case",
+         "一直拿着平均更好，部分是因为这 102 只都是今天的大公司（幸存者偏差）；挂止损的作用是限制最坏情况", key=False)
+    return []          # no sizing by the loss budget here: the user asked for the models' view only (2026-11-02)
+
+
+def _events_ahead(sym: str, m: Dict[str, Any], study: Dict[str, Any], note) -> None:
+    """Scheduled events ahead and what such sessions did in 2016-2026 (quant_data calendar_events.py):
+    small effects, shown as context; the 5-day barrier model already takes them in."""
+    cal = (m.get("barrier") or {}).get("calendar")
+    if not cal:
+        return
+    near = 10
+    fa, nf = study.get("fomc_ahead_5d") or {}, study.get("no_fomc_5d") or {}
+    if cal["to_fomc"] <= 5 and fa:
+        note("events", f"Fed decision in {cal['to_fomc']} sessions: with one within 5 sessions SPY averaged {fa['mean']:+.2f}% over 5 days, "
+             f"{nf.get('mean', 0):+.2f}% otherwise", f"{cal['to_fomc']} 个交易日后美联储议息：历史上议息前 5 天 SPY 平均 {fa['mean']:+.2f}%，"
+             f"没有议息时 {nf.get('mean', 0):+.2f}%")
+    else:
+        note("events", f"Next Fed decision in {cal['to_fomc']} sessions", f"下次美联储议息在 {cal['to_fomc']} 个交易日后", key=cal["to_fomc"] <= near)
+    ox = study.get("opex_week") or {}
+    if cal["to_opex"] <= 4 and ox:
+        note("events", f"Options expiration in {cal['to_opex']} sessions: in expiration weeks SPY averaged {ox['mean']:+.2f}% a day against "
+             f"other days (t {ox['t']})", f"{cal['to_opex']} 个交易日后期权到期：历史上期权到期周 SPY 每天比平常 {ox['mean']:+.2f}%（t {ox['t']}）")
+    else:
+        note("events", f"Options expiration in {cal['to_opex']} sessions", f"期权到期在 {cal['to_opex']} 个交易日后", key=False)
+    if cal["to_nfp"] <= 5:
+        note("events", f"Jobs report in {cal['to_nfp']} sessions (no reliable effect on the day in 2016-2026)",
+             f"{cal['to_nfp']} 个交易日后公布非农（2016–2026 年发布当天没有可靠的涨跌效应）", key=False)
+    if cal.get("pre_holiday"):
+        ph = study.get("pre_holiday") or {}
+        note("events", f"The session before a market holiday: {ph.get('mean', 0):+.2f}% a day against others (t {ph.get('t')}, not significant)",
+             f"明天休市前的交易日：历史上比平常 {ph.get('mean', 0):+.2f}%（t {ph.get('t')}，不显著）", key=False)
+    rd = cal.get("to_report_days")
+    br = study.get("day_before_report") or {}
+    if rd is not None:
+        if rd <= 2 and br:
+            note("events", f"{sym} reports in {rd} day(s): the session before a report beat the market by {br['mean']:+.2f}% on average (t {br['t']})",
+                 f"{sym} {rd} 天后发财报：历史上财报前一天平均比大盘多涨 {br['mean']:+.2f}%（t {br['t']}）")
+        else:
+            note("events", f"{sym} reports in {rd} days", f"{sym} 的下次财报在 {rd} 天后", key=rd <= 14)
