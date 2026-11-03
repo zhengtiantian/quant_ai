@@ -789,9 +789,27 @@ def _prev_close_from_info(session: str, primary: Dict[str, Any], secondary: Dict
     return round(last - change, 4)
 
 
+# A second kind of bad replica, in every session: on 2026-11-03 in pre-market about a third of the
+# info replies for TSM / MU / INTC / PLTR / SKHY were marked "Closed", had no bid/ask, yesterday's
+# close as the price, a wrong change (MU -51.15 against +23.9) and a trade time of "Apr 2, 2027".
+# The holdings then jumped between the pre-market price and yesterday's close from one refresh to
+# the next. No real trade is dated after today, so such a reply is retried like the frozen one.
+def _future_dated(ts: Any, now: Optional[datetime] = None) -> bool:
+    m = _DATE_RE.search(str(ts or ""))
+    if not m:
+        return False
+    try:
+        d = datetime.strptime(m.group(), "%b %d, %Y").date()
+    except ValueError:
+        return False
+    return d > (now or datetime.now(US_EAST)).astimezone(US_EAST).date()
+
+
 def _frozen_reply(info: Optional[Dict[str, Any]]) -> bool:
     if not info or not info.get("primaryData"):
         return False
+    if _future_dated(info["primaryData"].get("lastTradeTimestamp")):
+        return True
     status = str(info.get("marketStatus") or "").strip().lower()
     if _STATUS_TO_SESSION.get(status) != "regular":
         return False
@@ -862,8 +880,8 @@ def fetch_quotes_batch(items: List[tuple]) -> Dict[str, Dict[str, Any]]:
     for r in rows:
         sym = str(r.get("symbol") or "").upper().replace("/", ".")
         price = _money(r.get("lastSalePrice"))
-        if not sym or price is None:
-            continue
+        if not sym or price is None or _future_dated(r.get("lastTradeTimestamp")):
+            continue                               # a bad replica's row: fetched per symbol instead
         status = str(r.get("marketStatus") or "").strip().lower()
         prev = r.get("previousClosePrice")
         out[sym] = {

@@ -284,6 +284,29 @@ class PortfolioTest(unittest.TestCase):
         self.assertTrue(pf._frozen_reply(frozen))
         self.assertFalse(pf._frozen_reply(after))             # thin extended hours may lack a quote
 
+    def test_future_dated_replica_is_detected_in_every_session(self):
+        # TSM in pre-market on 2026-11-03: yesterday's close, a wrong change, dated "Apr 2, 2027"
+        bad = {"marketStatus": "Closed", "primaryData": {"lastSalePrice": "$398.63", "netChange": "-7.50", "lastTradeTimestamp": "Apr 2, 2027",
+                                                         "bidPrice": "N/A", "askPrice": "N/A"}, "secondaryData": None}
+        pre = {"marketStatus": "Pre-Market", "primaryData": {"lastSalePrice": "$401.95", "netChange": "+3.32",
+                                                             "lastTradeTimestamp": "Nov 3, 2026 5:39 AM ET", "bidPrice": "$401.86", "askPrice": "$402.34"}}
+        closed = {"marketStatus": "Closed", "primaryData": {"lastSalePrice": "$398.63", "lastTradeTimestamp": "Nov 2, 2026",
+                                                            "bidPrice": "N/A", "askPrice": "N/A"}}
+        with mock.patch.object(pf, "datetime", wraps=pf.datetime) as dt:
+            dt.now.return_value = pf.datetime(2026, 11, 3, 5, 40, tzinfo=pf.US_EAST)
+            self.assertTrue(pf._frozen_reply(bad))
+            self.assertFalse(pf._frozen_reply(pre))
+            self.assertFalse(pf._frozen_reply(closed))           # last night's close is a real price
+            calls = iter([bad, bad, pre])
+            with mock.patch.object(pf, "_nasdaq", lambda sym, ep, cls: next(calls) if ep == "info" else None), \
+                 mock.patch.object(pf, "session_now", return_value="pre"):
+                self.assertEqual(REAL_FETCH_QUOTE("TSM", "stocks", known_prev_close=398.63)["price"], 401.95)
+            rows = {"status": {"rCode": 200}, "data": [
+                {"symbol": "TSM", "lastSalePrice": "$398.63", "lastTradeTimestamp": "Apr 2, 2027", "marketStatus": "Closed"},
+                {"symbol": "MU", "lastSalePrice": "$857.50", "lastTradeTimestamp": "Nov 3, 2026 5:41 AM ET", "marketStatus": "Pre Market"}]}
+            with mock.patch.object(pf, "_get_json", return_value=rows):
+                self.assertEqual(sorted(self.real_batch([("TSM", "stocks"), ("MU", "stocks")])), ["MU"])
+
     def _nasdaq_replies(self, status, secondary=None, primary_change="+0.61"):
         info = {"marketStatus": status, "companyName": "Intel",
                 "primaryData": {"lastSalePrice": "$86.10", "netChange": primary_change,
