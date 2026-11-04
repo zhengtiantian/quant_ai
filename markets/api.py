@@ -277,6 +277,16 @@ def tasks_monitor_route():
         return _error(e, 500)
 
 
+@router.get("/tasks/schedule")
+def tasks_schedule_route():
+    """Today's and tomorrow's runs (Dublin days) of every scheduled task, in time order, with their state."""
+    from . import task_schedule
+    try:
+        return {"status": "success", **task_schedule.schedule()}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
 @router.get("/tasks/log")
 def tasks_log_route(
     source: str = "airflow",

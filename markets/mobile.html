@@ -58,6 +58,9 @@
   .q.qi .qn { font-weight: 700; } .q.first-stock { border-top: 1px solid rgba(255,255,255,0.06); margin-top: 3px; padding-top: 3px; }
   .foot { display: flex; justify-content: space-between; margin-top: 10px; }
   .msg { padding: 8px 0; }
+  .ixgrid { display: grid; grid-template-columns: 1fr auto auto; column-gap: 12px; row-gap: 3px; font-size: 13px; margin: 2px 0 6px; }
+  .ixgrid .ixn { color: #cbd5e1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ixgrid .r { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -160,6 +163,12 @@ function render(d, offline) {
       </div></div>`;
   }).join("") || `<div class="muted msg">No holdings yet</div>`;
 
+  // The user's indices (S&P 500, Nasdaq, SOX, QQQ, SPY...), refreshed with the holdings.
+  const ixs = d.indices || [];
+  const indices = ixs.length ? `<div class="ghead"><span class="t">📈 Indices</span></div><div class="ixgrid">` +
+    ixs.map((i) => `<span class="ixn">${esc(i.name)}</span><span class="r">${num(i.price)}</span>` +
+      `<span class="r" style="color:${col(i.change_pct)};font-weight:600">${pct(i.change_pct) || "—"}</span>`).join("") + `</div>` : "";
+
   // Global markets: one line per country (its indices); tap it for its exchanges, each with its
   // status, local time and hours, its indices and its stocks.
   const g = d.global || {};
@@ -205,6 +214,8 @@ function render(d, offline) {
     <div class="hr"></div>
     ${holdings}
     <div class="hr" style="margin-bottom:0"></div>
+    ${indices}
+    ${ixs.length ? `<div class="hr" style="margin-bottom:0"></div>` : ""}
     ${globalHead}
     ${regions}
     <div class="muted foot">

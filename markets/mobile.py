@@ -5,7 +5,7 @@ http://<mac>.<tailnet>.ts.net/ to http://127.0.0.1:18000/m/ for the user's own t
 (WireGuard-encrypted end to end), so nothing else of the API is exposed. serve passes the caller's
 tailnet address in X-Forwarded-For, which uvicorn trusts only from 127.0.0.1: so these routes answer
 this Mac and tailnet addresses (100.64.0.0/10, fd7a:115c:a1e0::/48), and the LAN still sees nothing.
-/m/state is /api/markets/portfolio/state cut to what the card shows: the holdings, and the global
+/m/state is /api/markets/portfolio/state cut to what the card shows: the holdings, the user's indices, and the global
 markets (every exchange's indices and stocks: name, price, change, currency).
 """
 
@@ -70,7 +70,9 @@ def state():
                     for h in s.get("holdings") or []]
         return {"status": "success", "holdings": holdings, "totals": s.get("totals"), "session": s.get("session"),
                 "us_time": s.get("us_time"), "server_time": s.get("server_time"), "refresh_seconds": s.get("refresh_seconds"),
-                "global": _global(s.get("global") or {})}
+                "global": _global(s.get("global") or {}),
+                "indices": [{k: q.get(k) for k in ("symbol", "name", "price", "change", "change_pct", "currency")}
+                            for q in s.get("indices") or []]}
     except Exception as e:  # noqa: BLE001
         return _error(e, 500)
 

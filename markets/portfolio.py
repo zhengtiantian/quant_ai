@@ -1276,4 +1276,7 @@ def get_state(force_quotes: bool = False, path: Optional[Path] = None, cached_qu
         "us_time": datetime.now(US_EAST).strftime("%H:%M"), "usd_cny": _usd_cny(),
         "tx_types": TX_TYPES, "server_time": time.time(), "refreshing": refreshing, "cash": get_cash(path),
         "global": global_markets.global_state(path, background=background_refresh),
+        # the user's indices (Holdings page module), refreshed as often as the holdings (60 s when closed)
+        "indices": global_markets.indices_live(path, max_age=refresh_interval(session, REFRESH_SECONDS) or 60,
+                                               background=background_refresh),
     }

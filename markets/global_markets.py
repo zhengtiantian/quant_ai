@@ -428,3 +428,43 @@ def set_index(symbol: str, shown: bool, path: Optional[Path] = None) -> Dict[str
     finally:
         conn.close()
     return indices_state(path)
+
+
+_index_lock = threading.Lock()
+_index_running = {"on": False}
+
+
+def indices_live(path: Optional[Path] = None, max_age: float = MACRO_TTL, background: bool = True) -> List[Dict[str, Any]]:
+    """The shown indices from stored quotes, for the portfolio state (the page, the widget, the phone): answers
+    at once and, when a quote is older than max_age (the holdings' refresh interval), refreshes them in a thread."""
+    syms = _index_symbols(path)
+    if not syms:
+        return []
+    conn = pf._conn(path)
+    try:
+        stored = {r["symbol"]: dict(r) for r in conn.execute(
+            f"SELECT * FROM global_quotes WHERE symbol IN ({','.join('?' * len(syms))})", syms)}
+    finally:
+        conn.close()
+    now = time.time()
+    if any(s not in stored or now - stored[s]["fetched_at"] >= max_age for s in syms):
+        if background:
+            with _index_lock:
+                start = not _index_running["on"]
+                _index_running["on"] = True
+            if start:
+                def run():
+                    try:
+                        _cached_cnbc(syms, path, max_age)
+                    finally:
+                        with _index_lock:
+                            _index_running["on"] = False
+                threading.Thread(target=run, name="index-quotes", daemon=True).start()
+        # background=False (a save, the tests): stored quotes only, as global_state does
+    out = []
+    for sym in syms:
+        name, group = _INDEX_NAMES.get(sym, (sym, "Other"))
+        row = stored.get(sym)
+        out.append({"symbol": sym, "name": name, "group": group, "fetched_at": row["fetched_at"] if row else None,
+                    **(json.loads(row["data"]) if row else {})})
+    return out
