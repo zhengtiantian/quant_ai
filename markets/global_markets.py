@@ -312,9 +312,11 @@ def fetch_cnbc(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def macro_state(path: Optional[Path] = None, max_age: float = MACRO_TTL) -> Dict[str, Any]:
+def _cached_cnbc(syms: List[str], path: Optional[Path] = None, max_age: float = MACRO_TTL) -> Dict[str, Dict[str, Any]]:
+    """global_quotes rows for `syms`, refreshed from CNBC (one request) when older than max_age."""
     pf.init_db(path)
-    syms = [m[0] for m in MACRO_ITEMS]
+    if not syms:
+        return {}
     conn = pf._conn(path)
     try:
         stored = {r["symbol"]: dict(r) for r in conn.execute(
@@ -338,9 +340,91 @@ def macro_state(path: Optional[Path] = None, max_age: float = MACRO_TTL) -> Dict
                 conn.commit()
             finally:
                 conn.close()
+    return stored
+
+
+def macro_state(path: Optional[Path] = None, max_age: float = MACRO_TTL) -> Dict[str, Any]:
+    stored = _cached_cnbc([m[0] for m in MACRO_ITEMS], path, max_age)
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for sym, name, group in MACRO_ITEMS:
         row = stored.get(sym)
         groups.setdefault(group, []).append({"symbol": sym, "name": name, "fetched_at": row["fetched_at"] if row else None,
                                              **(json.loads(row["data"]) if row else {})})
     return {"groups": [{"name": g, "items": items} for g, items in groups.items()]}
+
+
+# ---------------------------------------------------------------- indices (Holdings page, 2026-11-04)
+# The user moved index ETFs (QQQ, SPY) out of the watchlist into their own module. The ones shown are
+# picked from this catalog on the page and kept in index_watch; every symbol was checked against CNBC.
+INDEX_CATALOG = [
+    (".SPX", "S&P 500", "US indices"), (".IXIC", "Nasdaq Composite", "US indices"), (".NDX", "Nasdaq 100", "US indices"),
+    (".DJI", "Dow Jones Industrial", "US indices"), (".RUT", "Russell 2000", "US indices"),
+    (".SOX", "Philadelphia Semiconductor (SOX)", "US indices"), (".NDXT", "Nasdaq-100 Technology", "US indices"),
+    (".SPXEW", "S&P 500 Equal Weight", "US indices"), (".NYA", "NYSE Composite", "US indices"),
+    (".DJT", "Dow Jones Transportation", "US indices"), (".NBI", "Nasdaq Biotechnology", "US indices"),
+    (".XAU", "PHLX Gold/Silver", "US indices"), (".VIX", "VIX (volatility)", "US indices"),
+    ("SPY", "SPDR S&P 500 ETF", "Index ETFs"), ("VOO", "Vanguard S&P 500 ETF", "Index ETFs"),
+    ("QQQ", "Invesco QQQ (Nasdaq 100)", "Index ETFs"), ("QQQM", "Invesco Nasdaq 100 ETF", "Index ETFs"),
+    ("DIA", "SPDR Dow Jones ETF", "Index ETFs"), ("IWM", "iShares Russell 2000 ETF", "Index ETFs"),
+    ("RSP", "Invesco S&P 500 Equal Weight ETF", "Index ETFs"), ("VTI", "Vanguard Total Stock Market ETF", "Index ETFs"),
+    ("SOXX", "iShares Semiconductor ETF", "Chips & tech"), ("SMH", "VanEck Semiconductor ETF", "Chips & tech"),
+    ("XLK", "Technology Select Sector SPDR", "Chips & tech"), ("IGV", "iShares Software ETF", "Chips & tech"),
+    ("CIBR", "First Trust Cybersecurity ETF", "Chips & tech"), ("BOTZ", "Global X Robotics & AI ETF", "Chips & tech"),
+    ("ARKK", "ARK Innovation ETF", "Chips & tech"),
+    ("XLF", "Financials", "Sectors"), ("XLE", "Energy", "Sectors"), ("XLV", "Health care", "Sectors"),
+    ("XLI", "Industrials", "Sectors"), ("XLY", "Consumer discretionary", "Sectors"), ("XLP", "Consumer staples", "Sectors"),
+    ("XLU", "Utilities", "Sectors"), ("XLB", "Materials", "Sectors"), ("XLRE", "Real estate", "Sectors"),
+    ("XLC", "Communication services", "Sectors"), ("XBI", "S&P Biotech ETF", "Sectors"), ("KRE", "Regional banks ETF", "Sectors"),
+    ("ITB", "Home construction ETF", "Sectors"),
+    ("EEM", "iShares MSCI Emerging Markets", "Global & other"), ("VEA", "Vanguard Developed Markets", "Global & other"),
+    ("KWEB", "KraneShares China Internet", "Global & other"), ("TLT", "iShares 20+ Year Treasury", "Global & other"),
+    ("GLD", "SPDR Gold Shares", "Global & other"), ("IBIT", "iShares Bitcoin Trust", "Global & other"),
+    ("TQQQ", "ProShares UltraPro QQQ (3x)", "Leveraged"), ("SOXL", "Direxion Semiconductor Bull (3x)", "Leveraged"),
+]
+INDEX_DEFAULT = [".SPX", ".IXIC", ".SOX", "QQQ", "SPY"]
+_INDEX_NAMES = {s: (n, g) for s, n, g in INDEX_CATALOG}
+
+
+def _index_symbols(path: Optional[Path] = None) -> List[str]:
+    pf.init_db(path)
+    conn = pf._conn(path)
+    try:
+        existed = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='index_watch'").fetchone()
+        conn.execute("CREATE TABLE IF NOT EXISTS index_watch (symbol TEXT PRIMARY KEY, position INTEGER, added_at TEXT)")
+        if not existed:
+            for i, sym in enumerate(INDEX_DEFAULT):
+                conn.execute("INSERT INTO index_watch VALUES (?, ?, datetime('now'))", (sym, i))
+        conn.commit()
+        return [r["symbol"] for r in conn.execute("SELECT symbol FROM index_watch ORDER BY position, added_at")]
+    finally:
+        conn.close()
+
+
+def indices_state(path: Optional[Path] = None, max_age: float = MACRO_TTL) -> Dict[str, Any]:
+    syms = _index_symbols(path)
+    stored = _cached_cnbc(syms, path, max_age)
+    items = []
+    for sym in syms:
+        name, group = _INDEX_NAMES.get(sym, (sym, "Other"))
+        row = stored.get(sym)
+        items.append({"symbol": sym, "name": name, "group": group, "fetched_at": row["fetched_at"] if row else None,
+                      **(json.loads(row["data"]) if row else {})})
+    catalog = [{"symbol": s, "name": n, "group": g, "shown": s in syms} for s, n, g in INDEX_CATALOG]
+    return {"items": items, "catalog": catalog, "refresh_seconds": MACRO_TTL}
+
+
+def set_index(symbol: str, shown: bool, path: Optional[Path] = None) -> Dict[str, Any]:
+    sym = str(symbol or "").strip().upper()
+    if sym not in _INDEX_NAMES:
+        raise ValueError(f"{symbol} is not in the index catalog")
+    syms = _index_symbols(path)
+    conn = pf._conn(path)
+    try:
+        if shown and sym not in syms:
+            conn.execute("INSERT INTO index_watch VALUES (?, ?, datetime('now'))", (sym, len(syms)))
+        elif not shown:
+            conn.execute("DELETE FROM index_watch WHERE symbol = ?", (sym,))
+        conn.commit()
+    finally:
+        conn.close()
+    return indices_state(path)

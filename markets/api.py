@@ -151,6 +151,25 @@ def macro():
         return _error(e, 500)
 
 
+@router.get("/indices")
+def indices():
+    try:
+        return {"status": "success", **global_markets.indices_state()}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
+@router.post("/indices")
+def indices_set(body: Dict[str, Any]):
+    """{"symbol": ".SOX", "shown": true|false}: show or hide one catalog index on the Holdings page."""
+    try:
+        return {"status": "success", **global_markets.set_index(body.get("symbol"), bool(body.get("shown", True)))}
+    except (ValueError, KeyError) as e:
+        return _error(e, 400)
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
 @router.get("/briefs")
 def briefs_list(kind: str = "", limit: int = 60):
     from . import briefs
