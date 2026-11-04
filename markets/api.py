@@ -213,6 +213,31 @@ def predictions_scorecard():
         return _error(e, 500)
 
 
+@router.get("/keywords/review")
+def keywords_review():
+    """The weekly keyword proposals with the user's decisions (markets/keyword_review.py)."""
+    from . import keyword_review
+    try:
+        return {"status": "success", **keyword_review.review()}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
+@router.post("/keywords/decide")
+def keywords_decide(payload: Dict[str, Any]):
+    """{"ids": [...], "decision": "add" | "weak" | "reject" | "pending" | "keep", "history"?: "full" | "first_seen"}."""
+    from . import keyword_review
+    try:
+        ids = [str(i) for i in payload.get("ids") or []]
+        if not ids:
+            raise ValueError("no ids")
+        return {"status": "success", **keyword_review.decide(ids, payload.get("decision"), payload.get("history"))}
+    except (ValueError, KeyError) as e:
+        return _error(e, 400)
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
 @router.get("/pipeline/health")
 def pipeline_health_route(refresh: str = ""):
     """Freshness of each quant_data stage; ?refresh=1 checks now instead of the last result."""
