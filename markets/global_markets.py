@@ -140,9 +140,14 @@ def _parse_cnbc(q: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     last = pf._money(q.get("last"))
     if last is None:
         return None
-    return {"price": last, "change": pf._money(q.get("change")), "change_pct": pf._money(q.get("change_pct")),
-            "prev_close": pf._money(q.get("previous_day_closing")), "currency": q.get("currencyCode"),
-            "trade_time": q.get("last_time"), "full_name": q.get("name")}
+    out = {"price": last, "change": pf._money(q.get("change")), "change_pct": pf._money(q.get("change_pct")),
+           "prev_close": pf._money(q.get("previous_day_closing")), "currency": q.get("currencyCode"),
+           "trade_time": q.get("last_time"), "full_name": q.get("name")}
+    ext = q.get("ExtendedMktQuote") or {}
+    if pf._money(ext.get("last")) is not None:   # pre/after-market price (ETFs; indices have none)
+        out.update(ext_price=pf._money(ext.get("last")), ext_type=ext.get("type"), ext_time=ext.get("last_time"))
+    out["market_status"] = q.get("curmktstatus")      # CNBC keeps the last pre-market quote during the session
+    return out
 
 
 def _parse_naver(q: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -408,7 +413,7 @@ def indices_state(path: Optional[Path] = None, max_age: float = MACRO_TTL) -> Di
         name, group = _INDEX_NAMES.get(sym, (sym, "Other"))
         row = stored.get(sym)
         items.append({"symbol": sym, "name": name, "group": group, "fetched_at": row["fetched_at"] if row else None,
-                      **(json.loads(row["data"]) if row else {})})
+                      **(_vs_last_close(json.loads(row["data"])) if row else {})})
     catalog = [{"symbol": s, "name": n, "group": g, "shown": s in syms} for s, n, g in INDEX_CATALOG]
     return {"items": items, "catalog": catalog, "refresh_seconds": MACRO_TTL}
 
@@ -428,6 +433,35 @@ def set_index(symbol: str, shown: bool, path: Optional[Path] = None) -> Dict[str
     finally:
         conn.close()
     return indices_state(path)
+
+
+def _vs_last_close(q: Dict[str, Any]) -> Dict[str, Any]:
+    """An index quote measured against the last regular close, as the holdings are (2026-11-05: before the
+    US open CNBC still gave yesterday's whole-day move, previous_day_closing already equal to the price).
+      pre-market:  the pre-market price against the last close
+      after hours: the after-hours price against the close before today's session
+      no extended price and the session not started (previous close == price): unchanged, 0%
+      otherwise CNBC's own change, which is against the previous close."""
+    price, change, prev = q.get("price"), q.get("change"), q.get("prev_close")
+    if price is None:
+        return q
+    ext, kind = q.get("ext_price"), (q.get("ext_type") or "").upper()
+    status = (q.get("market_status") or "").upper()
+    if status and not status.startswith(kind[:3] or "-"):
+        ext = None                                     # a pre-market quote left over in the regular session (2026-11-05)
+    if ext is not None and kind.startswith("PRE"):
+        base, now, basis = prev if prev is not None else price, ext, "pre-market"
+    elif ext is not None and kind.startswith("POST"):
+        base, now, basis = (price - change) if change is not None else prev, ext, "after-hours"
+    elif prev is not None and abs(prev - price) < 1e-9:
+        base, now, basis = price, price, "last close"
+    else:
+        return {**q, "basis": "session"}
+    if base is None or not base:
+        return q
+    ch = round(now - base, 4)
+    return {**q, "price": now, "change": ch, "change_pct": round(ch / base * 100, 2), "ref_close": base,
+            "session_price": price, "basis": basis}
 
 
 _index_lock = threading.Lock()
@@ -466,5 +500,5 @@ def indices_live(path: Optional[Path] = None, max_age: float = MACRO_TTL, backgr
         name, group = _INDEX_NAMES.get(sym, (sym, "Other"))
         row = stored.get(sym)
         out.append({"symbol": sym, "name": name, "group": group, "fetched_at": row["fetched_at"] if row else None,
-                    **(json.loads(row["data"]) if row else {})})
+                    **(_vs_last_close(json.loads(row["data"])) if row else {})})
     return out

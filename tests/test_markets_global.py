@@ -127,3 +127,29 @@ class RefreshGlobalTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_index_change_is_against_the_last_close():
+    """2026-11-05: before the US open CNBC still gave yesterday's whole-day move (prev close == price)."""
+    from markets.global_markets import _vs_last_close
+    idx = _vs_last_close({"price": 7688.62, "change": 119.7, "change_pct": 1.58, "prev_close": 7688.62})
+    assert idx["change"] == 0 and idx["change_pct"] == 0 and idx["basis"] == "last close"
+    pre = _vs_last_close({"price": 691.95, "change": 6.67, "change_pct": 0.97, "prev_close": 691.95,
+                          "ext_price": 688.64, "ext_type": "PRE_MKT"})
+    assert pre["price"] == 688.64 and pre["change"] == -3.31 and pre["change_pct"] == -0.48 and pre["ref_close"] == 691.95
+    post = _vs_last_close({"price": 700.0, "change": 8.05, "change_pct": 1.16, "prev_close": 691.95,
+                           "ext_price": 702.0, "ext_type": "POST_MKT"})
+    assert post["ref_close"] == 691.95 and post["change"] == 10.05 and post["session_price"] == 700.0
+    live = _vs_last_close({"price": 7700.0, "change": 11.38, "change_pct": 0.15, "prev_close": 7688.62})
+    assert live["change"] == 11.38 and live["basis"] == "session"
+
+
+def test_stale_pre_market_quote_is_ignored_in_the_session():
+    """2026-11-05: at 15:00 ET CNBC still carried the 09:30 pre-market quote; the regular price must win."""
+    from markets.global_markets import _vs_last_close
+    q = _vs_last_close({"price": 656.46, "change": -35.49, "change_pct": -5.13, "prev_close": 691.95,
+                        "ext_price": 683.12, "ext_type": "PRE_MKT", "market_status": "REG_MKT"})
+    assert q["price"] == 656.46 and q["change_pct"] == -5.13 and q["basis"] == "session"
+    pre = _vs_last_close({"price": 691.95, "change": 6.67, "change_pct": 0.97, "prev_close": 691.95,
+                          "ext_price": 688.64, "ext_type": "PRE_MKT", "market_status": "PRE_MKT"})
+    assert pre["price"] == 688.64 and pre["basis"] == "pre-market"
