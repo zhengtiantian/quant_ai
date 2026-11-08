@@ -85,6 +85,4 @@ analyst_downgrade, inst_outflow. Results written to `positions` with status=clos
 
 ## LangChain Agent (quant_langchain/main.py)
 - Exposes FastAPI on port 8083
-- /api/workflow/generate-spec: agent uses tools to gather context, then generates JSON strategy spec
-- /api/workflow/generate-tasks: LLM generates Python code for each task in the spec
 - /api/ask: RAG-augmented Q&A about the quant system

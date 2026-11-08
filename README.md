@@ -103,7 +103,6 @@ are. This closes that gap by driving the real model against fixed cases in
 | `POST` | `/api/agent/portfolio` | Portfolio review: rule decisions + deterministic portfolio checks |
 | `POST` | `/api/agent/research/stream` | Same run as SSE: one event per tool call, then final |
 | `POST` | `/api/ask` | Natural language Q&A with RAG context |
-| `POST` | `/api/generate-script` | Generate a quant Python script from description |
 | `GET` | `/health` | Service health + model connectivity |
 | `GET` | `/docs` | FastAPI auto-generated docs |
 
