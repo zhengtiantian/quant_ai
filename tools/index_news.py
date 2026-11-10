@@ -167,6 +167,10 @@ def main() -> None:
 
     last_id, seen = load_checkpoint(args.reset)
     query = {"_id": {"$gt": __import__("bson").ObjectId(last_id)}} if last_id else {}
+    # 2026-11-10: the 490 universe companies' articles joined the matched collection (origin=universe_backfill).
+    # Not embedded unless INDEX_INCLUDE_UNIVERSE=1: ~740k rows, and the eval sets were built on the 102.
+    if os.getenv("INDEX_INCLUDE_UNIVERSE", "0") != "1":
+        query["origin"] = {"$ne": "universe_backfill"}
     if last_id:
         print(f"resuming after _id={last_id} ({len(seen)} dedupe keys carried over)")
 

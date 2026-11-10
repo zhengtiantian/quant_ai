@@ -195,10 +195,14 @@ def news(symbols: List[str], days: int = NEWS_DAYS, per_symbol: int = NEWS_PER_S
     since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y%m%d")
     q = {"symbol": {"$in": symbols}, "date": {"$gte": since}}
     proj = {"_id": 0, "symbol": 1, "date": 1, "title": 1, "source": 1, "url": 1}
-    labelled = {d["url"]: d for d in _db()["news_articles_company_matched_v2"].find(
+    # keyed by (url, symbol): since 2026-11-10 one article is stored for each company it is about, and the
+    # sentiment belongs to that company's copy
+    key = lambda d: (d.get("url"), d.get("symbol"))  # noqa: E731
+    labelled = {key(d): d for d in _db()["news_articles_company_matched_v2"].find(
         q, {**proj, "llm_sentiment_final": 1, "llm_event_type_a": 1}).sort("date", -1).limit(60 * len(symbols)) if d.get("url")}
     raw = list(_db()["news_articles"].find(q, proj).sort("date", -1).limit(60 * len(symbols)))
-    rows = sorted([labelled.get(r.get("url"), r) for r in raw] + [d for u, d in labelled.items() if u not in {r.get("url") for r in raw}],
+    raw_keys = {key(r) for r in raw}
+    rows = sorted([labelled.get(key(r), r) for r in raw] + [d for k, d in labelled.items() if k not in raw_keys],
                   key=lambda r: str(r.get("date") or ""), reverse=True)
     out: Dict[str, List[Dict[str, Any]]] = {s: [] for s in symbols}
     seen = set()
