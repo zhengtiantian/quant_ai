@@ -393,6 +393,18 @@ class PortfolioTest(unittest.TestCase):
         self.assertEqual(out["NVDA"]["price"], 213.0)          # the per-symbol fetch (fake) won, not 91.215
 
 
+    def test_chart_comes_from_cnbc_while_nasdaq_is_blocked(self):
+        day = pf.datetime.now(pf.US_EAST).date().strftime("%Y%m%d")
+        bars = [{"t": day + "040000", "open": 10.0, "high": 11.0, "low": 9.5, "close": 10.5, "volume": 100.0},
+                {"t": day + "093000", "open": 10.5, "high": 12.0, "low": 10.4, "close": 11.8, "volume": 900.0}]
+        with mock.patch.object(pf, "nasdaq_blocked", return_value=True), \
+             mock.patch.object(pf, "_intraday", side_effect=AssertionError("Nasdaq must not be asked")), \
+             mock.patch.object(pf, "_cnbc_bars", return_value=bars):
+            out = pf.get_chart("NVDA", "1d", path=self.db)
+        self.assertEqual(out["source"], "cnbc")
+        self.assertEqual([c["session"] for c in out["candles"]], ["pre", "regular"])
+        self.assertEqual(out["candles"][1]["high"], 12.0)
+
     def test_pre_market_asks_cnbc_first_and_nasdaq_only_for_what_it_lacks(self):
         fetched = []
         cnbc = {"NVDA": {**fake_quote("NVDA"), "price": 200.0, "source": "cnbc"}}

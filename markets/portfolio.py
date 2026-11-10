@@ -1268,6 +1268,57 @@ def _daily(symbol: str, cls: str, days: int) -> List[Dict[str, Any]]:
     return sorted(out, key=lambda x: x["time"])
 
 
+# Charts from CNBC when Nasdaq does not answer (blocked since 2026-11-10): real OHLC bars, 5-minute
+# from 4:00 ET for the day and daily for the longer ranges. tradeTime is ET wall-clock time; it is
+# encoded as if UTC, the convention Nasdaq's points use above, so the page reads both the same way.
+CNBC_BARS_URL = "https://ts-api.cnbc.com/harmony/app/bars/{sym}/{interval}/{start}/{end}/adjusted/EST5EDT.json"
+
+
+def _cnbc_bars(symbol: str, interval: str, start: date, end: date) -> List[Dict[str, Any]]:
+    d = _get_json(CNBC_BARS_URL.format(sym=urllib.parse.quote(symbol), interval=interval,
+                                       start=start.strftime("%Y%m%d") + "000000", end=end.strftime("%Y%m%d") + "235959"))
+    out = []
+    for b in ((d.get("barData") or {}).get("priceBars")) or []:
+        o, h, l, c = (_money(b.get(k)) for k in ("open", "high", "low", "close"))
+        if None in (o, h, l, c) or not b.get("tradeTime"):
+            continue
+        out.append({"t": str(b["tradeTime"]), "open": o, "high": h, "low": l, "close": c, "volume": float(b.get("volume") or 0)})
+    return out
+
+
+def _intraday_cnbc(symbol: str, path: Optional[Path] = None) -> Dict[str, Any]:
+    """The latest day with bars in the last few (today once pre-market has traded), as _intraday returns."""
+    from datetime import timezone
+    today = datetime.now(US_EAST).date()
+    bars = _cnbc_bars(symbol, f"{INTRADAY_BUCKET_MIN}M", date.fromordinal(today.toordinal() - 5), today)
+    day = max((b["t"][:8] for b in bars), default=None)
+    candles = []
+    for b in bars:
+        if b["t"][:8] != day:
+            continue
+        t = datetime.strptime(b["t"], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        hm = t.hour * 60 + t.minute
+        candles.append({"time": int(t.timestamp()), "open": b["open"], "high": b["high"], "low": b["low"],
+                        "close": b["close"], "volume": b["volume"],
+                        "session": "pre" if hm < 570 else "post" if hm >= 960 else "regular"})
+    prev = None
+    conn = _conn(path)
+    try:
+        row = conn.execute("SELECT data FROM quotes WHERE symbol = ?", (symbol,)).fetchone()
+        if row and day == today.strftime("%Y%m%d"):
+            prev = json.loads(row["data"]).get("prev_close")
+    finally:
+        conn.close()
+    return {"candles": candles, "prev_close": prev}
+
+
+def _daily_cnbc(symbol: str, days: int) -> List[Dict[str, Any]]:
+    today = datetime.now(US_EAST).date()
+    return [{"time": f"{b['t'][:4]}-{b['t'][4:6]}-{b['t'][6:8]}", "open": b["open"], "high": b["high"], "low": b["low"],
+             "close": b["close"], "volume": b["volume"]}
+            for b in _cnbc_bars(symbol, "1D", date.fromordinal(today.toordinal() - days), today)]
+
+
 def get_chart(symbol: str, rng: str = "1d", path: Optional[Path] = None) -> Dict[str, Any]:
     symbol = re.sub(r"\s+", "", str(symbol or "")).upper()
     if rng not in CHART_RANGES:
@@ -1284,15 +1335,20 @@ def get_chart(symbol: str, rng: str = "1d", path: Optional[Path] = None) -> Dict
         return {**json.loads(row["data"]), "cached": True}
     known = _asset_class(symbol, path)
     last_err = None
-    for cls in ([known] if known else []) + [c for c in ("stocks", "etf") if c != known]:
+    # Nasdaq per asset class (skipped while it is refusing this client), then CNBC.
+    sources = [] if nasdaq_blocked() else [
+        ("nasdaq", lambda cls=cls: _intraday(symbol, cls), lambda cls=cls: _daily(symbol, cls, CHART_RANGES[rng]))
+        for cls in ([known] if known else []) + [c for c in ("stocks", "etf") if c != known]]
+    sources.append(("cnbc", lambda: _intraday_cnbc(symbol, path), lambda: _daily_cnbc(symbol, CHART_RANGES[rng])))
+    for source, get_intraday, get_daily in sources:
         try:
-            intraday = _intraday(symbol, cls)
+            intraday = get_intraday()
             if rng == "1d":
                 if not intraday["candles"]:
                     continue
-                result = {"symbol": symbol, "range": rng, "interval": f"{INTRADAY_BUCKET_MIN}m", **intraday}
+                result = {"symbol": symbol, "range": rng, "interval": f"{INTRADAY_BUCKET_MIN}m", "source": source, **intraday}
             else:
-                candles = _daily(symbol, cls, CHART_RANGES[rng])
+                candles = get_daily()
                 if not candles:
                     continue
                 reg = [c for c in intraday["candles"] if c["session"] == "regular"]
@@ -1301,7 +1357,7 @@ def get_chart(symbol: str, rng: str = "1d", path: Optional[Path] = None) -> Dict
                     candles.append({"time": today, "open": reg[0]["open"], "high": max(c["high"] for c in reg),
                                     "low": min(c["low"] for c in reg), "close": reg[-1]["close"],
                                     "volume": sum(c["volume"] for c in reg), "partial": True})
-                result = {"symbol": symbol, "range": rng, "interval": "1d", "candles": candles}
+                result = {"symbol": symbol, "range": rng, "interval": "1d", "source": source, "candles": candles}
             break
         except Exception as e:  # noqa: BLE001
             last_err = e
