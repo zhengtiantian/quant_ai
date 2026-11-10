@@ -21,7 +21,7 @@ from . import portfolio as pf
 # a closed one is fetched once after its close for the final price and then left alone.
 GLOBAL_TTL = 60
 CNBC_URL = ("https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols={syms}"
-            "&requestMethod=itv&noform=1&partnerId=2&fund=1&exthrs=1&output=json")
+            "&requestMethod=itv&noform=1&partnerId=2&fund=1&exthrs=1&output=json")   # same as portfolio.CNBC_URL (circular import)
 NAVER_URL = "https://polling.finance.naver.com/api/realtime/domestic/stock/{codes}"
 NAVER_PREFIX = "KRX:"
 # country code: (name, flag, region)
@@ -120,7 +120,7 @@ GLOBAL_ITEMS = [
     (".STOXX50E", "Euro Stoxx 50", "STOXX", "index"),
 ]
 _global_lock = threading.Lock()
-_global_state = {"running": False}
+_global_state = {"running": False, "started_at": 0.0, "gen": 0}   # hung-round takeover as in portfolio.refresh_in_background
 
 
 def market_status(exchange: str, now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -229,9 +229,10 @@ def refresh_global(path: Optional[Path] = None) -> int:
 
 def refresh_global_in_background(path: Optional[Path] = None) -> bool:
     with _global_lock:
-        if _global_state["running"]:
+        if _global_state["running"] and time.time() - _global_state["started_at"] < pf.REFRESH_STUCK_SECONDS:
             return True
-        _global_state["running"] = True
+        _global_state.update(running=True, started_at=time.time(), gen=_global_state["gen"] + 1)
+        gen = _global_state["gen"]
 
     def run():
         try:
@@ -240,7 +241,8 @@ def refresh_global_in_background(path: Optional[Path] = None) -> bool:
             pass
         finally:
             with _global_lock:
-                _global_state["running"] = False
+                if _global_state["gen"] == gen:
+                    _global_state["running"] = False
 
     threading.Thread(target=run, name="global-quotes", daemon=True).start()
     return True

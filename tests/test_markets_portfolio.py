@@ -38,6 +38,14 @@ class PortfolioTest(unittest.TestCase):
         self._fx = mock.patch.object(budget_link, "usd_cny", return_value=None)   # no call to job_agent
         self._fx.start()
         self.addCleanup(self._fx.stop)
+        # Nor the fallbacks (CNBC first in pre-market / after hours by the real clock), nor leftover
+        # per-symbol throttling or a Nasdaq pause from another test.
+        for name in ("fetch_quotes_cnbc", "fetch_quotes_finnhub"):
+            p = mock.patch.object(pf, name, return_value={})
+            p.start()
+            self.addCleanup(p.stop)
+        pf._single_last.clear()
+        pf._nasdaq_block["until"] = 0.0
 
     def tearDown(self):
         self._q.stop(); self._b.stop(); self.tmp.cleanup()
@@ -233,6 +241,7 @@ class PortfolioTest(unittest.TestCase):
         conn = pf._conn(self.db)
         conn.execute("UPDATE quotes SET fetched_at = ?", (_t.time() - 10,))   # both 10 s old
         conn.commit(); conn.close()
+        pf._single_last.clear()                         # the TTL is under test here, not the per-symbol throttle
         fetched = []
         with mock.patch.object(pf, "session_now", return_value="regular"), \
              mock.patch.object(pf, "fetch_quote", side_effect=lambda s, *a: fetched.append(s) or fake_quote(s)):
@@ -384,6 +393,32 @@ class PortfolioTest(unittest.TestCase):
         self.assertEqual(out["NVDA"]["price"], 213.0)          # the per-symbol fetch (fake) won, not 91.215
 
 
+    def test_pre_market_asks_cnbc_first_and_nasdaq_only_for_what_it_lacks(self):
+        fetched = []
+        cnbc = {"NVDA": {**fake_quote("NVDA"), "price": 200.0, "source": "cnbc"}}
+        with mock.patch.object(pf, "session_now", return_value="pre"), \
+             mock.patch.object(pf, "fetch_quotes_cnbc", return_value=cnbc) as c, \
+             mock.patch.object(pf, "fetch_quote", side_effect=lambda s, *a: fetched.append(s) or fake_quote(s)):
+            out = pf.get_quotes(["NVDA", "AAPL"], force=True, path=self.db)
+        self.assertEqual(c.call_count, 1)                # one request for both symbols
+        self.assertEqual(out["NVDA"]["price"], 200.0)
+        self.assertEqual(fetched, ["AAPL"])
+
+    def test_per_symbol_nasdaq_requests_are_capped_and_the_rest_go_to_cnbc(self):
+        syms = [f"S{i}" for i in range(10)]
+        fetched = []
+        quote = lambda s: {"symbol": s, "asset_class": "stocks", "name": s, "price": 10.0, "session": "regular"}  # noqa: E731
+        with mock.patch.object(pf, "session_now", return_value="regular"), \
+             mock.patch.object(pf, "fetch_quote", side_effect=lambda s, *a: fetched.append(s) or quote(s)), \
+             mock.patch.object(pf, "fetch_quotes_cnbc", side_effect=lambda items: {s: {**quote(s), "source": "cnbc"} for s, _ in items}) as c:
+            out = pf.get_quotes(syms, force=True, path=self.db)
+            self.assertEqual(len(fetched), pf.SINGLE_MAX_PER_ROUND)
+            self.assertEqual(sorted(s for s, _ in c.call_args[0][0]), sorted(set(syms) - set(fetched)))
+            self.assertTrue(all(out[s]["price"] for s in syms))
+            fetched.clear()
+            pf.get_quotes(syms[:1], force=True, path=self.db)   # asked again within SINGLE_MIN_SECONDS
+            self.assertEqual(fetched, [])
+
     def test_explicit_lot_allocation_swing_profit_statuses_and_invariants(self):
         # User's exact scenario: 10 sh @ $106 + 20 sh @ $73.14, then sell 20 @ $85 closing the $73.14 lot.
         b_high = self.tx(symbol="NVDA", quantity=10, price=106.0, trade_date="2026-10-20")
@@ -481,10 +516,12 @@ class FastWindowTest(unittest.TestCase):
         from zoneinfo import ZoneInfo
         return datetime(2026, 10, 22, hh, mm, tzinfo=ZoneInfo("Europe/Dublin"))
 
-    def test_pre_regular_post_inside_the_window_are_5s(self):
-        for session in ("pre", "regular", "post"):
-            self.assertEqual(pf.refresh_interval(session, pf.REFRESH_SECONDS, self.at(10)), 5)
-            self.assertEqual(pf.refresh_interval(session, pf.WATCH_TTL, self.at(21, 59)), 5)
+    def test_regular_inside_the_window_is_5s_pre_and_post_keep_30s(self):
+        self.assertEqual(pf.refresh_interval("regular", pf.REFRESH_SECONDS, self.at(10)), 5)
+        self.assertEqual(pf.refresh_interval("regular", pf.WATCH_TTL, self.at(21, 59)), 5)
+        for session in ("pre", "post"):            # 2026-11-10: 5 s pre-market got the client blocked by Nasdaq
+            self.assertEqual(pf.refresh_interval(session, pf.REFRESH_SECONDS, self.at(10)), 30)
+            self.assertEqual(pf.refresh_interval(session, pf.WATCH_TTL, self.at(21, 59)), 30)
 
     def test_outside_the_window_the_session_table_applies(self):
         self.assertEqual(pf.refresh_interval("pre", pf.REFRESH_SECONDS, self.at(9, 30)), 30)

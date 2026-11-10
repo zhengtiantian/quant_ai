@@ -45,9 +45,9 @@ SESSIONS = {"pre": "Pre-market", "regular": "Market open", "post": "After hours"
 QUOTE_TTL = {"regular": 5, "pre": 30, "post": 30, "closed": 3600}             # holdings
 WATCH_TTL = {"regular": 5, "pre": 30, "post": 30, "closed": 3600}             # watchlist
 REFRESH_SECONDS = {"regular": 5, "pre": 30, "post": 30, "closed": None}
-# The user's waking hours (Dublin): every 5 s in any trading session, pre-market and after hours
-# included (asked 2026-10-22). Outside it the tables above apply. US pre-market opens 09:00 Dublin
-# and after hours ends 01:00, so on a weekday the window is all trading time.
+# The user's waking hours (Dublin): every 5 s in the regular session. Pre-market and after hours
+# were 5 s too (asked 2026-10-22) until Nasdaq blocked the client on 2026-11-10; they are back to
+# the tables' 30 s (user's call, 2026-11-10). Outside the window the tables above apply.
 FAST_ZONE = ZoneInfo("Europe/Dublin")
 FAST_WINDOW = (dtime(10, 0), dtime(22, 0))
 FAST_SECONDS = 5
@@ -59,9 +59,9 @@ def in_fast_window(now: Optional[datetime] = None) -> bool:
 
 
 def refresh_interval(session: str, table: Dict[str, Any], now: Optional[datetime] = None) -> Any:
-    """Seconds for this session: FAST_SECONDS inside the window while any session trades,
+    """Seconds for this session: FAST_SECONDS inside the window during the regular session,
     otherwise the session's entry in `table` (None = do not poll)."""
-    if session in ("pre", "regular", "post") and in_fast_window(now):
+    if session == "regular" and in_fast_window(now):
         return FAST_SECONDS
     return table.get(session)
 
@@ -602,10 +602,49 @@ def _money(s) -> Optional[float]:
         return None
 
 
+REQUEST_TIMEOUT = 10        # seconds per socket operation
+REQUEST_DEADLINE = 20       # seconds for the whole request
+# On 2026-11-10 Nasdaq started answering every request from Python with 403 (curl from the same
+# machine still got 200) after pre-market polling at 5 s. A 403 stops all Nasdaq requests for
+# NASDAQ_BLOCK_SECONDS so the block is not fed; quotes come from CNBC meanwhile (fetch_quotes_cnbc).
+NASDAQ_HOST = "api.nasdaq.com"
+NASDAQ_BLOCK_SECONDS = 600
+_nasdaq_block = {"until": 0.0}
+
+
+class NasdaqBlocked(RuntimeError):
+    pass
+
+
+def nasdaq_blocked() -> bool:
+    return time.time() < _nasdaq_block["until"]
+
+
 def _get_json(url: str) -> Dict[str, Any]:
+    """The socket timeout only bounds each read: a server dribbling bytes kept one quote request
+    alive for 15+ minutes on 2026-11-10 and with it every later refresh. The body is read in
+    pieces against a wall-clock deadline instead."""
+    nasdaq = urllib.parse.urlsplit(url).hostname == NASDAQ_HOST
+    if nasdaq and nasdaq_blocked():
+        raise NasdaqBlocked("Nasdaq refused this client (HTTP 403); paused")
     req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.load(resp)
+    deadline = time.monotonic() + REQUEST_DEADLINE
+    try:
+        resp = urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT)
+    except urllib.error.HTTPError as e:
+        if nasdaq and e.code == 403:
+            _nasdaq_block["until"] = time.time() + NASDAQ_BLOCK_SECONDS
+        raise
+    with resp:
+        parts = []
+        while True:
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"no complete reply within {REQUEST_DEADLINE}s")
+            chunk = resp.read1(65536)
+            if not chunk:
+                break
+            parts.append(chunk)
+    return json.loads(b"".join(parts))
 
 
 def _nasdaq(symbol: str, endpoint: str, cls: str) -> Optional[Dict[str, Any]]:
@@ -897,6 +936,128 @@ def fetch_quotes_batch(items: List[tuple]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+CNBC_URL = ("https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols={syms}"
+            "&requestMethod=itv&noform=1&partnerId=2&fund=1&exthrs=1&output=json")
+_CNBC_EXT_TYPES = ("PRE_MKT", "POST_MKT")
+
+
+def fetch_quotes_cnbc(items: List[tuple]) -> Dict[str, Dict[str, Any]]:
+    """{symbol: quote} in fetch_quote's shape from CNBC, for [(symbol, asset_class or None)] in one
+    request: the fallback when Nasdaq does not answer. `last` is the regular session's price (dated
+    by last_time); a pre-market / after-hours trade is in ExtendedMktQuote, used when it is from today.
+    The session comes from the clock: CNBC says REG_MKT for a stock without a pre-market trade yet."""
+    if not items:
+        return {}
+    d = _get_json(CNBC_URL.format(syms=urllib.parse.quote("|".join(s for s, _ in items))))
+    rows = {str(q.get("symbol") or "").upper(): q
+            for q in ((d.get("FormattedQuoteResult") or {}).get("FormattedQuote")) or []}
+    today = datetime.now(US_EAST).date().isoformat()
+    session = session_now()
+    out: Dict[str, Dict[str, Any]] = {}
+    for s, cls in items:
+        q = rows.get(s.upper()) or {}
+        last = _money(q.get("last"))
+        if str(q.get("code")) != "0" or last is None:
+            continue
+        change, change_pct = _money(q.get("change")), _money(q.get("change_pct"))
+        traded_today = str(q.get("last_time") or "")[:10] == today
+        # Before today's open `last` is yesterday's close, the baseline itself; after it, last - change.
+        prev_close = round(last - change, 4) if traded_today and change is not None else last
+        ext = q.get("ExtendedMktQuote") or {}
+        ext_price = _money(ext.get("last"))
+        use_ext = (session != "regular" and ext_price is not None and ext.get("type") in _CNBC_EXT_TYPES
+                   and str(ext.get("last_time") or "")[:10] == today)
+        if use_ext:
+            price, s_change, s_pct = ext_price, _money(ext.get("change")), _money(ext.get("change_pct"))
+            regular_price, regular_time, trade_time = last, q.get("last_time"), ext.get("last_time")
+        else:
+            price, regular_time, trade_time = last, None, q.get("last_time")
+            s_change, s_pct = (change, change_pct) if session == "regular" or traded_today else (None, None)
+            regular_price = last if session in ("pre", "post") else None
+        out[s] = {
+            "symbol": s, "asset_class": cls or "stocks", "name": q.get("name") or s,
+            "price": price, "session": session, "market_status": q.get("curmktstatus"),
+            "trade_time": trade_time, "session_change": s_change, "session_change_pct": s_pct,
+            "regular_price": regular_price, "regular_time": regular_time,
+            "prev_close": prev_close, "prev_close_date": today if session != "closed" else None,
+            "source": "cnbc", "price_basis": "post_close" if use_ext and session == "closed" else "last",
+            "volume": _money(q.get("volume")),
+        }
+    return out
+
+
+# Last resort after Nasdaq and CNBC. Its free quote has the regular session only (no pre-market /
+# after-hours price) and one request per symbol, and the key's 60 calls/minute are shared with the
+# news collectors, so a symbol is asked at most once per FINNHUB_MIN_SECONDS and a 429 pauses it.
+FINNHUB_QUOTE_URL = "https://finnhub.io/api/v1/quote?symbol={sym}&token={key}"
+FINNHUB_MIN_SECONDS = 60
+_finnhub_state: Dict[str, Any] = {"last": {}, "paused_until": 0.0}
+
+
+def fetch_quotes_finnhub(items: List[tuple]) -> Dict[str, Dict[str, Any]]:
+    from . import events                       # holds the key lookup; imported here (circular import)
+    key = events._finnhub_key()
+    now = time.time()
+    if not key or now < _finnhub_state["paused_until"]:
+        return {}
+    items = [(s, cls) for s, cls in items if now - _finnhub_state["last"].get(s, 0) >= FINNHUB_MIN_SECONDS]
+    today = datetime.now(US_EAST).date()
+    session = session_now()
+
+    def one(item):
+        s, cls = item
+        _finnhub_state["last"][s] = time.time()
+        try:
+            d = _get_json(FINNHUB_QUOTE_URL.format(sym=urllib.parse.quote(s), key=key))
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                _finnhub_state["paused_until"] = time.time() + FINNHUB_MIN_SECONDS
+            return s, None
+        except Exception:  # noqa: BLE001
+            return s, None
+        price, t = _money(d.get("c")), d.get("t") or 0
+        if not price or not t:
+            return s, None                     # unknown symbols come back as zeros
+        traded = datetime.fromtimestamp(t, US_EAST)
+        traded_today = traded.date() == today
+        # Before today's open c is yesterday's close, the baseline itself; d/dp are yesterday's move then.
+        prev_close = _money(d.get("pc")) if traded_today else price
+        live = session == "regular" or traded_today
+        return s, {
+            "symbol": s, "asset_class": cls or "stocks", "name": s, "price": price, "session": session,
+            "market_status": None, "trade_time": traded.isoformat(),
+            "session_change": _money(d.get("d")) if live else None,
+            "session_change_pct": _money(d.get("dp")) if live else None,
+            "regular_price": price if session in ("pre", "post") else None, "regular_time": None,
+            "prev_close": prev_close, "prev_close_date": today.isoformat() if session != "closed" else None,
+            "source": "finnhub", "price_basis": "regular_only", "volume": None,
+        }
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        return {s: q for s, q in ex.map(one, items) if q}
+
+
+# Per-symbol Nasdaq requests in one round are capped, and a symbol is asked on its own at most once
+# per SINGLE_MIN_SECONDS (regular-session re-checks of a batch row that looked frozen, symbols the
+# batch leaves out). What is left over goes to CNBC in one request.
+SINGLE_MAX_PER_ROUND = 4
+SINGLE_MIN_SECONDS = 30
+_single_last: Dict[str, float] = {}
+
+
+def _take_singles(cands: List[tuple], budget: List[int]) -> List[tuple]:
+    now, picked = time.time(), []
+    for t in cands:
+        if budget[0] <= 0:
+            break
+        if now - _single_last.get(t[0], 0.0) < SINGLE_MIN_SECONDS:
+            continue
+        _single_last[t[0]] = now
+        budget[0] -= 1
+        picked.append(t)
+    return picked
+
+
 def get_quotes(symbols: List[str], force: bool = False, path: Optional[Path] = None,
                cached_only: bool = False, ttl_by_symbol: Optional[Dict[str, float]] = None) -> Dict[str, Dict[str, Any]]:
     """Quotes for the symbols, refreshed when older than their session's TTL; on any failure
@@ -942,13 +1103,26 @@ def get_quotes(symbols: List[str], force: bool = False, path: Optional[Path] = N
             return s, None, f"{type(e).__name__}: {e}"
 
     results = []
+    cnbc_tried = False
+    if todo and clock_session in ("pre", "post"):
+        # Pre-market / after hours: CNBC first, one request for every symbol; Nasdaq answers only
+        # one symbol per request there, which is what got this client blocked on 2026-11-10.
+        cnbc_tried = True
+        try:
+            first = fetch_quotes_cnbc([(s, cls) for s, cls, _ in todo])
+        except Exception:  # noqa: BLE001 - Nasdaq and Finnhub below are still tried
+            first = {}
+        results = [(s, first[s], None) for s, _, _ in todo if first.get(s)]
+    done = {s for s, _, _ in results}
+    nasdaq_todo = [] if nasdaq_blocked() else [t for t in todo if t[0] not in done]
+    budget = [SINGLE_MAX_PER_ROUND]
     with ThreadPoolExecutor(max_workers=12) as ex:
-        if todo and clock_session == "regular":
+        if nasdaq_todo and clock_session == "regular":
             # Symbols the batch endpoint has left out before (SPY, WDC on 2026-10-20) start their
             # per-symbol fetch alongside the batch instead of after it.
-            known_missing = [t for t in todo if t[0] in _BATCH_MISSES]
+            known_missing = _take_singles([t for t in nasdaq_todo if t[0] in _BATCH_MISSES], budget)
             early = [ex.submit(work, t) for t in known_missing]
-            asked = [t for t in todo if t[0] not in _BATCH_MISSES]
+            asked = [t for t in nasdaq_todo if t[0] not in _BATCH_MISSES]
             try:
                 batch = fetch_quotes_batch([(s, cls) for s, cls, _ in asked]) if asked else {}
             except Exception:  # noqa: BLE001 - the per-symbol path below covers everything then
@@ -960,13 +1134,37 @@ def get_quotes(symbols: List[str], force: bool = False, path: Optional[Path] = N
                 new = batch[s].get("volume")
                 return bool(prev and new and new <= prev)
             behind = {s for s in batch if older(s)}
-            results = [(s, batch[s], None) for s, _, _ in asked if s in batch and s not in behind]
+            results += [(s, batch[s], None) for s, _, _ in asked if s in batch and s not in behind]
             late = [t for t in asked if t[0] not in batch or t[0] in behind]
             if batch:                                   # an empty reply is an outage, not a verdict
                 _BATCH_MISSES.update(t[0] for t in late if t[0] not in batch)
-            results += [f.result() for f in early] + list(ex.map(work, late))
+            results += [f.result() for f in early] + list(ex.map(work, _take_singles(late, budget)))
         else:
-            results = list(ex.map(work, todo))
+            results += list(ex.map(work, _take_singles(nasdaq_todo, budget)))
+    # Whatever Nasdaq did not price (blocked, failed, not found, over the per-symbol budget) is
+    # asked of CNBC in one request, unless CNBC already answered first, then of Finnhub.
+    by_sym = {s: (s, q, err) for s, q, err in results}
+    missing = [(s, cls) for s, cls, _ in todo if not (by_sym.get(s) or (s, None, None))[1]]
+    if missing:
+        alt, alt_err = {}, None
+        if not cnbc_tried:
+            try:
+                alt = fetch_quotes_cnbc(missing)
+            except Exception as e:  # noqa: BLE001
+                alt_err = f"CNBC {type(e).__name__}: {e}"
+        still = [(s, cls) for s, cls in missing if not alt.get(s)]
+        if still:
+            try:
+                alt.update(fetch_quotes_finnhub(still))
+            except Exception as e:  # noqa: BLE001
+                alt_err = "; ".join(x for x in (alt_err, f"Finnhub {type(e).__name__}: {e}") if x)
+        for s, _ in missing:
+            if alt.get(s):
+                by_sym[s] = (s, alt[s], None)
+            else:
+                prev_err = (by_sym.get(s) or (s, None, "Nasdaq paused after HTTP 403"))[2]
+                by_sym[s] = (s, None, "; ".join(x for x in (prev_err, alt_err) if x) or None)
+        results = list(by_sym.values())
     conn = _conn(path)
     try:
         for s, q, err in results:
@@ -1130,19 +1328,23 @@ def _usd_cny() -> Optional[float]:
 # One background refresh at a time. The page never waits on Nasdaq (20 symbols took ~8 s
 # synchronously on 2026-10-20): it gets the stored quotes at once, this thread brings them up
 # to date, and the page polls again a couple of seconds later to pick the new prices up.
+# A round older than this is taken as hung and a new one may start beside it; the hung round's
+# ending then no longer touches the state (gen), so it cannot clear the new round's flag.
+REFRESH_STUCK_SECONDS = 60
 _refresh_lock = threading.Lock()
-_refresh_state = {"running": False, "finished_at": 0.0}
+_refresh_state = {"running": False, "finished_at": 0.0, "started_at": 0.0, "gen": 0}
 
 
 def refresh_in_background(symbols: List[str], force: bool = False, path: Optional[Path] = None,
                           ttl_by_symbol: Optional[Dict[str, float]] = None) -> bool:
     """Start refreshing these symbols' quotes unless a refresh is already running. True if one is."""
     with _refresh_lock:
-        if _refresh_state["running"]:
+        if _refresh_state["running"] and time.time() - _refresh_state["started_at"] < REFRESH_STUCK_SECONDS:
             return True
         if not symbols:
             return False
-        _refresh_state["running"] = True
+        _refresh_state.update(running=True, started_at=time.time(), gen=_refresh_state["gen"] + 1)
+        gen = _refresh_state["gen"]
 
     def run():
         try:
@@ -1151,8 +1353,9 @@ def refresh_in_background(symbols: List[str], force: bool = False, path: Optiona
             pass
         finally:
             with _refresh_lock:
-                _refresh_state["running"] = False
-                _refresh_state["finished_at"] = time.time()
+                if _refresh_state["gen"] == gen:
+                    _refresh_state["running"] = False
+                    _refresh_state["finished_at"] = time.time()
 
     threading.Thread(target=run, name="portfolio-quotes", daemon=True).start()
     return True
