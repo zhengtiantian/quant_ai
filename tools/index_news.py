@@ -171,6 +171,8 @@ def main() -> None:
     # Not embedded unless INDEX_INCLUDE_UNIVERSE=1: ~740k rows, and the eval sets were built on the 102.
     if os.getenv("INDEX_INCLUDE_UNIVERSE", "0") != "1":
         query["origin"] = {"$ne": "universe_backfill"}
+    # rows the relevance student rejected stay in the collection marked matched = false: never embedded
+    query["company_match_v2.matched"] = {"$ne": False}
     if last_id:
         print(f"resuming after _id={last_id} ({len(seen)} dedupe keys carried over)")
 
