@@ -22,6 +22,9 @@ anthropic>=0.40.0
 # Vector math (RAG cosine similarity)
 numpy>=1.26.0
 
+# Analysts' ratings and price targets per stock (markets/analysts.py); the version quant_data's collectors use
+yfinance==1.2.0
+
 # MCP — mcp_server.py exposes the platform's tools over stdio; mcp_client.py
 # is how the agent consumes them. Requires fastapi>=0.118 for starlette.
 mcp>=1.28.0

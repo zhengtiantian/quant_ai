@@ -43,3 +43,6 @@ def start() -> None:
         return
     _started.set()
     threading.Thread(target=_loop, name="markets-background", daemon=True).start()
+    # analysts' ratings: its own thread, since a pass over every followed stock takes a minute or more
+    from . import analysts
+    analysts.start()

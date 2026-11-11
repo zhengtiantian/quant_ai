@@ -40,8 +40,10 @@ def portfolio_state(force: str = ""):
         portfolio.init_db()
         # Never waits on Nasdaq: stored quotes now, a background thread refreshes them.
         state = portfolio.get_state(force_quotes=force == "1", background_refresh=True)
-        from . import pipeline_health
-        return {"status": "success", **state, "latest_briefs": _latest_briefs(), "pipeline": pipeline_health.latest()}
+        from . import analysts, pipeline_health
+        syms = [h["symbol"] for h in state["holdings"]] + [w["symbol"] for w in state["watchlist"]]
+        return {"status": "success", **state, "latest_briefs": _latest_briefs(), "pipeline": pipeline_health.latest(),
+                "analysts": analysts.summaries(syms)}
     except Exception as e:  # noqa: BLE001
         return _error(e, 500)
 
@@ -58,6 +60,17 @@ def _latest_briefs():
     if flash and time.time() - (flash["finished_at"] or 0) > 36 * 3600:
         out.pop("flash")
     return [out[k] for k in ("flash", "outlook", "asia_europe", "us") if k in out]
+
+
+@router.get("/analysts/{symbol}")
+def analyst_detail(symbol: str):
+    """Every firm's newest rating and price target on one stock, with the headline that reported it."""
+    try:
+        from . import analysts
+        analysts.ensure(symbol)
+        return {"status": "success", **analysts.detail(symbol)}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
 
 
 @router.get("/portfolio/symbols")
