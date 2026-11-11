@@ -40,10 +40,9 @@ class PortfolioTest(unittest.TestCase):
         self.addCleanup(self._fx.stop)
         # Nor the fallbacks (CNBC first in pre-market / after hours by the real clock), nor leftover
         # per-symbol throttling or a Nasdaq pause from another test.
-        for name in ("fetch_quotes_cnbc", "fetch_quotes_finnhub"):
-            p = mock.patch.object(pf, name, return_value={})
-            p.start()
-            self.addCleanup(p.stop)
+        p = mock.patch.object(pf, "fetch_quotes_cnbc", return_value={})
+        p.start()
+        self.addCleanup(p.stop)
         pf._single_last.clear()
         pf._nasdaq_block["until"] = 0.0
 

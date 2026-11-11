@@ -986,57 +986,6 @@ def fetch_quotes_cnbc(items: List[tuple]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-# Last resort after Nasdaq and CNBC. Its free quote has the regular session only (no pre-market /
-# after-hours price) and one request per symbol, and the key's 60 calls/minute are shared with the
-# news collectors, so a symbol is asked at most once per FINNHUB_MIN_SECONDS and a 429 pauses it.
-FINNHUB_QUOTE_URL = "https://finnhub.io/api/v1/quote?symbol={sym}&token={key}"
-FINNHUB_MIN_SECONDS = 60
-_finnhub_state: Dict[str, Any] = {"last": {}, "paused_until": 0.0}
-
-
-def fetch_quotes_finnhub(items: List[tuple]) -> Dict[str, Dict[str, Any]]:
-    from . import events                       # holds the key lookup; imported here (circular import)
-    key = events._finnhub_key()
-    now = time.time()
-    if not key or now < _finnhub_state["paused_until"]:
-        return {}
-    items = [(s, cls) for s, cls in items if now - _finnhub_state["last"].get(s, 0) >= FINNHUB_MIN_SECONDS]
-    today = datetime.now(US_EAST).date()
-    session = session_now()
-
-    def one(item):
-        s, cls = item
-        _finnhub_state["last"][s] = time.time()
-        try:
-            d = _get_json(FINNHUB_QUOTE_URL.format(sym=urllib.parse.quote(s), key=key))
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                _finnhub_state["paused_until"] = time.time() + FINNHUB_MIN_SECONDS
-            return s, None
-        except Exception:  # noqa: BLE001
-            return s, None
-        price, t = _money(d.get("c")), d.get("t") or 0
-        if not price or not t:
-            return s, None                     # unknown symbols come back as zeros
-        traded = datetime.fromtimestamp(t, US_EAST)
-        traded_today = traded.date() == today
-        # Before today's open c is yesterday's close, the baseline itself; d/dp are yesterday's move then.
-        prev_close = _money(d.get("pc")) if traded_today else price
-        live = session == "regular" or traded_today
-        return s, {
-            "symbol": s, "asset_class": cls or "stocks", "name": s, "price": price, "session": session,
-            "market_status": None, "trade_time": traded.isoformat(),
-            "session_change": _money(d.get("d")) if live else None,
-            "session_change_pct": _money(d.get("dp")) if live else None,
-            "regular_price": price if session in ("pre", "post") else None, "regular_time": None,
-            "prev_close": prev_close, "prev_close_date": today.isoformat() if session != "closed" else None,
-            "source": "finnhub", "price_basis": "regular_only", "volume": None,
-        }
-
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        return {s: q for s, q in ex.map(one, items) if q}
-
-
 # Per-symbol Nasdaq requests in one round are capped, and a symbol is asked on its own at most once
 # per SINGLE_MIN_SECONDS (regular-session re-checks of a batch row that looked frozen, symbols the
 # batch leaves out). What is left over goes to CNBC in one request.
@@ -1110,7 +1059,7 @@ def get_quotes(symbols: List[str], force: bool = False, path: Optional[Path] = N
         cnbc_tried = True
         try:
             first = fetch_quotes_cnbc([(s, cls) for s, cls, _ in todo])
-        except Exception:  # noqa: BLE001 - Nasdaq and Finnhub below are still tried
+        except Exception:  # noqa: BLE001 - Nasdaq below is still tried
             first = {}
         results = [(s, first[s], None) for s, _, _ in todo if first.get(s)]
     done = {s for s, _, _ in results}
@@ -1142,7 +1091,7 @@ def get_quotes(symbols: List[str], force: bool = False, path: Optional[Path] = N
         else:
             results += list(ex.map(work, _take_singles(nasdaq_todo, budget)))
     # Whatever Nasdaq did not price (blocked, failed, not found, over the per-symbol budget) is
-    # asked of CNBC in one request, unless CNBC already answered first, then of Finnhub.
+    # asked of CNBC in one request, unless CNBC already answered first.
     by_sym = {s: (s, q, err) for s, q, err in results}
     missing = [(s, cls) for s, cls, _ in todo if not (by_sym.get(s) or (s, None, None))[1]]
     if missing:
@@ -1152,12 +1101,6 @@ def get_quotes(symbols: List[str], force: bool = False, path: Optional[Path] = N
                 alt = fetch_quotes_cnbc(missing)
             except Exception as e:  # noqa: BLE001
                 alt_err = f"CNBC {type(e).__name__}: {e}"
-        still = [(s, cls) for s, cls in missing if not alt.get(s)]
-        if still:
-            try:
-                alt.update(fetch_quotes_finnhub(still))
-            except Exception as e:  # noqa: BLE001
-                alt_err = "; ".join(x for x in (alt_err, f"Finnhub {type(e).__name__}: {e}") if x)
         for s, _ in missing:
             if alt.get(s):
                 by_sym[s] = (s, alt[s], None)
