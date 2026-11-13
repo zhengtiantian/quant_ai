@@ -45,6 +45,10 @@ class PortfolioTest(unittest.TestCase):
         self.addCleanup(p.stop)
         pf._single_last.clear()
         pf._nasdaq_block["until"] = 0.0
+        # Nor the after-hours reference bars: none by default, so the previous close stands in.
+        p = mock.patch.object(pf, "_cnbc_bars", return_value=[])
+        p.start()
+        self.addCleanup(p.stop)
 
     def tearDown(self):
         self._q.stop(); self._b.stop(); self.tmp.cleanup()
@@ -97,6 +101,32 @@ class PortfolioTest(unittest.TestCase):
         t = pf.get_state(path=self.db)["totals"]
         self.assertAlmostEqual(t["dividends"], 0.25)
         self.assertAlmostEqual(t["realized"], -0.10)
+
+    def test_day_measured_from_previous_after_hours_end(self):
+        self.tx(quantity=10, price=180)
+        day = pf.trading_day().strftime("%Y%m%d")
+        prev = pf.date.fromordinal(pf.trading_day().toordinal() - 1).strftime("%Y%m%d")
+        bars = [{"t": prev + "155900", "close": 217.0}, {"t": prev + "195900", "close": 210.0},
+                {"t": prev + "200500", "close": 999.0}, {"t": day + "070000", "close": 888.0}]
+        with mock.patch.object(pf, "_cnbc_bars", return_value=bars):
+            st = pf.get_state(path=self.db)
+        h, t = st["holdings"][0], st["totals"]
+        self.assertEqual(h["quote"]["ref_basis"], "post_close")
+        self.assertAlmostEqual(h["quote"]["ref_price"], 210.0)        # the 19:59 bar, not later or today's
+        self.assertAlmostEqual(h["ref_pnl"], 10 * (213.0 - 210.0))
+        self.assertAlmostEqual(h["day_pnl"], h["ref_pnl"])             # the day itself is measured from it
+        self.assertAlmostEqual(h["close_pnl"], 10 * (213.0 - 217.0))   # the old move vs the previous regular close
+        self.assertEqual(t["ref_basis"], "post_close")
+        self.assertAlmostEqual(t["ref_pnl_pct"], 30.0 / 2100.0 * 100)
+        # cached for the trading day: no second fetch
+        with mock.patch.object(pf, "_cnbc_bars", side_effect=AssertionError("fetched again")):
+            self.assertAlmostEqual(pf.get_state(path=self.db)["holdings"][0]["ref_pnl"], 30.0)
+
+    def test_previous_close_stands_in_without_after_hours_bars(self):
+        self.tx(quantity=10, price=180)
+        h = pf.get_state(path=self.db)["holdings"][0]
+        self.assertEqual(h["quote"]["ref_basis"], "prev_close")
+        self.assertAlmostEqual(h["ref_pnl"], h["day_pnl"])
 
     def test_validation(self):
         for bad in ({"symbol": "12AB"}, {"trade_date": "yesterday"}, {"quantity": 0, "price": 10}, {"side": "short"}):

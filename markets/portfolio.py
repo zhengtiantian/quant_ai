@@ -86,6 +86,9 @@ CREATE TABLE IF NOT EXISTS global_quotes (
     symbol TEXT PRIMARY KEY, data TEXT NOT NULL, fetched_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS quotes (
     symbol TEXT PRIMARY KEY, asset_class TEXT, data TEXT NOT NULL, fetched_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS ref_prices (
+    symbol TEXT NOT NULL, trading_day TEXT NOT NULL, ref_date TEXT, price REAL, fetched_at REAL NOT NULL,
+    PRIMARY KEY (symbol, trading_day));
 """
 
 
@@ -1009,6 +1012,15 @@ def _take_singles(cands: List[tuple], budget: List[int]) -> List[tuple]:
 
 def get_quotes(symbols: List[str], force: bool = False, path: Optional[Path] = None,
                cached_only: bool = False, ttl_by_symbol: Optional[Dict[str, float]] = None) -> Dict[str, Dict[str, Any]]:
+    """_get_quotes_raw plus the day's reference price on every quote (see ref_prices); cached_only
+    never fetches one either."""
+    out = _get_quotes_raw(symbols, force=force, path=path, cached_only=cached_only, ttl_by_symbol=ttl_by_symbol)
+    refs = ref_prices(list(out), path=path, fetch=not cached_only)
+    return {s: _with_ref(q, refs.get(s)) for s, q in out.items()}
+
+
+def _get_quotes_raw(symbols: List[str], force: bool = False, path: Optional[Path] = None,
+                    cached_only: bool = False, ttl_by_symbol: Optional[Dict[str, float]] = None) -> Dict[str, Dict[str, Any]]:
     """Quotes for the symbols, refreshed when older than their session's TTL; on any failure
     the last stored quote is served with stale=True and the error attached.
 
@@ -1290,6 +1302,9 @@ def get_chart(symbol: str, rng: str = "1d", path: Optional[Path] = None) -> Dict
                 if not intraday["candles"]:
                     continue
                 result = {"symbol": symbol, "range": rng, "interval": f"{INTRADAY_BUCKET_MIN}m", "source": source, **intraday}
+                ref = ref_prices([symbol], path=path).get(symbol)
+                if ref:   # the baseline is the previous after-hours end, as the day's move
+                    result["close_prev"], result["prev_close"], result["ref_basis"] = result.get("prev_close"), ref["ref_price"], "post_close"
             else:
                 candles = get_daily()
                 if not candles:
@@ -1360,6 +1375,83 @@ def refresh_in_background(symbols: List[str], force: bool = False, path: Optiona
     return True
 
 
+# The day's move on the Holdings page and the desktop widget (2026-11-12, at the user's request): in every
+# session (pre-market, regular, after-hours, closed) the price is measured from the previous trading day's
+# after-hours end, i.e. the close of its last 1-minute bar at or before 19:59 ET (CNBC bars include the
+# extended sessions and stay available afterwards, so a Mac asleep at 20:00 loses nothing). Fetched once per
+# symbol and trading day; when it cannot be had the previous regular close stands in (ref_basis says which).
+# day_change / day_pnl keep their old meaning (vs the previous regular close) for the advisor, briefs and MCP.
+REF_RETRY_SECONDS = 600
+
+
+def trading_day(now: Optional[datetime] = None) -> date:
+    """The trading day the clock is in: today from 04:00 ET on a weekday, otherwise the weekday before."""
+    from datetime import timedelta
+    t = (now or datetime.now(US_EAST)).astimezone(US_EAST)
+    d = t.date()
+    if t.weekday() < 5 and t.hour >= 4:
+        return d
+    d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def _post_end_price(symbol: str, day: date) -> Optional[Dict[str, Any]]:
+    """The last 1-minute close at or before 19:59 ET on the latest day with bars before `day`."""
+    bars = _cnbc_bars(symbol, "1M", date.fromordinal(day.toordinal() - 6), date.fromordinal(day.toordinal() - 1))
+    best = None
+    for b in bars:
+        t = b["t"]
+        if t[:8] < day.strftime("%Y%m%d") and t[8:12] <= "1959" and (best is None or t > best["t"]):
+            best = b
+    if not best:
+        return None
+    return {"ref_date": f"{best['t'][:4]}-{best['t'][4:6]}-{best['t'][6:8]}", "price": best["close"]}
+
+
+def ref_prices(symbols: List[str], path: Optional[Path] = None, fetch: bool = True) -> Dict[str, Dict[str, Any]]:
+    """{symbol: {ref_price, ref_date}} for the current trading day; symbols without one are left out.
+    fetch=False: stored ones only (no network)."""
+    if not symbols:
+        return {}
+    day = trading_day(); key = day.isoformat(); now = time.time()
+    conn = _conn(path)
+    try:
+        rows = {r["symbol"]: dict(r) for r in conn.execute(
+            f"SELECT * FROM ref_prices WHERE trading_day = ? AND symbol IN ({','.join('?' * len(symbols))})", (key, *symbols))}
+    finally:
+        conn.close()
+    todo = [s for s in symbols if s not in rows or (rows[s]["price"] is None and now - rows[s]["fetched_at"] >= REF_RETRY_SECONDS)] if fetch else []
+    if todo:
+        def one(sym):
+            try:
+                return sym, _post_end_price(sym, day)
+            except Exception:  # noqa: BLE001 - retried after REF_RETRY_SECONDS; the previous close stands in
+                return sym, None
+        with ThreadPoolExecutor(max_workers=min(8, len(todo))) as ex:
+            got = list(ex.map(one, todo))
+        conn = _conn(path)
+        try:
+            for sym, r in got:
+                rows[sym] = {"symbol": sym, "trading_day": key, "ref_date": (r or {}).get("ref_date"), "price": (r or {}).get("price"), "fetched_at": now}
+                conn.execute("INSERT INTO ref_prices(symbol, trading_day, ref_date, price, fetched_at) VALUES (?, ?, ?, ?, ?) "
+                             "ON CONFLICT(symbol, trading_day) DO UPDATE SET ref_date = excluded.ref_date, price = excluded.price, "
+                             "fetched_at = excluded.fetched_at", (sym, key, rows[sym]["ref_date"], rows[sym]["price"], now))
+            conn.commit()
+        finally:
+            conn.close()
+    return {s: {"ref_price": r["price"], "ref_date": r["ref_date"]} for s, r in rows.items() if r.get("price")}
+
+
+def _with_ref(q: Dict[str, Any], ref: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The quote plus ref_price / ref_date / ref_basis (post_close, or prev_close as the stand-in).
+    The quote's own fields (prev_close, regular_price, session_change*) keep their meaning."""
+    if ref:
+        return {**q, **ref, "ref_basis": "post_close"}
+    return {**q, "ref_price": q.get("prev_close"), "ref_date": None, "ref_basis": "prev_close" if q.get("prev_close") else None}
+
+
 def get_state(force_quotes: bool = False, path: Optional[Path] = None, cached_quotes: bool = False,
               background_refresh: bool = False) -> Dict[str, Any]:
     """background_refresh: answer from stored quotes at once and, if any is out of date (or
@@ -1404,16 +1496,24 @@ def get_state(force_quotes: bool = False, path: Optional[Path] = None, cached_qu
                           for s, q in quotes.items())
         if force_quotes or out_of_date:
             refreshing = refresh_in_background(all_syms, force=force_quotes, path=path, ttl_by_symbol=ttl_by_symbol)
+    if cached_quotes and all_syms:   # the page's fast path: fetch the day's references once (stored after that)
+        refs = ref_prices(all_syms, path=path)
+        quotes = {s: _with_ref({k: v for k, v in q.items() if k not in ("ref_price", "ref_date", "ref_basis")}, refs.get(s))
+                  if q.get("ref_basis") != "post_close" else q for s, q in quotes.items()}
     watchlist = []
     for w in watch_rows:
         q = quotes.get(w["symbol"]) or {}
-        pc, price = q.get("prev_close"), q.get("price")
+        pc, price, ref = q.get("prev_close"), q.get("price"), q.get("ref_price")
+        rc = price - ref if ref and price is not None else None
         watchlist.append({**w, "quote": q,
-                          "day_change": price - pc if pc and price is not None else None,
-                          "day_change_pct": (price - pc) / pc * 100 if pc and price is not None else None})
+                          # the day is measured from the previous after-hours end (ref_price) everywhere
+                          "day_change": rc, "day_change_pct": rc / ref * 100 if rc is not None else None,
+                          "ref_change": rc, "ref_change_pct": rc / ref * 100 if rc is not None else None,
+                          "close_change": price - pc if pc and price is not None else None,
+                          "close_change_pct": (price - pc) / pc * 100 if pc and price is not None else None})
 
     holdings, closed = [], []
-    tot = {"market_value": 0.0, "cost": 0.0, "day_pnl": 0.0, "realized": 0.0, "dividends": 0.0, "priced": 0,
+    tot = {"market_value": 0.0, "cost": 0.0, "day_pnl": 0.0, "ref_pnl": 0.0, "close_pnl": 0.0, "realized": 0.0, "dividends": 0.0, "priced": 0,
            "fifo_cost": 0.0, "fifo_realized": 0.0}
     for s, p in positions.items():
         tot["realized"] += p["realized"]
@@ -1447,13 +1547,20 @@ def get_state(force_quotes: bool = False, path: Optional[Path] = None, cached_qu
             h["unrealized_pct"] = h["unrealized"] / p["cost"] * 100 if p["cost"] > EPS else None
             h["fifo_unrealized"] = h["market_value"] - p["fifo_cost"]
             tot["fifo_cost"] += p["fifo_cost"]
-            pc = q.get("prev_close")
-            h["day_change"] = price - pc if pc else None
-            h["day_change_pct"] = (price - pc) / pc * 100 if pc else None
-            h["day_pnl"] = h["day_change"] * p["quantity"] if pc else None
+            pc, ref = q.get("prev_close"), q.get("ref_price")
+            # the day is measured from the previous after-hours end (ref_price) everywhere; close_* keep
+            # the move against the previous regular close
+            h["close_change"] = price - pc if pc else None
+            h["close_change_pct"] = (price - pc) / pc * 100 if pc else None
+            h["close_pnl"] = h["close_change"] * p["quantity"] if pc else None
+            h["ref_change"] = h["day_change"] = price - ref if ref else None
+            h["ref_change_pct"] = h["day_change_pct"] = (price - ref) / ref * 100 if ref else None
+            h["ref_pnl"] = h["day_pnl"] = h["ref_change"] * p["quantity"] if ref else None
+            tot["ref_pnl"] += h["ref_pnl"] or 0.0
+            tot["close_pnl"] += h["close_pnl"] or 0.0
             tot["market_value"] += h["market_value"]
             tot["cost"] += p["cost"]
-            tot["day_pnl"] += h["day_pnl"] or 0.0
+            tot["day_pnl"] += h["day_pnl"] or 0.0          # = ref_pnl
             tot["priced"] += 1
         holdings.append(h)
     for h in holdings:
@@ -1465,6 +1572,11 @@ def get_state(force_quotes: bool = False, path: Optional[Path] = None, cached_qu
     tot["unrealized_pct"] = tot["unrealized"] / tot["cost"] * 100 if tot["cost"] > EPS else None
     prev_value = tot["market_value"] - tot["day_pnl"]
     tot["day_pnl_pct"] = tot["day_pnl"] / prev_value * 100 if prev_value > EPS else None
+    tot["ref_pnl_pct"] = tot["day_pnl_pct"]
+    close_value = tot["market_value"] - tot["close_pnl"]
+    tot["close_pnl_pct"] = tot["close_pnl"] / close_value * 100 if close_value > EPS else None
+    bases = {h["quote"].get("ref_basis") for h in holdings if h.get("market_value")}
+    tot["ref_basis"] = "post_close" if bases == {"post_close"} else "prev_close" if bases == {"prev_close"} else "mixed" if bases else None
 
     sessions = [q.get("session") for q in quotes.values() if q.get("session") and not q.get("stale")]
     session = max(set(sessions), key=sessions.count) if sessions else session_now()

@@ -638,8 +638,9 @@ def generate_in_background(kind: str, path: Optional[Path] = None, symbol: str =
             if kind == "flash":
                 q = portfolio.get_quotes([symbol], path=path, force=True).get(symbol) or {}
                 move = q.get("session_change_pct") if q.get("session") in ("pre", "post") else None
-                if move is None and q.get("price") and q.get("prev_close"):
-                    move = (q["price"] / q["prev_close"] - 1) * 100
+                base = q.get("ref_price") or q.get("prev_close")   # previous after-hours end (2026-11-12)
+                if move is None and q.get("price") and base:
+                    move = (q["price"] / base - 1) * 100
                 context = {"symbol": symbol, "name": events.BELLWETHERS.get(symbol, (q.get("name"), None))[0] or symbol,
                            "group": events.BELLWETHERS.get(symbol, (None, "user's pick"))[1], "session": q.get("session"),
                            "price": q.get("price"), "regular_close": q.get("regular_price") or q.get("prev_close"),
