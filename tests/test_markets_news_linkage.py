@@ -21,8 +21,8 @@ class _Coll:
         self.docs = docs
 
     def find(self, q, proj=None):
-        since = q["at"]["$gte"]
-        return _Cursor(d for d in self.docs if d["status"] == q["status"] and d["at"] >= since)
+        return _Cursor(d for d in self.docs if d["status"] == q["status"]
+                       and ("at" not in q or d["at"] >= q["at"]["$gte"]) and ("score" not in q or "score" in d))
 
 
 def judgment(sym, hours_ago, direction, status="ok"):
@@ -51,6 +51,21 @@ class NewsLinkageTest(unittest.TestCase):
         self.assertEqual(h["others"][0]["label"]["zh"], "利好")
         self.assertEqual(h["sources"], [{"title": "CEO resigns", "url": "https://example.com/1"}])
         self.assertIn("hint", out["labels"])
+        self.assertEqual(out["track"]["h5"]["calls"], 0)
+        self.assertIn("还没有可打分的判断", out["track"]["text"]["zh"])
+
+    def test_scores_after_the_call_and_the_record(self):
+        a, b, c = judgment("NVDA", 30, -1), judgment("AMD", 200, 1), judgment("MSFT", 300, 0)
+        a["score"] = {"h1": {"excess": -2.5, "right": True}, "complete": False}
+        b["score"] = {"h1": {"excess": -8.4, "right": False}, "h5": {"excess": -6.0, "right": False}}
+        c["score"] = {"h1": {"excess": 0.5, "right": None}, "h5": {"excess": 1.0, "right": None}}
+        out = news_linkage.latest(now=NOW, db={"news_linkage_judgments": _Coll([a, b, c])})
+        self.assertEqual(out["hints"]["NVDA"]["after"], [{"h": 1, "excess": -2.5, "right": True}])
+        t = out["track"]
+        self.assertEqual((t["h1"]["calls"], t["h1"]["right"]), (2, 1))          # MSFT's neutral call is not counted
+        self.assertEqual(t["h5"]["mean_called_excess"], -6.0)
+        self.assertIn("1 day: 1 of 2 right", t["text"]["en"])
+        self.assertIn("Too few calls", t["text"]["en"])
 
 
 if __name__ == "__main__":

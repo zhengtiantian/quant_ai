@@ -18,6 +18,8 @@ from typing import Any, Dict, Optional
 
 COLLECTION = "news_linkage_judgments"
 SHOW_HOURS = 72
+HORIZONS = (1, 5, 20)          # trading days; scored in quant_data research/news_linkage/score.py
+MIN_CALLS = 20                 # fewer scored 5-day calls than this: the record is shown as too thin to judge
 CACHE_SECONDS = 60
 _cache: Dict[str, Any] = {"at": 0.0, "out": None}
 _mongo: Dict[str, Any] = {"client": None}
@@ -37,6 +39,8 @@ LABELS = {
     "sources": {"en": "Sources", "zh": "引用的报道"},
     "storylines": {"en": "Storylines", "zh": "故事线"},
     "judged": {"en": "Judged", "zh": "判断于"},
+    "after": {"en": "Since the call, vs SPY", "zh": "判断之后（相对 SPY）"},
+    "days": {"en": "d", "zh": "天"},
     "hint": {"en": "A hint from the news alone: the action above is unchanged, and its accuracy is still being measured.",
              "zh": "仅是新闻提示：不改变上面的操作建议，准确率仍在统计中。"},
 }
@@ -87,7 +91,34 @@ def hint(doc: Dict[str, Any]) -> Dict[str, Any]:
         "sources": [{"title": c.get("title") or "", "url": c.get("url") or ""} for c in doc.get("cited") or []],
         "storylines": [{"head": s.get("head") or "", "reason": _reason(s.get("reason")), "n24": s.get("n24")}
                        for s in doc.get("storylines") or []],
+        # what the stock did against SPY since the call, from the first price after it (step 7)
+        "after": [{"h": h, "excess": sc[f"h{h}"]["excess"], "right": sc[f"h{h}"]["right"]}
+                  for sc in [doc.get("score") or {}] for h in HORIZONS if f"h{h}" in sc],
     }
+
+
+def track(docs) -> Dict[str, Any]:
+    """Every scored live call: per horizon, directional calls, how many were right, the mean excess return in
+    the called direction; and a line for the page."""
+    out: Dict[str, Any] = {}
+    for h in HORIZONS:
+        k = f"h{h}"
+        calls = [((d.get("answer") or {}).get("direction"), d["score"][k]) for d in docs
+                 if (d.get("score") or {}).get(k) and (d.get("answer") or {}).get("direction")]
+        out[k] = {"calls": len(calls), "right": sum(bool(s.get("right")) for _, s in calls),
+                  "mean_called_excess": round(sum((1 if dr > 0 else -1) * s["excess"] for dr, s in calls) / len(calls), 2) if calls else None}
+    parts_en, parts_zh = [], []
+    for h in HORIZONS:
+        t = out[f"h{h}"]
+        if t["calls"]:
+            parts_en.append(f"{h} day{'s' if h > 1 else ''}: {t['right']} of {t['calls']} right ({t['mean_called_excess']:+.1f}% vs SPY in the called direction)")
+            parts_zh.append(f"{h} 天：{t['calls']} 次对 {t['right']} 次（按判断方向平均跑赢 SPY {t['mean_called_excess']:+.1f}%）")
+    few = bool(parts_en) and out[f"h{HORIZONS[1]}"]["calls"] < MIN_CALLS
+    out["text"] = {
+        "en": "Live record: " + ("; ".join(parts_en) if parts_en else "no call scored yet") + (". Too few calls to judge yet." if few else "."),
+        "zh": "实盘战绩：" + ("；".join(parts_zh) if parts_zh else "还没有可打分的判断") + ("。次数太少，还不能下结论。" if few else "。"),
+    }
+    return out
 
 
 def latest(now: Optional[datetime] = None, db=None) -> Dict[str, Any]:
@@ -99,7 +130,8 @@ def latest(now: Optional[datetime] = None, db=None) -> Dict[str, Any]:
                          {"storylines.members": 0}).sort("at", -1):
         if doc["symbol"] not in hints:
             hints[doc["symbol"]] = hint(doc)
-    return {"hints": hints, "labels": LABELS, "show_hours": SHOW_HOURS}
+    scored = list(coll.find({"status": "ok", "score": {"$exists": True}}, {"answer.direction": 1, "score": 1}))
+    return {"hints": hints, "labels": LABELS, "show_hours": SHOW_HOURS, "track": track(scored)}
 
 
 def get(force: bool = False) -> Dict[str, Any]:
