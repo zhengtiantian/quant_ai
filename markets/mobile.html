@@ -38,6 +38,7 @@
   .px { font-size: 15px; font-weight: 600; } .avg { font-size: 15px; color: var(--soft); } .mv { font-size: 12.5px; }
   .right { text-align: right; line-height: 18px; }
   .dchg { font-size: 15px; font-weight: 600; } .pnl { font-size: 12.5px; white-space: nowrap; }
+  .news { grid-column: 1 / -1; font-size: 12px; line-height: 16px; color: var(--soft); margin-top: 4px; }
   .ghead { display: flex; justify-content: space-between; align-items: baseline; margin-top: 12px; }
   .ghead .t { font-weight: 700; font-size: 14px; } .ghead a { color: #60a5fa; font-size: 12px; text-decoration: none; }
   .gnote { font-size: 11px; color: var(--muted); margin-top: 2px; line-height: 15px; }
@@ -132,6 +133,11 @@ const SHORT = { "United Kingdom": "UK" };          // the country column is narr
 const num = (v) => (v == null || isNaN(v) ? "—" : v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
 const span = (text, color, extra = "") => `<span style="color:${color};${extra}">${text}</span>`;
 
+// The newest news-storyline judgment (N.6) under a holding: a hint only, in the server's words
+// (the briefs' language, Chinese by default).
+const newsLine = (n) => !n ? "" : `<div class="news"><b style="color:${n.direction < 0 ? DOWN : n.direction > 0 ? UP : FLAT}">` +
+  `${esc(n.label.zh)}</b> ${esc(n.summary.zh)}</div>`;
+
 function render(d, offline) {
   lastData = d; lastOffline = offline;
   const card = document.getElementById("card");
@@ -160,7 +166,7 @@ function render(d, offline) {
       <div class="right">
         <div class="dchg" style="color:${col(h.day_change_pct)}">${pct(h.day_change_pct) || "—"}</div>
         <div class="pnl" style="color:${col(h.unrealized)}">${signed(h.unrealized, 0)} ${pct(h.unrealized_pct)}</div>
-      </div></div>`;
+      </div>${newsLine((d.news || {})[h.symbol])}</div>`;
   }).join("") || `<div class="muted msg">No holdings yet</div>`;
 
   // The user's indices (S&P 500, Nasdaq, SOX, QQQ, SPY...), refreshed with the holdings.

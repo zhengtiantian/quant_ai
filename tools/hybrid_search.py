@@ -109,7 +109,30 @@ def embed_query(text: str) -> list[float]:
     return r.json()["data"][0]["embedding"]
 
 
-def dense_leg(qc, query, symbol, since, until, limit) -> list[Hit]:
+def before_ok(raw_date, before: str | None) -> bool:
+    """True when an article dated `raw_date` was published before `before` (YYYYMMDDHHMMSS, UTC).
+
+    N.6 (2026-11-14): replays step through a day hour by hour, so a day-level `until`
+    would hand the judge articles from later the same day. A date-only `date` (YYYYMMDD,
+    ~30% of recent rows) on the cutoff day has no time, so it is treated as possibly
+    after the cutoff and left out: missing one article is safer than seeing the future.
+    """
+    if not before:
+        return True
+    s = str(raw_date or "").strip()
+    if len(s) >= 14 and s[:14].isdigit():
+        return s[:14] < before
+    return bool(s[:8]) and s[:8] < before[:8]
+
+
+def _until_for(until, before):
+    """The day-level bound both legs filter on: the earlier of `until` and the cutoff's day."""
+    day = int(before[:8]) if before else None
+    return day if until is None else (until if day is None else min(until, day))
+
+
+def dense_leg(qc, query, symbol, since, until, limit, before: str | None = None) -> list[Hit]:
+    until = _until_for(until, before)
     must = []
     if symbol:
         must.append(qm.FieldCondition(key="symbol", match=qm.MatchValue(value=symbol)))
@@ -118,10 +141,13 @@ def dense_leg(qc, query, symbol, since, until, limit) -> list[Hit]:
     pts = qc.query_points(
         collection_name=COLLECTION,
         query=embed_query(query),
-        limit=limit,
+        # over-fetch when a cutoff can drop part of its own day, then keep the best `limit` before it
+        limit=limit * 2 if before else limit,
         query_filter=qm.Filter(must=must) if must else None,
         with_payload=True,
     ).points
+    if before:
+        pts = [p for p in pts if before_ok((p.payload or {}).get("date"), before)][:limit]
     out = []
     for rank, p in enumerate(pts, 1):
         pl = p.payload or {}
@@ -135,7 +161,8 @@ def dense_leg(qc, query, symbol, since, until, limit) -> list[Hit]:
     return out
 
 
-def sparse_leg(coll, query, symbol, since, until, limit) -> list[Hit]:
+def sparse_leg(coll, query, symbol, since, until, limit, before: str | None = None) -> list[Hit]:
+    until = _until_for(until, before)
     q: dict = {"$text": {"$search": query}}
     if symbol:
         q["symbol"] = symbol
@@ -159,6 +186,11 @@ def sparse_leg(coll, query, symbol, since, until, limit) -> list[Hit]:
             rng["$gte"] = str(since)
         if until is not None:
             rng["$lt"] = str(until + 1)   # +1 day-number keeps the whole `until` day
+        if before:
+            # the exact cutoff: "20261112093000" < "20261112100000" in string order too; a date-only
+            # "20261112" also sorts below it, so the cutoff day's date-only rows are excluded by name
+            rng["$lt"] = min(rng["$lt"], before)
+            rng["$ne"] = before[:8]
         q["date"] = rng
 
     # Over-fetch, then deduplicate to the identity the dense index already has: without
@@ -238,11 +270,12 @@ def rrf_fuse(dense: list[Hit], sparse: list[Hit], k: int,
 
 
 def search(query, k=10, symbol=None, since=None, until=None, candidates=CANDIDATES,
-           rrf_k=RRF_K, w_dense=W_DENSE, w_sparse=W_SPARSE):
+           rrf_k=RRF_K, w_dense=W_DENSE, w_sparse=W_SPARSE, before: str | None = None):
+    """`before` (YYYYMMDDHHMMSS, UTC) keeps only articles published before that moment, in both legs."""
     qc = QdrantClient(url=QDRANT_URL, timeout=60)
     coll = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)[DB_NAME][SRC_COLL]
-    dense = dense_leg(qc, query, symbol, since, until, candidates)
-    sparse = sparse_leg(coll, query, symbol, since, until, candidates)
+    dense = dense_leg(qc, query, symbol, since, until, candidates, before)
+    sparse = sparse_leg(coll, query, symbol, since, until, candidates, before)
     return dense, sparse, rrf_fuse(dense, sparse, k, rrf_k, w_dense, w_sparse)
 
 

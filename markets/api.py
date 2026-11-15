@@ -97,6 +97,16 @@ def portfolio_daily_action(force: str = ""):
         return _error(e, 500)
 
 
+@router.get("/portfolio/news-linkage")
+def portfolio_news_linkage(force: str = ""):
+    """The newest news-storyline judgment per followed stock (N.6): a hint under the Action pill only."""
+    from . import news_linkage
+    try:
+        return {"status": "success", **news_linkage.get(force=bool(force))}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
 @router.get("/portfolio/lot-advice")
 def portfolio_lot_advice(symbol: str = "", buy_price: str = ""):
     """Empirically calibrated dip-entry spacing check & per-lot ATR swing exit targets (Q.10)."""

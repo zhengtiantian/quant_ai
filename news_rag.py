@@ -198,8 +198,23 @@ def _excerpt(text: str) -> str:
     return text[:cut if cut > 0 else ARTICLE_EXCERPT] + "…"
 
 
+def _cutoff(before) -> str | None:
+    """A datetime (naive = UTC) or a YYYYMMDDHHMMSS / ISO string -> YYYYMMDDHHMMSS in UTC."""
+    if before is None or str(before).strip() == "":
+        return None
+    from datetime import datetime, timezone
+    if not isinstance(before, datetime):
+        s = str(before).strip()
+        if re.fullmatch(r"\d{14}", s):
+            return s
+        before = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if before.tzinfo:
+        before = before.astimezone(timezone.utc)
+    return before.strftime("%Y%m%d%H%M%S")
+
+
 def search_articles(query: str, symbol: str | None = None, from_date=None, to_date=None,
-                    limit: int = 20, coll=None, rrf_k: int = RRF_K) -> dict:
+                    limit: int = 20, coll=None, rrf_k: int = RRF_K, before=None) -> dict:
     """R.12 — hybrid retrieval returned as articles, not as an answer.
 
     The same payload shape as quant_api's `/api/news/search`, so every consumer of
@@ -211,6 +226,9 @@ def search_articles(query: str, symbol: str | None = None, from_date=None, to_da
     The symbol and date window are applied inside both legs, never after fusion, for the
     same reason news_rag does: a post-hoc filter lets an out-of-window dense hit take a
     top-k slot (the M.7 look-ahead error).
+
+    `before` (N.6, 2026-11-14): an exact moment, for replays and the linkage judge; only
+    articles published before it are returned (see hybrid_search.before_ok).
     """
     if coll is None:
         from pymongo import MongoClient
@@ -221,7 +239,7 @@ def search_articles(query: str, symbol: str | None = None, from_date=None, to_da
 
     t0 = time.perf_counter()
     dense, sparse, fused = search(query, k=k, symbol=sym, since=_date_int(from_date),
-                                  until=_date_int(to_date), rrf_k=rrf_k)
+                                  until=_date_int(to_date), rrf_k=rrf_k, before=_cutoff(before))
     retrieval_ms = (time.perf_counter() - t0) * 1000
     bodies = _fetch_bodies(fused, coll)
 

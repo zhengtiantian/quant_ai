@@ -5,7 +5,8 @@ http://<mac>.<tailnet>.ts.net/ to http://127.0.0.1:18000/m/ for the user's own t
 (WireGuard-encrypted end to end), so nothing else of the API is exposed. serve passes the caller's
 tailnet address in X-Forwarded-For, which uvicorn trusts only from 127.0.0.1: so these routes answer
 this Mac and tailnet addresses (100.64.0.0/10, fd7a:115c:a1e0::/48), and the LAN still sees nothing.
-/m/state is /api/markets/portfolio/state cut to what the card shows: the holdings, the user's indices, and the global
+/m/state is /api/markets/portfolio/state cut to what the card shows: the holdings (with the newest news-storyline
+judgment of each, N.6), the user's indices, and the global
 markets (every exchange's indices and stocks: name, price, change, currency).
 """
 
@@ -68,13 +69,24 @@ def state():
         s = portfolio.get_state(force_quotes=False, background_refresh=True)
         holdings = [{**{k: h.get(k) for k in HOLDING_KEYS}, "quote": {k: (h.get("quote") or {}).get(k) for k in QUOTE_KEYS}}
                     for h in s.get("holdings") or []]
-        return {"status": "success", "holdings": holdings, "totals": s.get("totals"), "session": s.get("session"),
+        return {"status": "success", "holdings": holdings, "news": _news([h["symbol"] for h in holdings]),
+                "totals": s.get("totals"), "session": s.get("session"),
                 "us_time": s.get("us_time"), "server_time": s.get("server_time"), "refresh_seconds": s.get("refresh_seconds"),
                 "global": _global(s.get("global") or {}),
                 "indices": [{k: q.get(k) for k in ("symbol", "name", "price", "change", "change_pct", "currency")}
                             for q in s.get("indices") or []]}
     except Exception as e:  # noqa: BLE001
         return _error(e, 500)
+
+
+def _news(symbols):
+    """The newest news-storyline judgment of each holding (N.6), cut to the line the card shows."""
+    try:
+        from . import news_linkage
+        hints = news_linkage.get().get("hints") or {}
+    except Exception:  # noqa: BLE001 - the card shows without it
+        return {}
+    return {s: {k: hints[s][k] for k in ("direction", "label", "summary", "at")} for s in symbols if s in hints}
 
 
 def _global(g):
