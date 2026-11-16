@@ -12,18 +12,29 @@ portfolio state for the desktop widget.
 """
 
 import os
+import sqlite3
 import subprocess
 import json
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from . import budget_link
 
 CHECK_EVERY = 30 * 60
 QUANT_DATA_ENV = Path(os.getenv("QUANT_DATA_ENV", "/Users/xiz/Quant_trade/quant_data/.env"))
+JOB_AGENT_DIR = Path(os.getenv("JOB_AGENT_APP_DIR", os.path.expanduser("~/Library/Application Support/job_agent")))
+DUBLIN_TZ = ZoneInfo("Europe/Dublin")
+
+# Host-side multi-region Job Agent freshness rules (migrated to Airflow job_agent_morning & job_agent_afternoon)
+JOB_AGENT_STAGES = [
+    ("job_agent (ireland)", "scrape_state", "last_success", {"hours": 30}, "job_agent_morning / job_agent_afternoon (11:00 & 16:00)"),
+    ("job_agent (eu/me/remote)", "global_meta", "eu_refreshed_at", {"hours": 36}, "job_agent_afternoon eu_me_remote_daily (16:00)"),
+    ("job_agent (china)", "china_meta", "foreign_refreshed_at", {"hours": 36}, "job_agent_morning china_fulltime_daily (11:00)"),
+]
 
 # stage -> (collection, how to read its newest date, allowed lag, what produces it)
 #   lag in weekdays for daily outputs, hours for the intraday news
@@ -97,10 +108,69 @@ def judge(newest: Optional[datetime], lag: Dict[str, int], now: datetime) -> Opt
     return None if behind <= lag["weekdays"] else f"{behind} weekdays behind"
 
 
-def check(now: Optional[datetime] = None, client=None) -> Dict[str, Any]:
+def _parse_local_ts(val: Optional[str]) -> Optional[datetime]:
+    if not val:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(val).strip().replace(" ", "T"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=DUBLIN_TZ)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _check_job_agent(now: datetime, app_dir: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
+    stages: List[Dict[str, Any]] = []
+    problems: List[str] = []
+    state_file = app_dir / "scrape_state.json"
+    db_file = app_dir / "job_history.db"
+    if not state_file.exists() and not db_file.exists():
+        return stages, problems
+
+    state_data: Dict[str, Any] = {}
+    if state_file.exists():
+        try:
+            state_data = json.loads(state_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    meta_vals: Dict[Tuple[str, str], str] = {}
+    if db_file.exists():
+        try:
+            conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=1.0)
+            cur = conn.cursor()
+            for tbl in ("global_meta", "china_meta"):
+                try:
+                    for k, v in cur.execute(f"SELECT key, value FROM {tbl}").fetchall():
+                        meta_vals[(tbl, str(k))] = str(v)
+                except Exception:
+                    pass
+            conn.close()
+        except Exception:
+            pass
+
+    for name, src_kind, key, lag, producer in JOB_AGENT_STAGES:
+        raw_ts = state_data.get(key) if src_kind == "scrape_state" else meta_vals.get((src_kind, key))
+        newest = _parse_local_ts(raw_ts)
+        why = judge(newest, lag, now)
+        stages.append({
+            "stage": name,
+            "newest": newest.isoformat() if newest else None,
+            "ok": why is None,
+            "problem": why,
+            "producer": producer,
+        })
+        if why:
+            problems.append(f"{name}: {why} ({producer})")
+    return stages, problems
+
+
+def check(now: Optional[datetime] = None, client=None, job_agent_dir: Optional[Path] = None) -> Dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     stages: List[Dict[str, Any]] = []
     problems: List[str] = []
+    check_host_jobs = job_agent_dir is not None or client is None
     try:
         if client is None:
             import pymongo
@@ -118,6 +188,12 @@ def check(now: Optional[datetime] = None, client=None) -> Dict[str, Any]:
                 problems.append(f"{name}: {why} ({producer})")
     except Exception as e:  # noqa: BLE001 - unreachable Mongo is itself the finding
         problems = [f"MongoDB unreachable ({type(e).__name__}): is Docker running with core.sh, and Data4T mounted?"]
+
+    if check_host_jobs:
+        ja_stages, ja_problems = _check_job_agent(now, job_agent_dir or JOB_AGENT_DIR)
+        stages.extend(ja_stages)
+        problems.extend(ja_problems)
+
     result = {"checked_at": now.isoformat(), "ok": not problems, "stages": stages, "problems": problems}
     with _lock:
         _state.update(result)

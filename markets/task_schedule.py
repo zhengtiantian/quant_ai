@@ -8,8 +8,9 @@ the window moves at local midnight), each run marked done, failed, running or no
               cron run fires at the end of its interval); DAGs started by another one (backfill_2 after
               backfill_1, daily_signal_pipeline after backfill_2) get one run per day after their upstream;
               manual runs in the window are listed as they are.
-  job_agent   launchd, 11:00 and 16:00: read back from its log ("Starting Job Agent execution..." /
-              "Job Agent finished." and the ERROR / exit-status lines in between).
+  job_agent   migrated to Airflow (job_agent_morning at 11:00 & job_agent_afternoon at 16:00 Dublin);
+              legacy launchd log reader (_job_agent) runs only as a fallback if com.xiangyu.jobagent is
+              still loaded in launchctl and Airflow has no job_agent_* entries.
   briefs      quant_ai's own scheduled briefs (markets/briefs.py KINDS with a time), from the briefs table.
 
 DAGs that run many times a day (the 30-minute intraday news, the hourly keyword apply) come as one row per
@@ -41,6 +42,9 @@ NAMES = {
     "daily_signal_pipeline": "Daily signal pipeline",
     "daily_advice": "Daily advice (model)",
     "gdelt_batch_verify": "GDELT data check",
+    "gdelt_hourly": "Hourly GDELT news & company match",
+    "job_agent_morning": "Job Agent morning (IE + China full + EU/ME ATS)",
+    "job_agent_afternoon": "Job Agent afternoon (IE + EU/ME/Remote full + CN ATS)",
     "keyword_refresh_apply": "Keyword review: apply decisions",
     "keyword_refresh_weekly": "Weekly keyword refresh",
     "market_snapshots": "Market snapshots",
@@ -313,17 +317,34 @@ def _group(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _legacy_job_agent_launchd_loaded() -> bool:
+    """True only if the retired cron plist com.xiangyu.jobagent (not .web) is still loaded."""
+    try:
+        out = subprocess.check_output(["launchctl", "list"], text=True, stderr=subprocess.DEVNULL)
+        return any(line.strip().split("\t")[-1] == "com.xiangyu.jobagent" for line in out.splitlines() if line.strip())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def schedule(now: Optional[datetime] = None) -> Dict[str, Any]:
     now = now or datetime.now(UTC)
     start, end, days = _window(now)
     entries: List[Dict[str, Any]] = []
     errors = []
-    for name, fn in (("airflow", lambda: _airflow(now, start, end)), ("job_agent", lambda: _job_agent(now, days)),
-                     ("briefs", lambda: _briefs(now, start, end))):
+    try:
+        entries += _airflow(now, start, end)
+    except Exception as e:  # noqa: BLE001 - one source down must not hide the others
+        errors.append(f"airflow: {type(e).__name__}: {e}")
+    has_airflow_job_agent = any((e.get("dag_id") or "").startswith("job_agent_") for e in entries)
+    if not has_airflow_job_agent and _legacy_job_agent_launchd_loaded():
         try:
-            entries += fn()
-        except Exception as e:  # noqa: BLE001 - one source down must not hide the others
-            errors.append(f"{name}: {type(e).__name__}: {e}")
+            entries += _job_agent(now, days)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"job_agent: {type(e).__name__}: {e}")
+    try:
+        entries += _briefs(now, start, end)
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"briefs: {type(e).__name__}: {e}")
     entries.sort(key=lambda e: (e["at"], e["name"]))
     rows = _group(entries)
     out_days = []

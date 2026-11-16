@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from unittest import mock
 from markets import task_schedule as ts
 
 UTC, DUB = ZoneInfo("UTC"), ZoneInfo("Europe/Dublin")
@@ -39,6 +40,24 @@ class Grouping(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["counts"], {"done": 12, "failed": 0, "running": 0, "pending": 12})
         self.assertEqual(rows[0]["state"], "partial")
+
+
+
+    def test_job_agent_names_and_dedup(self):
+        self.assertIn("job_agent_morning", ts.NAMES)
+        self.assertIn("job_agent_afternoon", ts.NAMES)
+        self.assertIn("gdelt_hourly", ts.NAMES)
+        now = datetime(2026, 11, 14, 12, tzinfo=UTC)
+        fake_af = [
+            ts._entry("airflow", "job_agent_morning", ts.NAMES["job_agent_morning"], datetime(2026, 11, 14, 11, tzinfo=DUB), "done", now, dag_id="job_agent_morning"),
+            ts._entry("airflow", "job_agent_afternoon", ts.NAMES["job_agent_afternoon"], datetime(2026, 11, 14, 16, tzinfo=DUB), "pending", now, dag_id="job_agent_afternoon"),
+        ]
+        with mock.patch.object(ts, "_airflow", return_value=fake_af), \
+             mock.patch.object(ts, "_briefs", return_value=[]), \
+             mock.patch.object(ts, "_legacy_job_agent_launchd_loaded", return_value=True):
+            res = ts.schedule(now)
+        today_items = res["days"][0]["items"]
+        self.assertEqual([i["source"] for i in today_items], ["airflow", "airflow"])
 
 
 if __name__ == "__main__":

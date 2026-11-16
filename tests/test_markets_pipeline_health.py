@@ -76,5 +76,24 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(n.call_count, 1)
 
 
+
+    def test_job_agent_freshness_rules(self):
+        import json, sqlite3
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "scrape_state.json").write_text(json.dumps({"last_success": "2026-10-22T11:00:00"}))
+        conn = sqlite3.connect(tmp / "job_history.db")
+        conn.execute("CREATE TABLE global_meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("CREATE TABLE china_meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO global_meta VALUES ('eu_refreshed_at', '2026-10-22 16:00:00')")
+        conn.execute("INSERT INTO china_meta VALUES ('foreign_refreshed_at', '2026-10-20 08:00:00')")
+        conn.commit()
+        conn.close()
+
+        res = ph.check(NOW, client=self.client("2026-10-21"), job_agent_dir=tmp)
+        self.assertFalse(res["ok"])
+        self.assertEqual(len(res["problems"]), 1)
+        self.assertTrue(res["problems"][0].startswith("job_agent (china):"))
+
+
 if __name__ == "__main__":
     unittest.main()

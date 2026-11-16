@@ -13,9 +13,13 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
+
+DUBLIN_TZ = ZoneInfo("Europe/Dublin")
 
 AIRFLOW_POSTGRES_URI = os.getenv(
     "AIRFLOW_DATABASE_URI",
@@ -26,7 +30,10 @@ AIRFLOW_SCHEDULER_LOG = Path("/Users/xiz/Quant_trade/quant_data/airflow_schedule
 
 JOB_AGENT_PORT = 5050
 JOB_AGENT_LOG_DIR = Path(os.path.expanduser("~/Library/Logs/job_agent"))
-JOB_AGENT_STATE_FILE = Path(os.path.expanduser("~/Library/Application Support/job_agent/scrape_state.json"))
+JOB_AGENT_APP_DIR = Path(os.path.expanduser("~/Library/Application Support/job_agent"))
+JOB_AGENT_STATE_FILE = JOB_AGENT_APP_DIR / "scrape_state.json"
+JOB_AGENT_DB_FILE = JOB_AGENT_APP_DIR / "job_history.db"
+JOB_AGENT_SNAPSHOT_FILE = JOB_AGENT_APP_DIR / "monitor_snapshot.json"
 JOB_AGENT_REPORT_FILE = Path(
     os.path.expanduser(
         "~/Library/CloudStorage/GoogleDrive-biaszh00001@gmail.com/My Drive/17.找工作/Today_Jobs.md"
@@ -82,8 +89,8 @@ def _get_process_running(patterns: List[str]) -> bool:
 
 
 def _calc_job_agent_next_run() -> Dict[str, Any]:
-    """Calculate the next scheduled run for Job Agent (11:00 & 16:00 daily)."""
-    now = datetime.datetime.now()
+    """Calculate the next scheduled run for Job Agent (11:00 & 16:00 Europe/Dublin daily in Airflow)."""
+    now = datetime.datetime.now(DUBLIN_TZ)
     t11 = now.replace(hour=11, minute=0, second=0, microsecond=0)
     t16 = now.replace(hour=16, minute=0, second=0, microsecond=0)
 
@@ -100,18 +107,76 @@ def _calc_job_agent_next_run() -> Dict[str, Any]:
 
     return {
         "next_run_iso": next_dt.isoformat(),
-        "next_run_display": next_dt.strftime("%Y-%m-%d %H:%M"),
+        "next_run_display": next_dt.strftime("%Y-%m-%d %H:%M (Dublin)"),
         "countdown": f"{hours}小时 {minutes}分钟后" if hours > 0 else f"{minutes}分钟后",
     }
 
 
-def _get_job_agent_info() -> Dict[str, Any]:
-    """Gather Job Agent (:5050) metadata, state, next run and report summary."""
-    is_online = _is_port_open(JOB_AGENT_PORT)
-    launchd = _get_launchd_status().get("com.xiangyu.jobagent", {})
-    is_scraping = _get_process_running(["job_agent/run_daily.sh", "job_agent/main.py"])
+def _read_job_agent_regions() -> Tuple[Optional[str], List[str]]:
+    """Read live open-job counts and latest refresh timestamps across all 5 regions from local APFS DB."""
+    timestamps: List[str] = []
+    if JOB_AGENT_DB_FILE.exists():
+        try:
+            conn = sqlite3.connect(f"file:{JOB_AGENT_DB_FILE}?mode=ro", uri=True, timeout=1.0)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT COUNT(*) FROM jobs j
+                WHERE j.is_recommended = 1
+                  AND j.job_key NOT IN (SELECT job_key FROM applied_jobs)
+                  AND j.job_key NOT IN (SELECT job_key FROM rejected_jobs)
+                  AND j.job_key NOT IN (SELECT job_key FROM closed_jobs)
+                  AND j.job_key NOT IN (SELECT job_key FROM no_sponsorship_jobs)
+            """)
+            ie_cnt = cur.fetchone()[0]
 
-    # Read state file
+            global_cnts = dict(
+                cur.execute("""
+                    SELECT region, COUNT(*) FROM global_jobs
+                    WHERE COALESCE(status, 'open') = 'open'
+                    GROUP BY region
+                """).fetchall()
+            )
+            cn_cnt = cur.execute("""
+                SELECT COUNT(*) FROM china_jobs
+                WHERE COALESCE(mark, '') = ''
+                  AND (kind != 'parttime' OR COALESCE(score, 0) >= 60)
+            """).fetchone()[0]
+
+            for tbl in ("china_meta", "global_meta"):
+                for (_k, val) in cur.execute(f"SELECT key, value FROM {tbl} WHERE key LIKE '%refreshed_at'").fetchall():
+                    if val:
+                        timestamps.append(str(val).replace(" ", "T")[:19])
+            conn.close()
+
+            summary = (
+                f"🇮🇪 Ireland {ie_cnt} · 🇪🇺🇬🇧 EU & UK {global_cnts.get('eu', 0)} · "
+                f"🇦🇪 中东 {global_cnts.get('me', 0)} · 🌍 Remote {global_cnts.get('remote', 0)} · "
+                f"🇨🇳 China {cn_cnt}"
+            )
+            return summary, timestamps
+        except Exception:
+            pass
+
+    if JOB_AGENT_SNAPSHOT_FILE.exists():
+        try:
+            snap = json.loads(JOB_AGENT_SNAPSHOT_FILE.read_text(encoding="utf-8"))
+            return snap.get("regions_summary"), timestamps
+        except Exception:
+            pass
+    return None, timestamps
+
+
+def _get_job_agent_info() -> Dict[str, Any]:
+    """Gather Job Agent (:5050) metadata, state, next run and multi-region summary."""
+    is_online = _is_port_open(JOB_AGENT_PORT)
+    launchd_map = _get_launchd_status()
+    launchd = launchd_map.get("com.xiangyu.jobagent.web") or launchd_map.get("com.xiangyu.jobagent") or {}
+    is_scraping = _get_process_running([
+        "job_agent/airflow_entry.py",
+        "job_agent/run_daily.sh",
+        "job_agent/main.py",
+    ])
+
     state_data = {}
     if JOB_AGENT_STATE_FILE.exists():
         try:
@@ -119,10 +184,13 @@ def _get_job_agent_info() -> Dict[str, Any]:
         except Exception:
             pass
 
-    # Read report summary
+    regions_summary, extra_ts = _read_job_agent_regions()
+    all_ts = [t for t in ([state_data.get("last_success")] + extra_ts) if t]
+    latest_success = max(all_ts) if all_ts else state_data.get("last_success")
+
     report_info = {}
-    if JOB_AGENT_REPORT_FILE.exists():
-        try:
+    try:
+        if JOB_AGENT_REPORT_FILE.exists():
             stat = JOB_AGENT_REPORT_FILE.stat()
             mtime = datetime.datetime.fromtimestamp(stat.st_mtime)
             lines = JOB_AGENT_REPORT_FILE.read_text(encoding="utf-8").splitlines()
@@ -138,6 +206,13 @@ def _get_job_agent_info() -> Dict[str, Any]:
                 "size_kb": round(stat.st_size / 1024, 1),
                 "summary": headline or "今日求职精选报告已生成",
             }
+    except Exception:
+        pass
+    if not report_info and JOB_AGENT_SNAPSHOT_FILE.exists():
+        try:
+            snap = json.loads(JOB_AGENT_SNAPSHOT_FILE.read_text(encoding="utf-8"))
+            if isinstance(snap.get("report"), dict) and snap["report"].get("exists"):
+                report_info = snap["report"]
         except Exception:
             pass
 
@@ -149,9 +224,10 @@ def _get_job_agent_info() -> Dict[str, Any]:
         "port": JOB_AGENT_PORT,
         "is_online": is_online,
         "is_scraping_now": is_scraping,
-        "schedule": "每日 11:00 & 16:00 (macOS Launchd)",
+        "schedule": "每日 11:00 & 16:00 都柏林时间 (Airflow 统一调度: job_agent_morning / job_agent_afternoon)",
+        "regions_summary": regions_summary,
         "next_run": _calc_job_agent_next_run(),
-        "last_success": state_data.get("last_success"),
+        "last_success": latest_success,
         "last_full_sweep": state_data.get("last_full_sweep"),
         "launchd_status": "loaded" if launchd else "not_found",
         "report": report_info,
@@ -212,6 +288,41 @@ def _get_dag_display_meta(dag_id: str) -> Dict[str, str]:
             "category": "数据处理与特征",
             "desc": "新闻样本交叉校验与标签模型评估",
         },
+        "job_agent_morning": {
+            "name": "全球求职早班扫描 (IE + 中国全量 + 欧中东官网)",
+            "category": "全球求职监控",
+            "desc": "每日 11:00 都柏林(19:00 北京)：爱尔兰早班全扫 + 中国全职(201家外企官网/国内/外包) + 中国远程兼职 + 欧英/中东官网快扫",
+        },
+        "job_agent_afternoon": {
+            "name": "全球求职午后扫描 (IE + 欧英/中东/Remote全量 + 中国外企官网)",
+            "category": "全球求职监控",
+            "desc": "每日 16:00 都柏林：爱尔兰午后全扫 + 欧洲12国/中东3国/全球Remote国家级全扫 + 中国201家外企官网快扫",
+        },
+        "gdelt_hourly": {
+            "name": "GDELT 小时级新闻采集与匹配",
+            "category": "数据采集与匹配",
+            "desc": "每小时 20 分增量抓取全球 GDELT GKG 新闻并通过 SLM 模型完成公司实体匹配",
+        },
+        "daily_advice": {
+            "name": "持仓盘中/收盘 AI 操作建议 (Daily Advice)",
+            "category": "量化主管道",
+            "desc": "交易日 13:30 / 17:30 / 21:30 UTC 为当前持仓生成模型动作评估建议",
+        },
+        "market_snapshots": {
+            "name": "期权与分析师评级收盘快照",
+            "category": "行情与历史数据",
+            "desc": "交易日 21:15 UTC 抓取股票池与持仓的期权隐含波动率及华尔街分析师目标价快照",
+        },
+        "keyword_refresh_weekly": {
+            "name": "公司匹配规则关键词周度挖掘",
+            "category": "数据处理与特征",
+            "desc": "每周六 08:00 都柏林时间自动生成新增公司匹配关键词候选供 UI 审核",
+        },
+        "keyword_refresh_apply": {
+            "name": "公司关键词审核自动生效",
+            "category": "数据处理与特征",
+            "desc": "每日 08:55–23:55 每小时将 UI 审核通过的关键词同步写入匹配规则库",
+        },
     }
     return mapping.get(dag_id, {
         "name": dag_id,
@@ -239,7 +350,9 @@ def _get_airflow_data() -> Dict[str, Any]:
 
         # 1. Fetch active DAGs
         cur.execute("""
-            SELECT dag_id, is_paused, schedule_interval, next_dagrun, description
+            SELECT dag_id, is_paused, schedule_interval,
+                   COALESCE(next_dagrun_create_after, next_dagrun_data_interval_end, next_dagrun),
+                   description
             FROM dag
             WHERE is_active = TRUE
             ORDER BY is_paused ASC, dag_id ASC;
@@ -388,6 +501,20 @@ def _get_airflow_data() -> Dict[str, Any]:
                 sched_display = "每周日 07:00 UTC"
             elif sched_str == "0 4 * * 0":
                 sched_display = "每周日 04:00 UTC"
+            elif sched_str == "0 11 * * *":
+                sched_display = "每日 11:00 都柏林时间 (19:00 北京 · 自动冬/夏令时)"
+            elif sched_str == "0 16 * * *":
+                sched_display = "每日 16:00 都柏林时间 (自动冬/夏令时)"
+            elif sched_str == "20 0-2,7-23 * * *":
+                sched_display = "每小时 20 分 UTC (03:00–06:00 让位夜间主管道)"
+            elif sched_str == "30 13,17,21 * * 1-5":
+                sched_display = "交易日 13:30 / 17:30 / 21:30 UTC"
+            elif sched_str == "15 21 * * 1-5":
+                sched_display = "交易日 21:15 UTC (美股收盘后)"
+            elif sched_str == "55 8-23 * * *":
+                sched_display = "每日 08:55–23:55 都柏林时间 (每小时 55 分)"
+            elif sched_str == "0 8 * * 6":
+                sched_display = "每周六 08:00 都柏林时间"
             else:
                 sched_display = sched_str
 
@@ -442,19 +569,19 @@ def _get_system_daemons() -> List[Dict[str, Any]]:
             "is_port_open": None,
             "pid": launchd.get("com.quant.airflow-scheduler", {}).get("pid"),
             "status": "running" if launchd.get("com.quant.airflow-scheduler", {}).get("is_running") else "stopped",
-            "description": "驱动全部 quant_data 定时任务、数据管道和周度训练",
+            "description": "驱动全部 quant_data 量化管道、模型周训与 job_agent 全球求职定时任务",
             "log_path": str(AIRFLOW_SCHEDULER_LOG),
         },
         {
             "id": "job_agent",
-            "name": "找工中控平台 (Job Agent)",
-            "type": "macOS Launchd & Web",
-            "label": "com.xiangyu.jobagent",
+            "name": "找工中控 Web 服务 (Job Agent)",
+            "type": "macOS Launchd + Airflow",
+            "label": "com.xiangyu.jobagent.web",
             "port": 5050,
             "is_port_open": _is_port_open(5050),
-            "pid": None,
+            "pid": launchd.get("com.xiangyu.jobagent.web", {}).get("pid"),
             "status": "running" if _is_port_open(5050) else "stopped",
-            "description": "爱尔兰资深工程师全网职位扫描，每日 11:00 & 16:00 定时执行",
+            "description": "5050 端口多国求职看板 (IE/EU/中东/Remote/中国)；定时抓取由 Airflow 每日 11:00 & 16:00 驱动",
             "log_path": str(JOB_AGENT_LOG_DIR / "job_agent.log"),
         },
         {
@@ -528,9 +655,10 @@ def get_task_monitor_status() -> Dict[str, Any]:
     job_agent_info = _get_job_agent_info()
     daemons = _get_system_daemons()
 
-    # Combine running tasks
+    # Combine running tasks (avoid duplicating Airflow-driven job_agent_* tasks)
     running_tasks = list(airflow_info["running_tasks"])
-    if job_agent_info["is_scraping_now"]:
+    airflow_has_job_agent = any((t.get("dag_id") or "").startswith("job_agent_") for t in running_tasks)
+    if job_agent_info["is_scraping_now"] and not airflow_has_job_agent:
         running_tasks.append({
             "source": "job_agent",
             "dag_id": "job_agent",
@@ -578,8 +706,12 @@ def get_task_log(
 
     if source == "job_agent":
         target_file = JOB_AGENT_LOG_DIR / "job_agent.log"
-        if target_id == "launchd":
-            target_file = JOB_AGENT_LOG_DIR / "launchd.log"
+        if target_id == "web":
+            target_file = JOB_AGENT_LOG_DIR / "web_server.log"
+        elif target_id == "launchd":
+            cand = JOB_AGENT_LOG_DIR / "launchd.log"
+            web_cand = JOB_AGENT_LOG_DIR / "web_server.log"
+            target_file = cand if (cand.exists() and cand.stat().st_size > 0) else web_cand
     elif source == "scheduler":
         target_file = AIRFLOW_SCHEDULER_LOG
     elif source == "quant_ai":
