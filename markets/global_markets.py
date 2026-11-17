@@ -1,5 +1,5 @@
 """Global markets: Asian and European exchanges and the macro board (oil, gold, US indices,
-VIX, Treasury yields, the dollar), for the portfolio page, the desktop widget and the briefs.
+VIX, Treasury yields, the dollar), for the portfolio page and the briefs.
 """
 
 import json
@@ -471,7 +471,7 @@ _index_running = {"on": False}
 
 
 def indices_live(path: Optional[Path] = None, max_age: float = MACRO_TTL, background: bool = True) -> List[Dict[str, Any]]:
-    """The shown indices from stored quotes, for the portfolio state (the page, the widget, the phone): answers
+    """The shown indices from stored quotes, for the portfolio state (the Holdings page): answers
     at once and, when a quote is older than max_age (the holdings' refresh interval), refreshes them in a thread."""
     syms = _index_symbols(path)
     if not syms:

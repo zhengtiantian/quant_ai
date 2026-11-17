@@ -1375,7 +1375,7 @@ def refresh_in_background(symbols: List[str], force: bool = False, path: Optiona
     return True
 
 
-# The day's move on the Holdings page and the desktop widget (2026-11-12, at the user's request): in every
+# The day's move on the Holdings page (2026-11-12, at the user's request): in every
 # session (pre-market, regular, after-hours, closed) the price is measured from the previous trading day's
 # after-hours end, i.e. the close of its last 1-minute bar at or before 19:59 ET (CNBC bars include the
 # extended sessions and stay available afterwards, so a Mac asleep at 20:00 loses nothing). Fetched once per

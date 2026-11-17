@@ -1,11 +1,10 @@
 """HTTP routes for the portfolio, the global markets and the briefs (/api/markets/...).
 
-Personal financial data: every route answers only requests from this Mac (127.0.0.1), whatever
-address the server listens on. quant_ui calls these from the browser and the desktop widget
-calls them with curl, both locally.
+Personal financial data: every route answers only requests from this Mac (127.0.0.1) or a signed-in
+device on the home network (lan_auth), whatever address the server listens on. quant_ui calls them
+from the browser.
 """
 
-import time
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -40,26 +39,11 @@ def portfolio_state(force: str = ""):
         portfolio.init_db()
         # Never waits on Nasdaq: stored quotes now, a background thread refreshes them.
         state = portfolio.get_state(force_quotes=force == "1", background_refresh=True)
-        from . import analysts, pipeline_health
+        from . import analysts
         syms = [h["symbol"] for h in state["holdings"]] + [w["symbol"] for w in state["watchlist"]]
-        return {"status": "success", **state, "latest_briefs": _latest_briefs(), "pipeline": pipeline_health.latest(),
-                "analysts": analysts.summaries(syms)}
+        return {"status": "success", **state, "analysts": analysts.summaries(syms)}
     except Exception as e:  # noqa: BLE001
         return _error(e, 500)
-
-
-def _latest_briefs():
-    """The newest written brief of each kind, for the desktop widget's headline lines."""
-    from . import briefs
-    out = {}
-    for b in briefs.list_briefs(limit=30):
-        if b["status"] == "done" and b["kind"] not in out:
-            out[b["kind"]] = {k: b[k] for k in ("id", "kind", "session_date", "topic", "headline_zh", "headline_en", "finished_at")}
-    # A flash only while it is fresh: today's or yesterday's.
-    flash = out.get("flash")
-    if flash and time.time() - (flash["finished_at"] or 0) > 36 * 3600:
-        out.pop("flash")
-    return [out[k] for k in ("flash", "outlook", "asia_europe", "us") if k in out]
 
 
 @router.get("/analysts/{symbol}")

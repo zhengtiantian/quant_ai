@@ -7,8 +7,7 @@ fires when a task runs and fails; this catches the other case, when nothing runs
 
 Every CHECK_EVERY seconds quant_ai (always on) reads the newest date of each stage's output in
 MongoDB and compares it with what a healthy pipeline would have by now. A problem is notified
-once a day; the latest result is served at /api/markets/pipeline/health and carried in the
-portfolio state for the desktop widget.
+once a day; the latest result is served at /api/markets/pipeline/health.
 """
 
 import os
