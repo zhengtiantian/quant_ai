@@ -91,6 +91,38 @@ def portfolio_news_linkage(force: str = ""):
         return _error(e, 500)
 
 
+@router.get("/portfolio/devils-advocate")
+def portfolio_devils_advocate():
+    """The newest case against adding per stock (Q.17.1), from the last few days, with the page's words."""
+    from . import devils_advocate
+    try:
+        return {"status": "success", **devils_advocate.latest()}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
+@router.post("/portfolio/devils-advocate")
+def portfolio_devils_advocate_run(payload: Dict[str, Any]):
+    """Write the case against adding for one stock now (Claude CLI, about a minute)."""
+    from . import devils_advocate
+    try:
+        return {"status": "success", **devils_advocate.request(str(payload.get("symbol", "")), "manual")}
+    except ValueError as e:
+        return _error(e, 400)
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
+@router.get("/portfolio/hint-scores")
+def portfolio_hint_scores():
+    """Blocked buys and cases against adding, scored against having bought at that session's close (Q.17.0)."""
+    from . import hint_scores
+    try:
+        return {"status": "success", **hint_scores.summary()}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
 @router.get("/portfolio/lot-advice")
 def portfolio_lot_advice(symbol: str = "", buy_price: str = ""):
     """Empirically calibrated dip-entry spacing check & per-lot ATR swing exit targets (Q.10)."""
