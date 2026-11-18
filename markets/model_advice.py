@@ -197,10 +197,15 @@ def _recover(sym: str, m: Dict[str, Any], price: float, qty: float, cost: float,
               "normal_badnews": "after bad news / a guidance cut", "normal": "no special situation"}[b["situation"]]
     sit_zh = {"deep_badnews": "距一年高点 30% 以上，且近期有坏消息 / 指引下调", "deep": "距一年高点 30% 以上",
               "normal_badnews": "近期有坏消息 / 指引下调", "normal": "无特殊情况"}[b["situation"]]
-    note("recover", f"Next 5 days (model, calibrated): {m5['p_upper']:.0f}% a rebound to ${s5['sell_at']:.2f} comes first, "
-         f"{m5['p_lower']:.0f}% a fall to ${s5['stop_at']:.2f}, {m5['p_none']:.0f}% neither",
-         f"未来 5 天（模型，已校准）：先反弹到 ${s5['sell_at']:.2f} 的概率 {m5['p_upper']:.0f}%，先跌到 ${s5['stop_at']:.2f} 的概率 "
-         f"{m5['p_lower']:.0f}%，都碰不到 {m5['p_none']:.0f}%")
+    # The model foresees the size of a move, not its side (Q.17 double sort, 2026-11-18: within each fifth of
+    # 1 - P(none), the share of P(lower) added nothing): the chance of a move leads, the split is marked weak.
+    moved = m5["p_upper"] + m5["p_lower"]
+    note("recover", f"Next 5 days (model, calibrated): {moved:.0f}% the price reaches ${s5['sell_at']:.2f} or ${s5['stop_at']:.2f} "
+         f"(a move of about 1-1.5 x ATR), {m5['p_none']:.0f}% neither. Which comes first is weak evidence: up {m5['p_upper']:.0f}% / "
+         f"down {m5['p_lower']:.0f}% (the direction part failed its test: the model foresees the size of a move, not its side)",
+         f"未来 5 天（模型，已校准）：碰到 ${s5['sell_at']:.2f} 或 ${s5['stop_at']:.2f}（约 1–1.5 倍 ATR 的波动）的概率 {moved:.0f}%，"
+         f"都碰不到 {m5['p_none']:.0f}%。先碰哪一边只能参考：先涨 {m5['p_upper']:.0f}% / 先跌 {m5['p_lower']:.0f}%"
+         f"（方向部分没通过检验：模型能预示波动大小，不能预示方向）")
     hold_loss, bar_loss = value * -s20["hold_worst5"] / 100, value * -s20["barrier_worst5"] / 100
     note("recover", f"20 days in this situation ({sit_en}; {s20['n']:,} past cases): holding averaged {s20['hold_mean']:+.1f}%, worst 5% "
          f"{s20['hold_worst5']:.0f}% (${hold_loss:,.0f} on this position); selling at ${s20['sell_at']:.2f} or stopping at ${s20['stop_at']:.2f} "

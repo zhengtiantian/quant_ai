@@ -69,7 +69,8 @@ class ModelAdviceTest(unittest.TestCase):
         a = model_advice.render("INTC", held, STATS, 64.44, 0.0, f, total=20200.0, budget_pct=5.0)
         self.assertEqual((a["action"], a["orders"]), ("hold", []))
         rec = [n["zh"] for n in a["notes"] if n["section"] == "recover"]
-        self.assertTrue(any("先反弹到 $66.95 的概率 48%" in r for r in rec))
+        self.assertTrue(any("碰到 $66.95 或 $49.50" in r and "先涨 48% / 先跌 2%" in r for r in rec))   # the move leads
+        self.assertTrue(any("方向部分没通过检验" in r for r in rec))
         self.assertTrue(any("不要补仓" in r for r in rec))
         self.assertFalse(any("风险预算" in n["zh"] for n in a["notes"]))
 
