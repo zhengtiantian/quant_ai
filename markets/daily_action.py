@@ -24,6 +24,8 @@ import math
 import os
 import sqlite3
 import time
+
+import numpy as np
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -328,7 +330,9 @@ def compute(path: Optional[Path] = None, state: Optional[Dict[str, Any]] = None,
                             "rule_action": {k: rule.get(k) for k in ("action", "headline", "orders", "evidence", "reasons")}})
         else:
             actions.append(rule)
-    week = week_reports(actions, risk_budget.BUDGET_PCT / 100 * ex["total"], ex["total"])
+    nights = _nights_from_advice(st, ex)
+    nights.update({a["symbol"]: a["event"] for a in actions if a.get("event")})      # the pilot's, straddle first
+    week = week_reports(nights, actions, risk_budget.BUDGET_PCT / 100 * ex["total"], ex["total"])
     out = {"generated_at": datetime.now(NY).isoformat(timespec="seconds"), "symbols": SYMBOLS, "actions": actions,
            "portfolio": {"total": round(ex["total"], 2), "cash": ex["cash"], "cash_pct": ex["cash_pct"], "cluster_pct": ex["cluster_pct"],
                          "max_symbol_pct": risk_rules.MAX_SYMBOL_PCT, "max_cluster_pct": risk_rules.MAX_CLUSTER_PCT,
@@ -339,22 +343,46 @@ def compute(path: Optional[Path] = None, state: Optional[Dict[str, Any]] = None,
     return out
 
 
-WEEK_DAYS = 7          # reports within a week of each other count together
+WEEK_SESSIONS = 5      # reports within a week (five sessions) of each other count together
 
 
-def week_reports(actions: List[Dict[str, Any]], budget: float, total: float) -> Optional[Dict[str, Any]]:
+def _nights_from_advice(st: Dict[str, Any], ex: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Each holding's next report within five sessions and its bad-night loss on the live fallback (1.6 x
+    ATR x EVENT_K), from daily_advice's latest.json (sessions to the report, ATR, close). A file read only:
+    estimating it from charts and calendars inside this request waited on database locks (2026-11-18)."""
+    adv = (model_advice.load() or {}).get("symbols") or {}
+    out = {}
+    for h in st.get("holdings") or []:
+        b = (adv.get(h["symbol"]) or {}).get("barrier") or {}
+        n = (b.get("calendar") or {}).get("to_report_days")
+        if n is None or n > WEEK_SESSIONS or not b.get("atr") or not b.get("close"):
+            continue
+        typical = risk_budget.REPORT_MOVE_PER_ATR * b["atr"] / b["close"] * 100
+        pct = risk_budget.night_loss_pct(typical)
+        if pct:
+            days = int((np.busday_offset(date.today(), int(n), roll="forward") - np.datetime64(date.today())).astype(int))
+            out[h["symbol"]] = {"days_away": days, "sessions_away": int(n), "loss_pct": pct, "source": "atr",
+                                "loss_usd": round(ex["mv"].get(h["symbol"], 0.0) * pct / 100, 2)}
+    return out
+
+
+WEEK_DAYS = 7          # calendar days: the pilot's own report nights come with days, not sessions
+
+
+def week_reports(nights: Dict[str, Dict[str, Any]], actions: List[Dict[str, Any]], budget: float, total: float) -> Optional[Dict[str, Any]]:
     """Holdings reporting within a week, their bad nights summed against the loss budget (Q.17 round 4,
     2026-11-18). Each night is bounded on its own, but bad report nights come together: over 2018-2026 a
     breach of the bound followed a breach 11% of the time against 4% otherwise (q17_risk_budget.py), so a
-    week with several holdings reporting is one exposure. Over the budget, each of them gets a key note;
-    no orders are made from it."""
-    rows = [(a["symbol"], a["event"]) for a in actions
-            if (a.get("event") or {}).get("loss_usd") is not None and (a["event"].get("days_away") or 0) <= WEEK_DAYS]
+    week with several holdings reporting is one exposure. Over the budget, the result carries the words for
+    the page and each of those holdings' actions gets a key note; no orders are made from it."""
+    rows = [(s, e) for s, e in nights.items() if e.get("loss_usd") is not None and (e.get("days_away") or 0) <= WEEK_DAYS]
     if len(rows) < 2:
         return None
+    rows.sort(key=lambda r: r[1].get("days_away") or 0)
     s = round(sum(e["loss_usd"] for _, e in rows), 2)
     out = {"symbols": [r[0] for r in rows], "loss_usd": s, "budget_usd": round(budget, 2), "over": s > budget,
-           "loss_pct": round(s / total * 100, 1) if total else None}
+           "loss_pct": round(s / total * 100, 1) if total else None,
+           "each": {sym: {"days_away": e.get("days_away"), "loss_usd": e["loss_usd"], "source": e.get("source")} for sym, e in rows}}
     if not out["over"]:
         return out
     names = ", ".join(f"{sym} ({'tonight' if (e.get('days_away') or 0) <= 0 else str(e['days_away']) + 'd'}, ${e['loss_usd']:,.0f})" for sym, e in rows)
@@ -364,6 +392,7 @@ def week_reports(actions: List[Dict[str, Any]], budget: float, total: float) -> 
           f"against 4%), so count them as one exposure")
     zh = (f"{len(rows)} 只持仓一周内发财报：{names_zh}。每只都遇到坏的一夜，合计约 ${s:,.0f}（组合的 {out['loss_pct']}%），"
           f"超过 ${budget:,.0f} 的风险预算。坏的财报夜往往扎堆（2018–2026：上一次突破后再突破的概率 11%，平时 4%），要合起来看")
+    out["text"] = {"en": en, "zh": zh}
     for a in actions:
         if a["symbol"] in out["symbols"]:
             a.setdefault("notes", []).insert(0, {"en": en, "zh": zh, "key": True, "section": "week_reports"})
