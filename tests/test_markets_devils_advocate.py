@@ -41,6 +41,9 @@ class DevilsAdvocateTest(unittest.TestCase):
         for p in self.patches:
             p.start()
         self.kw = {"state": state(), "news_fn": lambda s: NEWS, "judgment_fn": lambda s: None,
+                   "release_fn": lambda s: {"date": "2026-10-30", "full_year_outlook": "lowered", "next_guide_low": 13.0,
+                                            "next_guide_high": 14.0, "margin_outlook": "down", "tone": -1, "restructuring": True,
+                                            "one_line": "Guidance cut on weak demand."},
                    "analysts_fn": lambda s, since, p: [{"graded_at": "2026-01-04T00:00:00", "firm": "Firm X", "text": "Downgraded to Hold", "direction": -1}]}
 
     def tearDown(self):
@@ -65,6 +68,8 @@ class DevilsAdvocateTest(unittest.TestCase):
         text, ids, keep = da.packet("BBB", self.db, **self.kw)
         self.assertIn("refuses an add now: not stabilised after a large drop", text)
         self.assertIn("guidance cut: -1.61%", text)
+        self.assertIn("Shrunk base rate after a >= 2 x ATR drop", text)                       # Q.17.4's table
+        self.assertIn("full-year outlook lowered; next-quarter revenue guidance 13.0-14.0", text)   # the 8-K release
         self.assertIn("Firm X: Downgraded to Hold", text)
         self.assertIn("Bee Corp earnings", text)
         self.assertEqual(ids["A1"]["url"], "https://example.com/a")
@@ -90,6 +95,26 @@ class DevilsAdvocateTest(unittest.TestCase):
         self.assertEqual((out["status"], len(calls)), ("invalid", 2))
         self.assertIn("unknown citation A99", calls[1])
         self.assertIsNone(da.latest(path=self.db)["items"]["BBB"]["answer"])
+
+
+class LatestReleaseTest(unittest.TestCase):
+    def test_latest_release_within_120_days(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            fh.write(json.dumps({"symbol": "AAA", "date": "2026-07-30", "full_year_outlook": "raised"}) + "\n")
+            fh.write(json.dumps({"symbol": "AAA", "date": "2026-10-29", "full_year_outlook": "lowered"}) + "\n")
+        old, da.RELEASES_FILE = da.RELEASES_FILE, Path(fh.name)
+        try:
+            da._releases["mtime"] = None
+            self.assertEqual(da.latest_release("AAA", "2026-11-18")["full_year_outlook"], "lowered")
+            self.assertEqual(da.latest_release("AAA", "2026-10-01")["full_year_outlook"], "raised")
+            self.assertIsNone(da.latest_release("AAA", "2027-06-01"))          # too old by then
+            self.assertIsNone(da.latest_release("BBB", "2026-11-18"))
+            (Path(fh.name).parent / "AAA.earnings.json").write_text(json.dumps([{"time": "2026-11-10T16:00:00-05:00", "eps": 1.0}]))
+            self.assertEqual(da.latest_release("AAA", "2026-11-18"), {"stale": True, "report": "2026-11-10"})   # not read yet
+        finally:
+            da.RELEASES_FILE = old
+            da._releases["mtime"] = None
 
 
 if __name__ == "__main__":

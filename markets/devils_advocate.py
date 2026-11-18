@@ -47,6 +47,14 @@ MODEL = os.getenv("DEVILS_ADVOCATE_MODEL", "").strip() or None
 
 # Drift after news events, excess over all days, t clustered by date (news_events.py over 880k articles
 # 2018-2026, PROJECT_PLAN Q.16.8). Quoted to Claude as facts, not as a forecast for this stock.
+# What followed a >= 2 x ATR drop, by whether a report was in it (Q.17.4's pre-registered fallback,
+# 2026-11-18: no model beat these grouped rates; weighted 1 / drops that day and shrunk toward the
+# parent, the market-wide and bad-news splits shrink away entirely; quant_data
+# research/models/q17_shrunk_table.py). Out of sample 2024-2026 they beat the pooled rate.
+DROP_OUTCOMES = {
+    "no_report": {"label": "without an earnings report", "report": False, "drops": 1428, "lower5": 28.8, "bad20": 34.0},
+    "report": {"label": "with an earnings report in it", "report": True, "drops": 603, "lower5": 27.5, "bad20": 38.7},
+}
 NEWS_DRIFTS = [
     "after a guidance cut: -1.61% over 20 sessions (t -4.4), -2.35% over 60 (t -3.6)",
     "after bad earnings news: -0.76% over 20 sessions (t -5.0)",
@@ -209,7 +217,7 @@ def _finish(rid: int, status: str, path: Optional[Path], **cols: Any) -> None:
 # ------------------------------------------------------------------ the packet
 
 def packet(symbol: str, path: Optional[Path] = None, state: Optional[Dict[str, Any]] = None,
-           news_fn=None, analysts_fn=None, judgment_fn=None) -> Tuple[str, Dict[str, Dict[str, Any]], Dict[str, Any]]:
+           news_fn=None, analysts_fn=None, judgment_fn=None, release_fn=None) -> Tuple[str, Dict[str, Dict[str, Any]], Dict[str, Any]]:
     """The text Claude reads, the citable ids behind it, and the facts kept with the answer."""
     from . import daily_action, lot_advisor, risk_rules
     from . import portfolio as pf
@@ -268,6 +276,12 @@ def packet(symbol: str, path: Optional[Path] = None, state: Optional[Dict[str, A
     else:
         for rb in daily_action.REBOUND.values():
             fact(f"Base rate after {rb['label']} ({rb['n']} drops): +1.5 / +2 x ATR reached within 15 sessions in {rb[1.5]}% / {rb[2.0]}%.")
+    report = None if cause is None else cause != "other"
+    for key, o in DROP_OUTCOMES.items():
+        if report is None or o["report"] == report:
+            fact(f"Shrunk base rate after a >= 2 x ATR drop {o['label']} ({o['drops']} drops of 101 stocks, 2018-2026, weighted "
+                 f"by drops per day, empirical-Bayes shrunk): the lower barrier (1.5 x ATR under the next open) came first within "
+                 f"5 sessions in {o['lower5']}%; the next 20 sessions trailed SPY by more than 3% in {o['bad20']}%.")
     for d in NEWS_DRIFTS:
         fact("Event drift, excess over all days (880k articles, 2018-2026), " + d + ".")
 
@@ -276,6 +290,17 @@ def packet(symbol: str, path: Optional[Path] = None, state: Optional[Dict[str, A
         fact(f"Analyst {a['graded_at'][:10]} {a['firm']}: {a['text']}")
     for c in cats:
         fact(f"Catalyst in {c.get('days_away')} days ({c.get('date')}): {c.get('title')} [{c.get('impact')}]")
+    rel = (release_fn or latest_release)(symbol)
+    if rel and rel.get("stale"):
+        fact(f"The latest earnings report ({rel['report']}) has not been read from its 8-K yet; no release facts are given.")
+    elif rel:
+        guide = (f"{rel.get('next_guide_low')}-{rel.get('next_guide_high')}" if rel.get("next_guide_low") is not None
+                 else "none given")
+        line = screen(str(rel.get("one_line") or "")).text
+        fact(f"Latest earnings release ({rel['date']}, read from the 8-K by a local model; check against the release): "
+             f"full-year outlook {rel.get('full_year_outlook') or 'none'}; next-quarter revenue guidance {guide} (units as "
+             f"reported); margin outlook {rel.get('margin_outlook') or 'n/a'}; tone {rel.get('tone')}"
+             + ("; restructuring announced" if rel.get("restructuring") else "") + (f". In one line: {line}" if line else "") + ".")
     j = (judgment_fn or _judgment)(symbol)
     if j:
         fact(f"News-storyline judgment {str(j.get('at'))[:16]}: {(j.get('label') or {}).get('en')}; {(j.get('summary') or {}).get('en')}")
@@ -309,6 +334,49 @@ def _analyst_changes(symbol: str, since: str, path: Optional[Path]) -> List[Dict
     finally:
         conn.close()
     return [{"graded_at": r["graded_at"], "firm": r["firm"], "text": analysts.describe(r), "direction": analysts.direction(r)} for r in rows]
+
+
+RELEASES_FILE = Path(os.getenv("RELEASE_FEATURES_FILE", "/Volumes/Data4T/earnings_policy/release_features.jsonl"))
+RELEASE_MAX_DAYS = 120          # an older release is not the latest report any more
+_releases: Dict[str, Any] = {"mtime": None, "by_symbol": {}}
+
+
+def latest_release(symbol: str, today: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """The symbol's latest extracted earnings release (quant_data earnings_releases.py) of the last 120 days."""
+    try:
+        mt = RELEASES_FILE.stat().st_mtime
+    except OSError:
+        return None
+    if _releases["mtime"] != mt:
+        by: Dict[str, List[Dict[str, Any]]] = {}
+        for line in RELEASES_FILE.read_text().splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("symbol") and r.get("date"):
+                by.setdefault(r["symbol"], []).append(r)
+        _releases.update(mtime=mt, by_symbol={k: sorted(v, key=lambda r: r["date"]) for k, v in by.items()})
+    day = today or datetime.utcnow().strftime("%Y-%m-%d")
+    rows = [r for r in _releases["by_symbol"].get(symbol, []) if r["date"] <= day]
+    last_report = _last_report_day(symbol, day)
+    if not rows or rows[-1]["date"] < (last_report or ""):
+        # the file is refreshed by hand (earnings_releases.py extract): a report after the newest row
+        # has not been read yet, and an older release must not stand in for it
+        return {"stale": True, "report": last_report} if last_report else None
+    r = rows[-1]
+    age = (datetime.strptime(day, "%Y-%m-%d") - datetime.strptime(r["date"], "%Y-%m-%d")).days
+    return r if age <= RELEASE_MAX_DAYS else None
+
+
+def _last_report_day(symbol: str, day: str) -> Optional[str]:
+    """The calendar day of the symbol's latest reported earnings on or before `day` (earnings_policy's file)."""
+    try:
+        rows = json.loads((RELEASES_FILE.parent / f"{symbol}.earnings.json").read_text())
+    except (OSError, ValueError):
+        return None
+    days = [str(r.get("time"))[:10] for r in rows if r.get("eps") is not None and str(r.get("time"))[:10] <= day]
+    return max(days) if days else None
 
 
 def _judgment(symbol: str) -> Optional[Dict[str, Any]]:
