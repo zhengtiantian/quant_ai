@@ -100,21 +100,22 @@ class DevilsAdvocateTest(unittest.TestCase):
 class LatestReleaseTest(unittest.TestCase):
     def test_latest_release_within_120_days(self):
         import tempfile
-        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
-            fh.write(json.dumps({"symbol": "AAA", "date": "2026-07-30", "full_year_outlook": "raised"}) + "\n")
-            fh.write(json.dumps({"symbol": "AAA", "date": "2026-10-29", "full_year_outlook": "lowered"}) + "\n")
-        old, da.RELEASES_FILE = da.RELEASES_FILE, Path(fh.name)
-        try:
-            da._releases["mtime"] = None
-            self.assertEqual(da.latest_release("AAA", "2026-11-18")["full_year_outlook"], "lowered")
-            self.assertEqual(da.latest_release("AAA", "2026-10-01")["full_year_outlook"], "raised")
-            self.assertIsNone(da.latest_release("AAA", "2027-06-01"))          # too old by then
-            self.assertIsNone(da.latest_release("BBB", "2026-11-18"))
-            (Path(fh.name).parent / "AAA.earnings.json").write_text(json.dumps([{"time": "2026-11-10T16:00:00-05:00", "eps": 1.0}]))
-            self.assertEqual(da.latest_release("AAA", "2026-11-18"), {"stale": True, "report": "2026-11-10"})   # not read yet
-        finally:
-            da.RELEASES_FILE = old
-            da._releases["mtime"] = None
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "release_features.jsonl"
+            f.write_text(json.dumps({"symbol": "AAA", "date": "2026-07-30", "full_year_outlook": "raised"}) + "\n"
+                         + json.dumps({"symbol": "AAA", "date": "2026-10-29", "full_year_outlook": "lowered"}) + "\n")
+            old, da.RELEASES_FILE = da.RELEASES_FILE, f
+            try:
+                da._releases["mtime"] = None
+                self.assertEqual(da.latest_release("AAA", "2026-11-18")["full_year_outlook"], "lowered")
+                self.assertEqual(da.latest_release("AAA", "2026-10-01")["full_year_outlook"], "raised")
+                self.assertIsNone(da.latest_release("AAA", "2027-06-01"))          # too old by then
+                self.assertIsNone(da.latest_release("BBB", "2026-11-18"))
+                (Path(tmp) / "AAA.earnings.json").write_text(json.dumps([{"time": "2026-11-10T16:00:00-05:00", "eps": 1.0}]))
+                self.assertEqual(da.latest_release("AAA", "2026-11-18"), {"stale": True, "report": "2026-11-10"})   # not read yet
+            finally:
+                da.RELEASES_FILE = old
+                da._releases["mtime"] = None
 
 
 if __name__ == "__main__":

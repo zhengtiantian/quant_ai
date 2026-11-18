@@ -260,6 +260,7 @@ LABELS = {
     "add_block:spacing": {"en": "Too close to the cheapest lot", "zh": "离最便宜的一批太近"},
     "add_block:size": {"en": "No cash or room under a cap", "zh": "现金或仓位上限不够"},
     "devils_advocate": {"en": "Devil's advocate", "zh": "反方审讯"},
+    "filing_change": {"en": "Risk factors rewritten (10-K / 10-Q)", "zh": "风险因素大改（10-K / 10-Q）"},
     "fired": {"en": "fired", "zh": "次"},
     "loss_avoided": {"en": "loss avoided", "zh": "少亏"},
     "gain_missed": {"en": "gain missed", "zh": "错过的涨幅"},

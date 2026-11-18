@@ -217,7 +217,7 @@ def _finish(rid: int, status: str, path: Optional[Path], **cols: Any) -> None:
 # ------------------------------------------------------------------ the packet
 
 def packet(symbol: str, path: Optional[Path] = None, state: Optional[Dict[str, Any]] = None,
-           news_fn=None, analysts_fn=None, judgment_fn=None, release_fn=None) -> Tuple[str, Dict[str, Dict[str, Any]], Dict[str, Any]]:
+           news_fn=None, analysts_fn=None, judgment_fn=None, release_fn=None, filing_fn=None) -> Tuple[str, Dict[str, Dict[str, Any]], Dict[str, Any]]:
     """The text Claude reads, the citable ids behind it, and the facts kept with the answer."""
     from . import daily_action, lot_advisor, risk_rules
     from . import portfolio as pf
@@ -290,6 +290,10 @@ def packet(symbol: str, path: Optional[Path] = None, state: Optional[Dict[str, A
         fact(f"Analyst {a['graded_at'][:10]} {a['firm']}: {a['text']}")
     for c in cats:
         fact(f"Catalyst in {c.get('days_away')} days ({c.get('date')}): {c.get('title')} [{c.get('impact')}]")
+    fc = (filing_fn or _filing_change)(symbol)
+    if fc:
+        from . import filing_changes
+        fact(filing_changes.describe(fc, "en"))
     rel = (release_fn or latest_release)(symbol)
     if rel and rel.get("stale"):
         fact(f"The latest earnings report ({rel['report']}) has not been read from its 8-K yet; no release facts are given.")
@@ -334,6 +338,14 @@ def _analyst_changes(symbol: str, since: str, path: Optional[Path]) -> List[Dict
     finally:
         conn.close()
     return [{"graded_at": r["graded_at"], "firm": r["firm"], "text": analysts.describe(r), "direction": analysts.direction(r)} for r in rows]
+
+
+def _filing_change(symbol: str) -> Optional[Dict[str, Any]]:
+    try:
+        from . import filing_changes
+        return filing_changes.get(symbol)
+    except Exception:  # noqa: BLE001 - no file: the packet goes without it
+        return None
 
 
 RELEASES_FILE = Path(os.getenv("RELEASE_FEATURES_FILE", "/Volumes/Data4T/earnings_policy/release_features.jsonl"))

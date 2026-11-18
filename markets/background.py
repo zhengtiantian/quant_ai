@@ -46,7 +46,18 @@ def _loop() -> None:
             devils_advocate.watch_due()        # market hours: a held stock down >= 2 x ATR gets the case against adding
         except Exception as e:  # noqa: BLE001
             print(f"[markets] devil's advocate check failed: {type(e).__name__}: {e}")
+        if time.time() - _filing_checked["t"] >= FILING_EVERY:
+            _filing_checked["t"] = time.time()
+            try:
+                from . import filing_changes
+                filing_changes.record_due()    # a rewritten risk-factor section, logged once as a blocking hint
+            except Exception as e:  # noqa: BLE001
+                print(f"[markets] filing-change logging failed: {type(e).__name__}: {e}")
         time.sleep(TICK)
+
+
+FILING_EVERY = 3600
+_filing_checked = {"t": 0.0}
 
 
 def start() -> None:

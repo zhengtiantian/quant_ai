@@ -113,6 +113,19 @@ def portfolio_devils_advocate_run(payload: Dict[str, Any]):
         return _error(e, 500)
 
 
+@router.get("/portfolio/filing-changes")
+def portfolio_filing_changes():
+    """Held and watched stocks whose latest 10-K / 10-Q rewrote its risk factors (Q.17.5), with the words."""
+    from . import filing_changes
+    from . import portfolio as pf
+    try:
+        st = pf.get_state(cached_quotes=True)
+        syms = [h["symbol"] for h in st.get("holdings") or []] + [w["symbol"] for w in st.get("watchlist") or []]
+        return {"status": "success", **filing_changes.for_symbols(syms)}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
 @router.get("/portfolio/hint-scores")
 def portfolio_hint_scores():
     """Blocked buys and cases against adding, scored against having bought at that session's close (Q.17.0)."""
