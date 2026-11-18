@@ -185,19 +185,21 @@ if __name__ == "__main__":
 class WeekReportsTest(unittest.TestCase):
     """Q.17 round 4: holdings reporting within a week count as one report-night exposure."""
 
-    def acts(self, *rows):
-        return [{"symbol": s, "event": {"days_away": d, "loss_usd": l}, "notes": [], "reasons": []} for s, d, l in rows]
+    def nights(self, *rows):
+        return {s: {"days_away": d, "loss_usd": l, "source": "atr"} for s, d, l in rows}
 
     def test_two_reports_over_the_budget_together_get_a_key_note(self):
-        acts = self.acts(("AAA", 0, 600.0), ("BBB", 3, 700.0), ("CCC", 20, 900.0))
-        w = daily_action.week_reports(acts, budget=1000.0, total=20000.0)
-        self.assertEqual((w["symbols"], w["loss_usd"], w["over"]), (["AAA", "BBB"], 1300.0, True))
-        self.assertIn("2 只持仓一周内发财报", acts[0]["notes"][0]["zh"])
-        self.assertTrue(acts[1]["notes"][0]["key"])
-        self.assertEqual(acts[2]["notes"], [])                           # reports later: not part of the week
+        acts = [{"symbol": "AAA", "notes": [], "reasons": []}, {"symbol": "ZZZ", "notes": [], "reasons": []}]
+        w = daily_action.week_reports(self.nights(("BBB", 3, 700.0), ("AAA", 0, 600.0), ("CCC", 20, 900.0)), acts, 1000.0, 20000.0)
+        self.assertEqual((w["symbols"], w["loss_usd"], w["over"]), (["AAA", "BBB"], 1300.0, True))   # by days away
+        self.assertIn("2 只持仓一周内发财报", w["text"]["zh"])
+        self.assertTrue(acts[0]["notes"][0]["key"])
+        self.assertEqual(acts[1]["notes"], [])                          # not reporting this week
 
     def test_under_the_budget_or_alone_no_note(self):
-        acts = self.acts(("AAA", 0, 300.0), ("BBB", 2, 300.0))
-        self.assertFalse(daily_action.week_reports(acts, 1000.0, 20000.0)["over"])
+        acts = [{"symbol": "AAA", "notes": [], "reasons": []}]
+        w = daily_action.week_reports(self.nights(("AAA", 0, 300.0), ("BBB", 2, 300.0)), acts, 1000.0, 20000.0)
+        self.assertFalse(w["over"])
+        self.assertNotIn("text", w)
         self.assertEqual(acts[0]["notes"], [])
-        self.assertIsNone(daily_action.week_reports(self.acts(("AAA", 0, 5000.0)), 1000.0, 20000.0))
+        self.assertIsNone(daily_action.week_reports(self.nights(("AAA", 0, 5000.0)), acts, 1000.0, 20000.0))
