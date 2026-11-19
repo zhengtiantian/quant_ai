@@ -6,6 +6,13 @@ decides each one on the tab: "add" (a keyword), "weak" (kept for the SLM pass, n
 back to pending. Decisions go to <dir>/decisions.json; quant_data's hourly apply step writes them into the
 rule files and logs each change to <dir>/applied.jsonl, which is read back here to show what is in effect.
 
+2026-11-19: quant_data also screens each suggestion for collateral hits (`screen`: 24 months of headlines,
+the words and companies next to the term, Claude on other meanings), may add the risk-free ones itself
+(decisions with "by": "auto", only while <dir>/settings.json has "auto_apply": true; set_auto() is the
+switch on the tab) and audits every added term daily (<dir>/audit.json: what it brought in, the share the
+relevance model kept; failing auto-added terms are taken out again). tools/coverage_watch.py writes the
+per-company coverage check to COVERAGE_DIR/latest.json; coverage() and summary() read it.
+
 Files only: quant_ai does not import quant_data code.
 """
 
@@ -19,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 DIR = Path(os.getenv("KEYWORD_REFRESH_DIR", "/Volumes/Data4T/keyword_refresh"))
+COVERAGE_DIR = Path(os.getenv("COVERAGE_WATCH_DIR", "/Volumes/Data4T/coverage_watch"))
 DECISIONS = ("add", "weak", "reject")
 HISTORY = ("full", "first_seen")
 # as quant_data's keyword_refresh.default_history: a product has no headlines before it exists, a
@@ -72,6 +80,9 @@ def review() -> Dict[str, Any]:
             seen.setdefault(c["id"], []).append(p.stem)
     decisions = _read(DIR / "decisions.json", {})
     applied = _applied()
+    audit = _read(DIR / "audit.json", {})
+    preview = _read(DIR / "auto_preview.json", {})
+    eligible = set(preview.get("ids") or [])
     rescans: Dict[str, List[Dict[str, Any]]] = {}
     for v in _read(DIR / "rescan.json", {}).values():
         if isinstance(v, dict) and v.get("id"):
@@ -85,13 +96,50 @@ def review() -> Dict[str, Any]:
                                            "examples", "company_headlines", "current_keywords", "ordinary_word", "caveat",
                                            "week")}
                     | {"weeks_seen": seen[pid], "decision": d.get("decision"), "decided_at": d.get("at"),
+                       "decided_by": d.get("by") or ("user" if d.get("decision") else None), "decision_reason": d.get("reason"),
+                       "confirmed_at": d.get("confirmed"), "screen": c.get("screen"), "auto_eligible": pid in eligible,
+                       "audit": (audit.get("terms") or {}).get(pid),
                        "history": d.get("history") or default_history(c.get("kind")),
                        "rescans": sorted(rescans.get(pid, []), key=lambda r: r["since"] or ""),
                        "in_rules": bool(a.get("in_rules")), "applied_at": a.get("at")})
     tier_order = {"add": 0, "weak": 1, "unjudged": 2, "model_none": 3}
     rows.sort(key=lambda r: (-int((r["week"] or "0").replace("-", "")), tier_order.get(r["tier"], 9),
                              r["symbol"], -(r["co_mention"] or 0)))
-    return {"dir": str(DIR), "runs": runs[::-1], "proposals": rows}
+    return {"dir": str(DIR), "runs": runs[::-1], "proposals": rows,
+            "auto": {"enabled": bool(_read(DIR / "settings.json", {}).get("auto_apply")), "preview_at": preview.get("at"),
+                     "eligible": len(eligible)},
+            "audit_at": audit.get("at")}
+
+
+def coverage() -> Dict[str, Any]:
+    """tools/coverage_watch.py's latest check, or {} before the first run."""
+    return _read(COVERAGE_DIR / "latest.json", {})
+
+
+def summary() -> Dict[str, Any]:
+    """Counts for the tab's badge: suggestions waiting for the user, coverage alerts."""
+    decisions = _read(DIR / "decisions.json", {})
+    props: Dict[str, Dict[str, Any]] = {}
+    for p in _runs():
+        for c in _read(p, {}).get("candidates") or []:
+            props[c["id"]] = c
+    pending = sum(1 for pid, c in props.items() if pid not in decisions and c.get("tier") in ("add", "weak"))
+    cov = coverage()
+    return {"pending": pending, "coverage_at": cov.get("at"),
+            "coverage_alerts": len(cov.get("core_alerts") or []) + len(cov.get("universe_flagged") or []),
+            "coverage_notices": len(set(cov.get("core_flagged") or []) - set(cov.get("core_alerts") or [])),
+            "auto_apply": bool(_read(DIR / "settings.json", {}).get("auto_apply"))}
+
+
+def set_auto(enabled: bool) -> Dict[str, Any]:
+    """The tab's switch for quant_data's auto_decide (it acts at the next hourly apply)."""
+    DIR.mkdir(parents=True, exist_ok=True)
+    cur = _read(DIR / "settings.json", {})
+    cur.update(auto_apply=bool(enabled), auto_apply_changed=datetime.now().isoformat(timespec="seconds"))
+    tmp = DIR / "settings.json.tmp"
+    tmp.write_text(json.dumps(cur, indent=1))
+    tmp.rename(DIR / "settings.json")
+    return {"auto_apply": cur["auto_apply"]}
 
 
 def decide(ids: List[str], decision: str | None, history: str | None = None) -> Dict[str, Any]:

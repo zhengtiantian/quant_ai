@@ -294,6 +294,40 @@ def keywords_review():
         return _error(e, 500)
 
 
+@router.get("/keywords/summary")
+def keywords_summary():
+    """Badge counts: suggestions waiting, coverage alerts (markets/keyword_review.py)."""
+    from . import keyword_review
+    try:
+        return {"status": "success", **keyword_review.summary()}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
+@router.get("/keywords/coverage")
+def keywords_coverage():
+    """quant_data's daily coverage check (tools/coverage_watch.py)."""
+    from . import keyword_review
+    try:
+        return {"status": "success", "coverage": keyword_review.coverage()}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
+@router.post("/keywords/auto")
+def keywords_auto(payload: Dict[str, Any]):
+    """{"enabled": true | false}: whether quant_data adds the suggestions that pass every check."""
+    from . import keyword_review
+    try:
+        if not isinstance(payload.get("enabled"), bool):
+            raise ValueError("enabled must be true or false")
+        return {"status": "success", **keyword_review.set_auto(payload["enabled"])}
+    except ValueError as e:
+        return _error(e, 400)
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
 @router.post("/keywords/decide")
 def keywords_decide(payload: Dict[str, Any]):
     """{"ids": [...], "decision": "add" | "weak" | "reject" | "pending" | "keep", "history"?: "full" | "first_seen"}."""
