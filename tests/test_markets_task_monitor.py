@@ -41,3 +41,22 @@ def test_get_task_log():
     res_sched = task_monitor.get_task_log(source="scheduler", target_id="scheduler", lines=10)
     assert res_sched["status"] == "success"
     assert len(res_sched["log"]) > 0
+
+
+def test_every_chinese_display_field_also_goes_out_in_english():
+    from markets import task_monitor as tm
+    out = tm._add_english({
+        "job_agent": {"name": "找工平台 (Job Agent)", "next_run": {"countdown": "2小时 5分钟后"}},
+        "airflow_dags": [{"name": "每日量化信号主管道 (EOD Signals)", "category": "量化主管道",
+                          "schedule_display": "每 30 分钟", "dag_id": "x"}],
+        "system_daemons": [{"name": "Airflow 定时调度器", "type": "Docker 容器", "description": "plain English"}],
+    })
+    assert out["job_agent"]["name_en"] == "Job Agent"
+    assert out["job_agent"]["next_run"]["countdown_en"] == "in 2h 5m"
+    dag = out["airflow_dags"][0]
+    assert (dag["name_en"], dag["category_en"], dag["schedule_display_en"]) == (
+        "Daily signal pipeline (EOD Signals)", "Quant pipeline", "Every 30 minutes")
+    assert dag["name"] == "每日量化信号主管道 (EOD Signals)"          # the Chinese field is kept
+    assert "description_en" not in out["system_daemons"][0]           # English text needs no copy
+    assert all(c in tm.EN for c in tm.CATEGORIES)
+    assert tm._english("实时盘中突发新闻采集 ➔ finnhub_news") == "Intraday breaking news ➔ finnhub_news"

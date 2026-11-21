@@ -648,6 +648,147 @@ def _get_system_daemons() -> List[Dict[str, Any]]:
     return daemons
 
 
+
+# ---------------------------------------------------------------- English for the dashboard
+# The dashboard shows English unless the viewer switches to Chinese, so every Chinese display text
+# below also goes out in English as "<field>_en" (_add_english); the Chinese fields are unchanged.
+EN: Dict[str, str] = {
+    "今日求职精选报告已生成": "Today's job report is ready",
+    "找工平台 (Job Agent)": "Job Agent",
+    "每日 11:00 & 16:00 都柏林时间 (Airflow 统一调度: job_agent_morning / job_agent_afternoon)":
+        "Daily 11:00 & 16:00 Dublin time (Airflow: job_agent_morning / job_agent_afternoon)",
+    "每日量化信号主管道 (EOD Signals)": "Daily signal pipeline (EOD Signals)",
+    "量化主管道": "Quant pipeline",
+    "收盘宏观/新闻指标聚合，特征工程，多因子打分与仓位风控决策":
+        "End-of-day macro and news features, multi-factor scoring and position risk decisions",
+    "GDELT 新闻抓取与 SLM 匹配": "GDELT news collection and SLM matching",
+    "数据采集与匹配": "Collection & matching",
+    "全球财经与科技新闻每日自动采集，经过SLM模型精准实体匹配入库":
+        "Daily collection of global business and tech news, matched to companies by the SLM",
+    "新闻特征丰富与向量化嵌入": "News enrichment and embeddings",
+    "数据处理与特征": "Processing & features",
+    "新闻事件情绪打分、聚类与向量数据库入库，下游触发信号主管道":
+        "News sentiment scoring, clustering and vector store; triggers the signal pipeline",
+    "历史日K行情增量回填": "Daily price history backfill",
+    "行情与历史数据": "Prices & history",
+    "同步每日最新股票收盘价、复权因子与交易量到 TimescaleDB":
+        "Syncs daily closes, adjustment factors and volume to TimescaleDB",
+    "实时盘中突发新闻采集": "Intraday breaking news",
+    "实时盘中监控": "Intraday monitoring",
+    "每30分钟采集盘中Breaking News与美股异动快讯": "Breaking news and US market movers every 30 minutes",
+    "散户与社交情绪监控": "Retail and social sentiment",
+    "美股主流散户社区情绪指数与热度异动采集": "Sentiment and buzz from the main US retail investor communities",
+    "AI 预测模型周度再训练": "Weekly model retraining",
+    "模型每周训练": "Weekly training",
+    "每周日自动化重新训练LightGBM多因子回归模型与MLflow版本记录":
+        "Retrains the LightGBM multi-factor model every Sunday, versioned in MLflow",
+    "机构 13F 持仓季报更新": "Institutional 13F filings",
+    "机构与资金流": "Institutions & flows",
+    "更新华尔街顶级机构 SEC 13F 季度调仓数据": "Quarterly SEC 13F position changes of the largest institutions",
+    "GDELT 数据健康度验证": "GDELT data health check",
+    "系统健康检查": "System health",
+    "每周定期校验 GDELT 数据完整性与空洞检测": "Weekly GDELT completeness and gap check",
+    "新闻验证与打分校准": "News validation and score calibration",
+    "新闻样本交叉校验与标签模型评估": "Cross-checks news samples and evaluates the labelling model",
+    "全球求职早班扫描 (IE + 中国全量 + 欧中东官网)": "Job scan, morning (IE + China full + EU/ME company sites)",
+    "全球求职监控": "Job search",
+    "每日 11:00 都柏林(19:00 北京)：爱尔兰早班全扫 + 中国全职(201家外企官网/国内/外包) + 中国远程兼职 + 欧英/中东官网快扫":
+        "Daily 11:00 Dublin (19:00 Beijing): Ireland full scan + China full-time (201 company sites / domestic / outsourcing) + China remote part-time + EU/UK & Middle East company sites",
+    "全球求职午后扫描 (IE + 欧英/中东/Remote全量 + 中国外企官网)":
+        "Job scan, afternoon (IE + EU/UK, Middle East, Remote full + China company sites)",
+    "每日 16:00 都柏林：爱尔兰午后全扫 + 欧洲12国/中东3国/全球Remote国家级全扫 + 中国201家外企官网快扫":
+        "Daily 16:00 Dublin: Ireland full scan + 12 European / 3 Middle East countries / Remote + 201 company sites in China",
+    "GDELT 小时级新闻采集与匹配": "Hourly GDELT news and matching",
+    "每小时 20 分增量抓取全球 GDELT GKG 新闻并通过 SLM 模型完成公司实体匹配":
+        "At :20 every hour: new GDELT GKG news, matched to companies by the SLM",
+    "持仓盘中/收盘 AI 操作建议 (Daily Advice)": "Daily model advice for holdings (Daily Advice)",
+    "交易日 13:30 / 17:30 / 21:30 UTC 为当前持仓生成模型动作评估建议":
+        "Trading days 13:30 / 17:30 / 21:30 UTC: the models' action for each holding",
+    "期权与分析师评级收盘快照": "Options and analyst ratings snapshot",
+    "交易日 21:15 UTC 抓取股票池与持仓的期权隐含波动率及华尔街分析师目标价快照":
+        "Trading days 21:15 UTC: implied volatility and analyst price targets for the universe and holdings",
+    "公司匹配规则关键词周度挖掘": "Weekly keyword mining for company rules",
+    "每周六 08:00 都柏林时间自动生成新增公司匹配关键词候选供 UI 审核":
+        "Saturdays 08:00 Dublin: new keyword candidates for the company rules, for review in the UI",
+    "公司关键词审核自动生效": "Approved keywords applied",
+    "每日 08:55–23:55 每小时将 UI 审核通过的关键词同步写入匹配规则库":
+        "Hourly 08:55–23:55: keywords approved in the UI are written to the matching rules",
+    "其他任务": "Other",
+    "上游联动触发 (backfill_2 完成后自动执行 · 约 04:30–05:10 UTC)": "After backfill_2 finishes (about 04:30–05:10 UTC)",
+    "上游联动触发 (backfill_1 完成后自动执行 · 约 04:15–04:30 UTC)": "After backfill_1 finishes (about 04:15–04:30 UTC)",
+    "按需手动触发 (On-demand 离线质检与抽样)": "On demand (offline quality checks and sampling)",
+    "按需 / 上游联动触发": "On demand / triggered upstream",
+    "每日 04:00 UTC (都柏林冬令时 04:00 / 夏令时 05:00)": "Daily 04:00 UTC (Dublin 04:00 winter / 05:00 summer)",
+    "每日 06:30 UTC (14:30 本地)": "Daily 06:30 UTC (14:30 local)",
+    "每 30 分钟": "Every 30 minutes",
+    "每日 20:30 UTC (04:30 本地)": "Daily 20:30 UTC (04:30 local)",
+    "每周日 06:00 UTC": "Sundays 06:00 UTC",
+    "每周日 07:00 UTC": "Sundays 07:00 UTC",
+    "每周日 04:00 UTC": "Sundays 04:00 UTC",
+    "每日 11:00 都柏林时间 (19:00 北京 · 自动冬/夏令时)": "Daily 11:00 Dublin time (19:00 Beijing)",
+    "每日 16:00 都柏林时间 (自动冬/夏令时)": "Daily 16:00 Dublin time",
+    "每小时 20 分 UTC (03:00–06:00 让位夜间主管道)": "At :20 every hour UTC (not 03:00–06:00, the nightly pipeline's slot)",
+    "交易日 13:30 / 17:30 / 21:30 UTC": "Trading days 13:30 / 17:30 / 21:30 UTC",
+    "交易日 21:15 UTC (美股收盘后)": "Trading days 21:15 UTC (after the US close)",
+    "每日 08:55–23:55 都柏林时间 (每小时 55 分)": "Daily 08:55–23:55 Dublin time (at :55)",
+    "每周六 08:00 都柏林时间": "Saturdays 08:00 Dublin time",
+    "Quant AI 核心服务": "Quant AI core service",
+    "提供量化分析、投资组合、宏观资讯、AI Agent 和监控 API":
+        "Quant analysis, portfolio, macro news, AI agent and monitoring APIs",
+    "Airflow 定时调度器": "Airflow scheduler",
+    "驱动全部 quant_data 量化管道、模型周训与 job_agent 全球求职定时任务":
+        "Runs every scheduled pipeline: quant_data, weekly training and the job scans",
+    "找工中控 Web 服务 (Job Agent)": "Job Agent web service",
+    "5050 端口多国求职看板 (IE/EU/中东/Remote/中国)；定时抓取由 Airflow 每日 11:00 & 16:00 驱动":
+        "Job board on port 5050 (IE / EU / Middle East / Remote / China); scans run from Airflow at 11:00 & 16:00",
+    "LM Studio 本地大模型": "LM Studio local models",
+    "本地 LLM 推理接口，服务于 quant_ai 与 job_agent 简历匹配": "Local LLM inference for quant_ai and the job matching",
+    "Data4T 磁盘健康看门狗": "Data4T disk watchdog",
+    "监控 4TB 外接高速盘空间并防止数据溢出": "Watches free space on the 4 TB external disk",
+    "Airflow 元数据库 (Postgres)": "Airflow metadata DB (Postgres)",
+    "Docker 容器": "Docker container",
+    "存储所有 DAG 执行记录、任务状态与调度元数据": "Every DAG run, task state and schedule",
+    "MLflow 实验与模型追踪": "MLflow experiments and models",
+    "记录周度模型训练指标与模型注册表": "Weekly training metrics and the model registry",
+    "Quant UI 前端交互面板": "Quant UI dashboard",
+    "量化投资组合管理、信号监控与定时任务大盘界面": "Portfolio, signals and scheduled-task dashboard",
+    "找工平台 ➔ 全网职位扫描与匹配中": "Job Agent ➔ scanning and matching jobs",
+}
+# Fixed order of the category filter on the Task Monitor page
+CATEGORIES = ["量化主管道", "全球求职监控", "数据采集与匹配", "数据处理与特征", "行情与历史数据",
+              "实时盘中监控", "机构与资金流", "模型每周训练", "系统健康检查"]
+_TEXT_KEYS = ("name", "category", "description", "desc", "schedule_display", "type", "countdown",
+              "schedule", "summary", "regions_summary")
+_CJK = re.compile(r"[一-鿿]")
+
+
+def _english(text: str) -> str:
+    """The English for one display text; built ones (a countdown, the regions line) by pattern."""
+    if text in EN:
+        return EN[text]
+    head, arrow, tail = text.partition(" ➔ ")      # a running step: "<DAG name> ➔ <task id>"
+    if arrow and head in EN:
+        return f"{EN[head]} ➔ {tail}"
+    out = re.sub(r"(\d+)小时 (\d+)分钟后", r"in \1h \2m", text)
+    out = re.sub(r"(\d+)分钟后", r"in \1m", out)
+    return out.replace("中东", "Middle East")
+
+
+def _add_english(obj: Any) -> Any:
+    """Adds "<field>_en" beside every Chinese display field, in place, at any depth."""
+    if isinstance(obj, dict):
+        for key in list(obj):
+            value = obj[key]
+            if key in _TEXT_KEYS and isinstance(value, str) and _CJK.search(value):
+                obj[f"{key}_en"] = _english(value)
+            else:
+                _add_english(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            _add_english(item)
+    return obj
+
+
 def get_task_monitor_status() -> Dict[str, Any]:
     """Unified entrypoint: collects full monitor state across all systems."""
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -674,7 +815,7 @@ def get_task_monitor_status() -> Dict[str, Any]:
     total_running = len(running_tasks)
     active_dags = sum(1 for d in airflow_info["dags"] if not d["is_paused"])
 
-    return {
+    return _add_english({
         "status": "success",
         "timestamp": now.isoformat(),
         "summary": {
@@ -690,7 +831,8 @@ def get_task_monitor_status() -> Dict[str, Any]:
         "job_agent": job_agent_info,
         "airflow_dags": airflow_info["dags"],
         "system_daemons": daemons,
-    }
+        "categories": [{"zh": c, "en": EN[c]} for c in CATEGORIES],
+    })
 
 
 def get_task_log(
