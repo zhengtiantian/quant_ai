@@ -90,6 +90,26 @@ class ModelAdviceTest(unittest.TestCase):
         a = model_advice.render("INTC", HOLD, STATS, 64.44, 0.0, forecast(generated="2026-10-01T00:00:00+00:00"))
         self.assertTrue(a["stale"])
 
+    def test_market_stress_shows_note_blocks_add_and_widens_spacing(self):
+        stress = {
+            "state": "fearful", "severity": "critical", "tighten_buys": True,
+            "title": {"en": "Market panic + Chip sector selloff", "zh": "市场恐慌 + 半导体踩踏"},
+            "detail": {"en": "Context only, not a forecast.", "zh": "仅作风险背景提示，不预测涨跌。"},
+            "pills": [{"id": "vix", "label": "VIX", "value": "34.0", "stress": True},
+                      {"id": "sox1d", "label": "SOX 1d", "value": "-9.51%", "stress": True}],
+        }
+        far = {**HOLD, "quote": {"price": 50.0}}   # passes normal 2x ATR ($50.72), fails stressed 3x ATR ($43.86)
+        a = model_advice.render("INTC", far, STATS, 64.44, 10000.0, forecast("add", 70.0), market=stress)
+        self.assertEqual((a["action"], a["orders"]), ("hold", []))
+        self.assertEqual(a["notes"][0]["section"], "market")
+        self.assertIn("VIX 34.0", a["notes"][0]["zh"])
+        add_notes = [n["zh"] for n in a["notes"] if n["section"] == "add"]
+        self.assertTrue(any("暂停补仓" in n and "$43.86 或更低" in n for n in add_notes))
+
+        b = model_advice.render("INTC", HOLD, STATS, 64.44, 0.0, forecast("hold", 52.0), market=stress)
+        add_b = [n["zh"] for n in b["notes"] if n["section"] == "add"]
+        self.assertTrue(any("$43.86 或更低" in n and "3 倍 ATR" in n for n in add_b))
+
 
 if __name__ == "__main__":
     unittest.main()

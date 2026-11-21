@@ -322,7 +322,7 @@ def compute(path: Optional[Path] = None, state: Optional[Dict[str, Any]] = None,
         # What the user reads is the models' advice (2026-11-02); the rule-based action is kept with it.
         try:
             m = model_fn(sym, h, advice.get("stats") or {}, (advice.get("dip_guardrail") or {}).get("anchor_cost"), float(st.get("cash") or 0.0),
-                         total=ex["total"], budget_pct=risk_budget.BUDGET_PCT)
+                         total=ex["total"], budget_pct=risk_budget.BUDGET_PCT, market=market)
         except Exception:  # noqa: BLE001 - no forecast: the rule-based action is shown
             m = None
         if m:
@@ -337,7 +337,10 @@ def compute(path: Optional[Path] = None, state: Optional[Dict[str, Any]] = None,
            "portfolio": {"total": round(ex["total"], 2), "cash": ex["cash"], "cash_pct": ex["cash_pct"], "cluster_pct": ex["cluster_pct"],
                          "max_symbol_pct": risk_rules.MAX_SYMBOL_PCT, "max_cluster_pct": risk_rules.MAX_CLUSTER_PCT,
                          "min_cash_pct": risk_rules.MIN_CASH_PCT,
-                         "breaches": risk_rules.summary(ex), "plan": plan, "market": market,
+                         "breaches": risk_rules.summary(ex), "breaches_zh": risk_rules.summary_zh(ex),
+                         "bad_day_loss": plan.get("bad_day_loss_before") if plan else None,
+                         "loss_budget_usd": round(risk_budget.BUDGET_PCT / 100 * ex["total"], 2),
+                         "plan": plan, "market": market,
                          "loss_budget_pct": risk_budget.BUDGET_PCT, "week_reports": week}}
     _keep(out, path)
     return out

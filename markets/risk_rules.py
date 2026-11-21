@@ -110,3 +110,14 @@ def summary(ex: Dict[str, Any]) -> List[str]:
     if ex.get("cash_pct", 0.0) < MIN_CASH_PCT:
         out.append(f"Cash is {ex.get('cash_pct', 0.0):.1f}% of the portfolio (target {MIN_CASH_PCT:g}%)")
     return out
+
+
+def summary_zh(ex: Dict[str, Any]) -> List[str]:
+    """The same portfolio-level breaches in Chinese."""
+    out = [f"{s} 占组合 {w:.1f}%（上限 {MAX_SYMBOL_PCT:g}%）" for s, w in sorted(ex["weights"].items(), key=lambda kv: -kv[1])
+           if w > MAX_SYMBOL_PCT]
+    if ex["cluster_pct"] > MAX_CLUSTER_PCT:
+        out.append(f"芯片 / 存储类占组合 {ex['cluster_pct']:.1f}%（上限 {MAX_CLUSTER_PCT:g}%）")
+    if ex.get("cash_pct", 0.0) < MIN_CASH_PCT:
+        out.append(f"现金仅占组合 {ex.get('cash_pct', 0.0):.1f}%（目标 {MIN_CASH_PCT:g}%）")
+    return out

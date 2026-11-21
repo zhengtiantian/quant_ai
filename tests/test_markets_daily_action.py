@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from markets import daily_action, risk_rules  # noqa: E402
+from markets import daily_action, risk_budget, risk_rules  # noqa: E402
 
 
 def state(intc_qty=142.18, intc_px=64.89, others=(("SKHY", 6755.82), ("TSM", 2760.33), ("STX", 2154.21), ("GOOGL", 281.45)), cash=0.0):
@@ -218,3 +218,143 @@ class NightsFromAdviceTest(unittest.TestCase):
         # 1.6 x 2% ATR = 3.2% typical, x EVENT_K 2.635 = 8.4% (rounded) of $10,000
         self.assertAlmostEqual(n["AAA"]["loss_usd"], 10000.0 * n["AAA"]["loss_pct"] / 100, places=2)
         self.assertEqual(n["AAA"]["sessions_away"], 2)
+
+
+class MarketWeatherTest(unittest.TestCase):
+    def _candles(self, vals):
+        return {"candles": [{"time": f"2026-01-{i+1:02d}", "close": v} for i, v in enumerate(vals)]}
+
+    def test_live_panic_chip_selloff_and_macro_headwind(self):
+        live = {
+            ".VIX": {"price": 34.0, "change_pct": 19.5},
+            ".SPX": {"price": 6968.0, "change_pct": -2.9},
+            ".SOX": {"price": 8523.9, "change_pct": -9.51},
+            "US10Y": {"price": 4.92},
+            "US2Y": {"price": 4.62},
+            ".DXY": {"price": 103.8},
+            "@CL.1": {"price": 84.1},
+            "@LCO.1": {"price": 92.6},
+        }
+        charts = {
+            "SPY": self._candles([100, 100, 100, 100, 100, 96.0]),      # -4.0% 5d
+            "SOXX": self._candles([100, 100, 100, 100, 100, 91.0]),     # -9.0% 5d
+            "HYG": self._candles([100.0] * 60 + [98.5]),
+            "IEF": self._candles([100.0] * 61),
+        }
+        hist = {
+            "as_of": "2026-11-19", "y10_60d_ago": 4.49, "y2_60d_ago": 3.99,
+            "dxy_60d_ago": 99.2, "credit_chg20": -0.2, "credit_chg60": -1.1,
+            "oil_20d_ago": 80.0, "oil_60d_ago": 83.5,
+        }
+        fake_events = [{"date": "2026-11-27", "days_away": 7, "kind": "policy", "impact": "medium",
+                        "title_en": "Export curbs pause ends", "title_zh": "出口限制暂停期届满"}]
+        m = risk_budget.market_state(
+            features_fn=lambda: {"macro_vix": 24.6, "macro_vix_pctile_252d": 0.91},
+            chart_fn=lambda sym, rng, path=None: charts.get(sym, {"candles": []}),
+            live_fn=lambda path=None: live,
+            macro_hist_fn=lambda: hist,
+            events_fn=lambda path=None: fake_events,
+        )
+        self.assertEqual(m["state"], "fearful")
+        self.assertEqual(m["vix"], 34.0)
+        self.assertEqual(m["vix_source"], "cnbc_live")
+        self.assertTrue(m["sector_stress"])
+        self.assertEqual(m["macro"]["level"], "heavy")
+        self.assertEqual(set(m["macro"]["flags"]), {"rates", "dollar", "credit", "oil"})
+        self.assertEqual(m["macro"]["oil"], 84.1)
+        self.assertEqual(m["macro"]["brent"], 92.6)
+        self.assertEqual(m["upcoming"], fake_events)
+        self.assertEqual(m["severity"], "critical")
+        self.assertTrue(m["tighten_buys"])
+        self.assertIn("市场恐慌", m["title"]["zh"])
+        self.assertIn("半导体踩踏", m["title"]["zh"])
+        self.assertIn("宏观紧缩重压", m["title"]["zh"])
+        by_id = {p["id"]: p for p in m["pills"]}
+        for pid in ("vix", "spx1d", "spy5d", "sox1d", "soxx5d", "us10y", "dxy", "credit", "oil"):
+            self.assertTrue(by_id[pid]["stress"], pid)
+
+    def test_calm_market_stays_info_without_tightening(self):
+        live = {
+            ".VIX": {"price": 14.2, "change_pct": -2.1},
+            ".SPX": {"price": 7100.0, "change_pct": 0.4},
+            ".SOX": {"price": 9200.0, "change_pct": 0.8},
+            "US10Y": {"price": 4.10},
+            "US2Y": {"price": 3.80},
+            ".DXY": {"price": 99.5},
+            "@CL.1": {"price": 68.0},
+            "@LCO.1": {"price": 72.0},
+        }
+        charts = {
+            "SPY": self._candles([100, 100.2, 100.4, 100.6, 100.8, 101.2]),
+            "SOXX": self._candles([100, 100.5, 101.0, 101.2, 101.5, 102.0]),
+            "HYG": self._candles([100.0] * 61),
+            "IEF": self._candles([100.0] * 61),
+        }
+        hist = {"as_of": "2026-11-19", "y10_60d_ago": 4.05, "y2_60d_ago": 3.82, "dxy_60d_ago": 99.0,
+                "oil_20d_ago": 67.5, "oil_60d_ago": 69.0}
+        m = risk_budget.market_state(
+            features_fn=lambda: {"macro_vix": 14.5, "macro_vix_pctile_252d": 0.30},
+            chart_fn=lambda sym, rng, path=None: charts.get(sym, {"candles": []}),
+            live_fn=lambda path=None: live,
+            macro_hist_fn=lambda: hist,
+            events_fn=lambda path=None: [],
+        )
+        self.assertEqual(m["state"], "normal")
+        self.assertFalse(m["sector_stress"])
+        self.assertEqual(m["macro"]["level"], "calm")
+        self.assertEqual(m["severity"], "info")
+        self.assertFalse(m["tighten_buys"])
+
+    def test_upcoming_macro_policy_filters_noise_and_deduplicates(self):
+        import sqlite3
+        from datetime import date
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "m.db"
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "CREATE TABLE collected_catalysts (id INTEGER PRIMARY KEY, event_date TEXT, kind TEXT, "
+                "symbol TEXT, impact_level TEXT, title_zh TEXT, title_en TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO collected_catalysts(event_date, kind, symbol, impact_level, title_zh, title_en) VALUES (?,?,?,?,?,?)",
+                [
+                    ("2026-11-27", "policy", "MACRO", "medium", "中国对美镓锗出口限制暂停期届满", "China gallium/germanium export curbs pause ends"),
+                    ("2026-11-30", "policy", "AMD", "high", "AMD 市场份额超博通", "AMD expected to beat Broadcom share"),
+                    ("2026-12-04", "policy", "MACRO", "medium", "美国232条款多晶硅关税生效", "Section 232 polysilicon tariff takes effect"),
+                    ("2026-12-04", "policy", "MACRO", "medium", "美国第232条多晶硅关税生效", "US Section 232 polysilicon tariff takes effect"),
+                ],
+            )
+            conn.commit()
+            conn.close()
+            out = risk_budget._upcoming_macro_policy(path=db, today=date(2026, 11, 20), days=14)
+            titles = [x["title_zh"] for x in out]
+            self.assertTrue(any("期权交割" in t for t in titles))
+            self.assertTrue(any("非农" in t for t in titles))
+            self.assertTrue(any("镓锗" in t for t in titles))
+            self.assertFalse(any("AMD" in t for t in titles))
+            self.assertEqual(sum(1 for t in titles if "多晶硅" in t), 1)
+
+    def test_compute_passes_market_and_exposes_chinese_breaches_and_budget(self):
+        seen = {}
+
+        def fake_model(*args, **kwargs):
+            seen["market"] = kwargs.get("market")
+            return None
+
+        fake_market = {"state": "fearful", "severity": "critical", "tighten_buys": True,
+                       "label": "fearful", "label_zh": "恐慌", "n": 66, "up5": 67, "mean5": 0.86, "p10_5": -4.6}
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "m.db"
+            out = daily_action.compute(
+                path=db, state=state(), analyze=lambda s, path=None, state=None: advice(),
+                plan_fn=lambda st, ex, path=None: {"sell": {}, "total_usd": 0.0, "bad_day_loss_before": 1400.0},
+                market_fn=lambda path=None: fake_market,
+                model_fn=fake_model,
+            )
+            self.assertEqual(seen["market"], fake_market)
+            p = out["portfolio"]
+            self.assertEqual(p["market"], fake_market)
+            self.assertEqual(p["bad_day_loss"], 1400.0)
+            self.assertGreater(p["loss_budget_usd"], 0)
+            self.assertTrue(any("芯片 / 存储类" in line for line in p["breaches_zh"]))
+            self.assertTrue(any("现金仅占组合" in line for line in p["breaches_zh"]))

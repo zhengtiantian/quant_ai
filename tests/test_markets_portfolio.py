@@ -12,6 +12,7 @@ from markets import budget_link  # noqa: E402
 from markets import portfolio as pf  # noqa: E402
 
 REAL_FETCH_QUOTE = pf.fetch_quote
+REAL_FETCH_CNBC = pf.fetch_quotes_cnbc
 
 
 def fake_quote(symbol, asset_class=None, known_prev_close=None):
@@ -408,6 +409,51 @@ class PortfolioTest(unittest.TestCase):
              mock.patch.object(pf, "_nasdaq", side_effect=self._closed_replies(ext_date="Oct 27, 2026")):
             q = REAL_FETCH_QUOTE("GOOGL", "stocks")
         self.assertEqual((q["price"], q["price_basis"]), (324.89, "last"))
+
+    def test_closed_nasdaq_info_behind_extended_trading_is_rejected_as_stale(self):
+        # 2026-11-20 21:03 ET: Nasdaq info returned Nov 19 while extended-trading had Nov 20's post-close
+        with mock.patch.object(pf, "session_now", return_value="closed"), \
+             mock.patch.object(pf, "_nasdaq", side_effect=self._closed_replies(ext_date="Oct 29, 2026")):
+            with self.assertRaises(pf.StaleQuote):
+                REAL_FETCH_QUOTE("GOOGL", "stocks")
+
+    def test_closed_cnbc_keeps_final_after_hours_price_overnight_and_weekends(self):
+        from datetime import datetime
+        payload = {"FormattedQuoteResult": {"FormattedQuote": [{
+            "symbol": "INTC", "code": "0", "name": "Intel Corp",
+            "last": "51.28", "change": "-4.44", "change_pct": "-7.97",
+            "last_time": "2026-11-20T16:15:00.000-0500", "curmktstatus": "POST_MKT", "volume": "187683467",
+            "ExtendedMktQuote": {"type": "POST_MKT", "last": "53.03", "change": "+1.75", "change_pct": "+3.42",
+                                 "last_time": "2026-11-20T19:59:56.599-0500"},
+        }]}}
+        sat = datetime(2026, 11, 21, 10, 0, tzinfo=pf.US_EAST)
+        with mock.patch.object(pf, "session_now", return_value="closed"), \
+             mock.patch.object(pf, "_get_json", return_value=payload), \
+             mock.patch.object(pf, "datetime") as mock_dt:
+            mock_dt.now.return_value = sat
+            mock_dt.strptime = datetime.strptime
+            q = REAL_FETCH_CNBC([("INTC", "stocks")])["INTC"]
+        self.assertEqual((q["price"], q["regular_price"], q["prev_close"], q["price_basis"]), (53.03, 51.28, 55.72, "post_close"))
+        self.assertEqual((q["session"], q["session_change"], q["session_change_pct"]), ("closed", 1.75, 3.42))
+
+    def test_closed_session_refreshes_pre_2000_quote_via_cnbc_first(self):
+        from datetime import datetime
+        pre_close_ts = datetime(2026, 11, 20, 19, 59, 30, tzinfo=pf.US_EAST).timestamp()
+        after_close_ts = datetime(2026, 11, 20, 20, 0, 10, tzinfo=pf.US_EAST).timestamp()
+        conn = pf._conn(self.db)
+        conn.execute("INSERT INTO quotes(symbol, asset_class, data, fetched_at) VALUES (?, ?, ?, ?)",
+                     ("INTC", "stocks", json.dumps({"symbol": "INTC", "asset_class": "stocks", "price": 52.8, "session": "post"}), pre_close_ts))
+        conn.commit(); conn.close()
+        cnbc_final = {"INTC": {"symbol": "INTC", "asset_class": "stocks", "name": "Intel", "price": 53.03,
+                               "regular_price": 51.28, "prev_close": 55.72, "session": "closed",
+                               "price_basis": "post_close", "source": "cnbc"}}
+        with mock.patch.object(pf, "session_now", return_value="closed"), \
+             mock.patch.object(pf, "_post_close_cutoff", return_value=datetime(2026, 11, 20, 20, 0, tzinfo=pf.US_EAST).timestamp()), \
+             mock.patch.object(pf.time, "time", return_value=after_close_ts), \
+             mock.patch.object(pf, "fetch_quotes_cnbc", return_value=cnbc_final) as c:
+            out = pf.get_quotes(["INTC"], force=False, path=self.db)
+        self.assertEqual(c.call_count, 1)
+        self.assertEqual((out["INTC"]["price"], out["INTC"]["price_basis"]), (53.03, "post_close"))
 
     def test_batch_row_with_volume_going_backwards_is_refetched(self):
         pf.get_quotes(["NVDA"], force=True, path=self.db)

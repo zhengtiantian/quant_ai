@@ -667,14 +667,24 @@ POST_CLOSE_TRADES = 10           # the median of the last trades, so one odd-lot
 _DATE_RE = re.compile(r"[A-Z][a-z]{2} \d{1,2}, \d{4}")
 
 
+def _parse_mdy(text: str) -> Optional[date]:
+    m = _DATE_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(), "%b %d, %Y").date()
+    except ValueError:
+        return None
+
+
 def _post_close_price(ext: Optional[Dict[str, Any]], primary: Dict[str, Any]) -> Optional[float]:
     """The last after-hours price from an extended-trading reply, or None when there is none or
     it belongs to another day than the regular close in `primary`."""
     if not isinstance(ext, dict):
         return None
-    updated = _DATE_RE.search(" ".join(ext.get("lastUpdateInfo") or []))
-    closed = _DATE_RE.search(str(primary.get("lastTradeTimestamp") or ""))
-    if not updated or not closed or updated.group() != closed.group():
+    updated = _parse_mdy(" ".join(ext.get("lastUpdateInfo") or []))
+    closed = _parse_mdy(str(primary.get("lastTradeTimestamp") or ""))
+    if not updated or not closed or updated != closed:
         return None
     rows = ((ext.get("tradeDetailTable") or {}).get("rows") or [])[:POST_CLOSE_TRADES]
     prices = sorted(p for p in (_money(r.get("price")) for r in rows) if p)
@@ -682,6 +692,13 @@ def _post_close_price(ext: Optional[Dict[str, Any]], primary: Dict[str, Any]) ->
         return prices[len(prices) // 2]
     info_rows = (ext.get("infoTable") or {}).get("rows") or []
     return _money(str(info_rows[0].get("consolidated") or "").split(" ")[0]) if info_rows else None
+
+
+def _post_close_cutoff(now: Optional[datetime] = None) -> float:
+    """Epoch seconds of 20:00 ET on the latest trading day (when after-hours closed)."""
+    t = (now or datetime.now(US_EAST)).astimezone(US_EAST)
+    d = trading_day(t)
+    return datetime(d.year, d.month, d.day, 20, 0, tzinfo=US_EAST).timestamp()
 
 
 def session_now(now: Optional[datetime] = None) -> str:
@@ -762,7 +779,13 @@ def fetch_quote(symbol: str, asset_class: Optional[str] = None, known_prev_close
             raise ValueError(f"{symbol}: no price in Nasdaq reply")
         price, price_basis = _sane_extended_price(price, session, _money(primary.get("bidPrice")), _money(primary.get("askPrice")))
         session_change, session_change_pct = _money(primary.get("netChange")), _money(primary.get("percentageChange"))
-        post = _post_close_price(replies.get((cls, "extended-trading")), primary) if session == "closed" else None
+        ext_reply = replies.get((cls, "extended-trading")) if session == "closed" else None
+        if isinstance(ext_reply, dict):
+            ext_d = _parse_mdy(" ".join(ext_reply.get("lastUpdateInfo") or []))
+            pri_d = _parse_mdy(str(primary.get("lastTradeTimestamp") or ""))
+            if ext_d and pri_d and ext_d > pri_d:
+                raise StaleQuote(f"{symbol}: Nasdaq info ({pri_d}) is behind extended-trading ({ext_d})")
+        post = _post_close_price(ext_reply, primary) if session == "closed" else None
         if post is not None:
             # Same shape as an after-hours quote: the regular close beside the price, the day measured
             # from the close before it, and the after-hours move as the session change.
@@ -963,19 +986,27 @@ def fetch_quotes_cnbc(items: List[tuple]) -> Dict[str, Dict[str, Any]]:
         if str(q.get("code")) != "0" or last is None:
             continue
         change, change_pct = _money(q.get("change")), _money(q.get("change_pct"))
-        traded_today = str(q.get("last_time") or "")[:10] == today
-        # Before today's open `last` is yesterday's close, the baseline itself; after it, last - change.
-        prev_close = round(last - change, 4) if traded_today and change is not None else last
+        last_date = str(q.get("last_time") or "")[:10]
+        traded_today = last_date == today
+        # Before today's open `last` is yesterday's close, the baseline itself; after it (and while
+        # closed overnight / on weekends / on holidays), `last` is the latest regular close and
+        # `last - change` is the prior regular close.
+        prev_close = round(last - change, 4) if (traded_today or session == "closed") and change is not None else last
         ext = q.get("ExtendedMktQuote") or {}
         ext_price = _money(ext.get("last"))
-        use_ext = (session != "regular" and ext_price is not None and ext.get("type") in _CNBC_EXT_TYPES
-                   and str(ext.get("last_time") or "")[:10] == today)
+        ext_date = str(ext.get("last_time") or "")[:10]
+        if session == "closed":
+            use_ext = (ext_price is not None and ext.get("type") == "POST_MKT"
+                       and (ext_date == today or (bool(ext_date) and ext_date == last_date)))
+        else:
+            use_ext = (session != "regular" and ext_price is not None and ext.get("type") in _CNBC_EXT_TYPES
+                       and ext_date == today)
         if use_ext:
             price, s_change, s_pct = ext_price, _money(ext.get("change")), _money(ext.get("change_pct"))
             regular_price, regular_time, trade_time = last, q.get("last_time"), ext.get("last_time")
         else:
             price, regular_time, trade_time = last, None, q.get("last_time")
-            s_change, s_pct = (change, change_pct) if session == "regular" or traded_today else (None, None)
+            s_change, s_pct = (change, change_pct) if session in ("regular", "closed") or traded_today else (None, None)
             regular_price = last if session in ("pre", "post") else None
         out[s] = {
             "symbol": s, "asset_class": cls or "stocks", "name": q.get("name") or s,
@@ -1036,6 +1067,7 @@ def _get_quotes_raw(symbols: List[str], force: bool = False, path: Optional[Path
     finally:
         conn.close()
     now, clock_session = time.time(), session_now()
+    closed_cutoff = _post_close_cutoff() if clock_session == "closed" else 0.0
     out: Dict[str, Dict[str, Any]] = {}
     todo = []
     for s in symbols:
@@ -1043,7 +1075,8 @@ def _get_quotes_raw(symbols: List[str], force: bool = False, path: Optional[Path
         if row:
             q = json.loads(row["data"])
             ttl = (ttl_by_symbol or {}).get(s, refresh_interval(clock_session, QUOTE_TTL) or 60)
-            if cached_only or (not force and now - row["fetched_at"] < ttl):
+            pre_close_stale = clock_session == "closed" and row["fetched_at"] < closed_cutoff
+            if cached_only or (not force and not pre_close_stale and now - row["fetched_at"] < ttl):
                 out[s] = {**q, "fetched_at": row["fetched_at"], "stale": False}
                 continue
         known = None
@@ -1065,9 +1098,10 @@ def _get_quotes_raw(symbols: List[str], force: bool = False, path: Optional[Path
 
     results = []
     cnbc_tried = False
-    if todo and clock_session in ("pre", "post"):
-        # Pre-market / after hours: CNBC first, one request for every symbol; Nasdaq answers only
-        # one symbol per request there, which is what got this client blocked on 2026-11-10.
+    if todo and clock_session in ("pre", "post", "closed"):
+        # Pre-market / after hours / closed: CNBC first, one request for every symbol; it returns
+        # the exact final 19:59 ET after-hours close in ExtendedMktQuote even overnight and on
+        # weekends, avoiding Nasdaq's stale-replica info replies and per-symbol rate limits.
         cnbc_tried = True
         try:
             first = fetch_quotes_cnbc([(s, cls) for s, cls, _ in todo])
@@ -1490,10 +1524,15 @@ def get_state(force_quotes: bool = False, path: Optional[Path] = None, cached_qu
     refreshing = False
     if background_refresh:
         clock = session_now()
+        closed_cutoff = _post_close_cutoff() if clock == "closed" else 0.0
         ttl_by_symbol = {s: refresh_interval(clock, QUOTE_TTL) or 60 for s in open_syms}
         ttl_by_symbol.update({w["symbol"]: refresh_interval(clock, WATCH_TTL) or 60 for w in watch_rows})
-        out_of_date = any(q.get("pending") or time.time() - (q.get("fetched_at") or 0) >= ttl_by_symbol.get(s, 60)
-                          for s, q in quotes.items())
+        out_of_date = any(
+            q.get("pending")
+            or (clock == "closed" and (q.get("fetched_at") or 0) < closed_cutoff)
+            or time.time() - (q.get("fetched_at") or 0) >= ttl_by_symbol.get(s, 60)
+            for s, q in quotes.items()
+        )
         if force_quotes or out_of_date:
             refreshing = refresh_in_background(all_syms, force=force_quotes, path=path, ttl_by_symbol=ttl_by_symbol)
     if cached_quotes and all_syms:   # the page's fast path: fetch the day's references once (stored after that)

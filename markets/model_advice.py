@@ -27,15 +27,18 @@ from typing import Any, Dict, List, Optional
 
 ADVICE_FILE = Path(os.getenv("ADVICE_FILE", "/Volumes/Data4T/daily_advice/latest.json"))
 ADD_SPACING_ATR = 2.0
+ADD_SPACING_STRESS_ATR = 3.0
 REDUCE_SHARE = 1 / 3            # a "reduce" call sells a third of the position
 ADD_SHARE = 0.10                # an "add" buys 10% of the shares held
 STALE_HOURS = 36
-SECTION_ORDER = {"why": 0, "recover": 1, "events": 2, "odds": 3, "add": 4, "quality": 5}
+SECTION_ORDER = {"market": 0, "why": 1, "recover": 2, "events": 3, "odds": 4, "add": 5, "quality": 6}
 
 CALLS = {"reduce": ("Reduce", "减仓"), "hold": ("Hold", "持有"), "add": ("Add", "加仓"), "recover": ("Recover", "解套")}
 HZ = {"5": ("next 5 days", "未来 5 天"), "20": ("next 20 days", "未来 20 天"), "60": ("next 60 days", "未来 60 天")}
-LABELS = {"why": {"en": "Why it fell", "zh": "为什么跌"}, "recover": {"en": "Getting out", "zh": "解套"}, "events": {"en": "Coming up", "zh": "近期事件"}, "odds": {"en": "Outlook", "zh": "预测"},
-          "add": {"en": "Adding", "zh": "补仓"}, "quality": {"en": "How good is the model", "zh": "模型可信度"},
+LABELS = {"market": {"en": "Market & macro", "zh": "大盘与宏观"}, "why": {"en": "Why it fell", "zh": "为什么跌"},
+          "recover": {"en": "Getting out", "zh": "解套"}, "events": {"en": "Coming up", "zh": "近期事件"},
+          "odds": {"en": "Outlook", "zh": "预测"}, "add": {"en": "Adding", "zh": "补仓"},
+          "quality": {"en": "How good is the model", "zh": "模型可信度"},
           "more": {"en": "More", "zh": "更多细节"}, "less": {"en": "Less", "zh": "收起"},
           "basis": {"en": "Basis", "zh": "依据"}, "blocked": {"en": "Buying is blocked", "zh": "买入被拦截"}}
 
@@ -56,7 +59,7 @@ def _hours_old(ts: str) -> float:
 
 def render(sym: str, holding: Dict[str, Any], stats: Dict[str, Any], lowest_lot: Optional[float],
            cash: float, data: Optional[Dict[str, Any]] = None, total: Optional[float] = None,
-           budget_pct: Optional[float] = None) -> Optional[Dict[str, Any]]:
+           budget_pct: Optional[float] = None, market: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """The model's action for one holding, or None when there is no forecast for it."""
     data = data if data is not None else load()
     m = (data or {}).get("symbols", {}).get(sym)
@@ -71,17 +74,37 @@ def render(sym: str, holding: Dict[str, Any], stats: Dict[str, Any], lowest_lot:
     def note(section, en, zh, key=True):
         notes.append({"section": section, "en": en, "zh": zh, "key": key})
 
-    # the call, and the user's rule against adding too close to the last lot or into a fall
+    tighten = bool((market or {}).get("tighten_buys"))
+    spacing_atr = ADD_SPACING_STRESS_ATR if tighten else ADD_SPACING_ATR
+
+    # Market panic / chip stress / macro headwind context (always visible under stress, never dropped by model override)
+    if market and market.get("severity") in ("critical", "warn"):
+        m_title = market.get("title") or {}
+        m_detail = market.get("detail") or {}
+        pills_txt = " · ".join(f"{p['label']} {p['value']}" for p in (market.get("pills") or []) if p.get("stress"))
+        en_head = m_title.get("en") or market.get("label") or "Market stress"
+        zh_head = m_title.get("zh") or market.get("label_zh") or "市场承压"
+        if pills_txt:
+            en_head = f"{en_head} ({pills_txt})"
+            zh_head = f"{zh_head}（{pills_txt}）"
+        note("market", en_head, zh_head, key=True)
+        if m_detail.get("en") and m_detail.get("zh"):
+            note("market", m_detail["en"], m_detail["zh"], key=False)
+
+    # the call, and the user's rule against adding too close to the last lot or into a fall / market panic
     call = m["call"] if reliable else "hold"
     blocked_en, blocked_zh = [], []
-    next_add = round(lowest_lot - ADD_SPACING_ATR * atr, 2) if (lowest_lot and atr) else None
+    next_add = round(lowest_lot - spacing_atr * atr, 2) if (lowest_lot and atr) else None
     if call == "add":
+        if tighten:
+            blocked_en.append("market panic / chip sector selloff (buy guardrail paused)")
+            blocked_zh.append("市场恐慌 / 半导体板块急跌，暂停补仓")
         if stats.get("stabilized") is False:
             blocked_en.append("still falling")
             blocked_zh.append("还在急跌，没企稳")
         if next_add is not None and price > next_add:
-            blocked_en.append(f"within 2 x ATR of your cheapest lot (${lowest_lot:.2f})")
-            blocked_zh.append(f"离你最便宜的一批（${lowest_lot:.2f}）不到 2 倍 ATR")
+            blocked_en.append(f"within {spacing_atr:g} x ATR of your cheapest lot (${lowest_lot:.2f})")
+            blocked_zh.append(f"离你最便宜的一批（${lowest_lot:.2f}）不到 {spacing_atr:g} 倍 ATR")
         if blocked_en:
             call = "hold"
     label_en, label_zh = CALLS[call]
@@ -139,9 +162,11 @@ def render(sym: str, holding: Dict[str, Any], stats: Dict[str, Any], lowest_lot:
              f"模型偏向加仓，但现在不补：{'；'.join(blocked_zh)}。下一次可考虑补仓价："
              + (f"${next_add:.2f} 或更低" if next_add else "企稳之后"))
     elif call != "add" and next_add is not None:
-        note("add", f"No add now. If you add later: ${next_add:.2f} or lower (2 x ATR under your cheapest lot ${lowest_lot:.2f}), "
+        stress_en = " — widened during market/sector stress" if tighten else ""
+        stress_zh = "，市场/板块承压期已放宽间距" if tighten else ""
+        note("add", f"No add now. If you add later: ${next_add:.2f} or lower ({spacing_atr:g} x ATR under your cheapest lot ${lowest_lot:.2f}{stress_en}), "
              f"at most {tranche} shares at a time",
-             f"现在不补仓。以后要补：${next_add:.2f} 或更低（比最便宜的一批 ${lowest_lot:.2f} 低 2 倍 ATR），每次最多 {tranche} 股")
+             f"现在不补仓。以后要补：${next_add:.2f} 或更低（比最便宜的一批 ${lowest_lot:.2f} 低 {spacing_atr:g} 倍 ATR{stress_zh}），每次最多 {tranche} 股")
     if call == "add" and orders and cash < orders[0]["shares"] * price:
         note("add", f"Cash ${cash:,.0f}: the add needs money from a sale first", f"现金 ${cash:,.0f}：要补仓得先卖出别的换现金")
 
