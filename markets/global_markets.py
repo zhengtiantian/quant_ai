@@ -387,8 +387,15 @@ INDEX_CATALOG = [
     ("KWEB", "KraneShares China Internet", "Global & other"), ("TLT", "iShares 20+ Year Treasury", "Global & other"),
     ("GLD", "SPDR Gold Shares", "Global & other"), ("IBIT", "iShares Bitcoin Trust", "Global & other"),
     ("TQQQ", "ProShares UltraPro QQQ (3x)", "Leveraged"), ("SOXL", "Direxion Semiconductor Bull (3x)", "Leveraged"),
+    # 2026-11-21, the user's request: gold, bitcoin and the international oil price on the Holdings page
+    # (the macro board's CNBC symbols: front-month futures for gold and oil, Coinbase spot for bitcoin)
+    ("@GC.1", "Gold ($/oz, futures)", "Commodities & crypto"), ("BTC.CB=", "Bitcoin ($)", "Commodities & crypto"),
+    ("@LCO.1", "Brent crude ($/bbl, international)", "Commodities & crypto"),
+    ("@CL.1", "WTI crude ($/bbl, US)", "Commodities & crypto"), ("@SI.1", "Silver ($/oz, futures)", "Commodities & crypto"),
 ]
 INDEX_DEFAULT = [".SPX", ".IXIC", ".SOX", "QQQ", "SPY"]
+# Added to the shown list once, for a list saved before they were in the catalog; removing one later sticks.
+INDEX_ADDED = {"commodities-2026-11-21": ["@GC.1", "BTC.CB=", "@LCO.1"]}
 _INDEX_NAMES = {s: (n, g) for s, n, g in INDEX_CATALOG}
 
 
@@ -401,6 +408,17 @@ def _index_symbols(path: Optional[Path] = None) -> List[str]:
         if not existed:
             for i, sym in enumerate(INDEX_DEFAULT):
                 conn.execute("INSERT INTO index_watch VALUES (?, ?, datetime('now'))", (sym, i))
+        conn.execute("CREATE TABLE IF NOT EXISTS index_watch_added (name TEXT PRIMARY KEY, added_at TEXT)")
+        done = {r["name"] for r in conn.execute("SELECT name FROM index_watch_added")}
+        for name, syms in INDEX_ADDED.items():
+            if name in done:
+                continue
+            have = {r["symbol"] for r in conn.execute("SELECT symbol FROM index_watch")}
+            top = conn.execute("SELECT COALESCE(MAX(position), -1) FROM index_watch").fetchone()[0]
+            for sym in (s for s in syms if s not in have):
+                top += 1
+                conn.execute("INSERT INTO index_watch VALUES (?, ?, datetime('now'))", (sym, top))
+            conn.execute("INSERT INTO index_watch_added VALUES (?, datetime('now'))", (name,))
         conn.commit()
         return [r["symbol"] for r in conn.execute("SELECT symbol FROM index_watch ORDER BY position, added_at")]
     finally:

@@ -136,6 +136,16 @@ def portfolio_hint_scores():
         return _error(e, 500)
 
 
+@router.get("/portfolio/volume")
+def portfolio_volume():
+    """Volume of the held and watched stocks: last session, month and year (volume.py, from a file)."""
+    from . import volume
+    try:
+        return {"status": "success", **volume.state()}
+    except Exception as e:  # noqa: BLE001
+        return _error(e, 500)
+
+
 @router.get("/portfolio/lot-advice")
 def portfolio_lot_advice(symbol: str = "", buy_price: str = ""):
     """Empirically calibrated dip-entry spacing check & per-lot ATR swing exit targets (Q.10)."""
