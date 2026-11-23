@@ -54,6 +54,7 @@ LEDE_CHARS = 1000
 EMBED_BATCH = 32          # throughput is character-bound; 32 only balances latency
 MONGO_BATCH = 500
 CHECKPOINT = Path(__file__).with_name(".index_news_checkpoint.json")
+UNIVERSE_CHECKPOINT = Path(__file__).with_name(".index_news_universe_checkpoint.json")
 
 # nomic-embed-text is asymmetric. Omitting these prefixes fails silently: vectors still
 # return, dimensions still match, nothing errors, retrieval is just quietly worse.
@@ -112,7 +113,17 @@ def embed(texts: list[str]) -> list[list[float]]:
     return [d["embedding"] for d in r.json()["data"]]
 
 
-def ensure_collection(qc: QdrantClient, reset: bool) -> None:
+def int8_quantization_config() -> qm.ScalarQuantization:
+    return qm.ScalarQuantization(
+        scalar=qm.ScalarQuantizationConfig(
+            type=qm.ScalarType.INT8,
+            quantile=0.99,
+            always_ram=True,
+        )
+    )
+
+
+def ensure_collection(qc: QdrantClient, reset: bool, enable_quantization: bool = False) -> None:
     exists = qc.collection_exists(COLLECTION)
     if exists and reset:
         print(f"dropping existing collection {COLLECTION}")
@@ -121,37 +132,49 @@ def ensure_collection(qc: QdrantClient, reset: bool) -> None:
     if not exists:
         qc.create_collection(
             collection_name=COLLECTION,
-            vectors_config=qm.VectorParams(size=VECTOR_DIM, distance=qm.Distance.COSINE),
+            vectors_config=qm.VectorParams(size=VECTOR_DIM, distance=qm.Distance.COSINE, on_disk=True),
+            on_disk_payload=True,
+            quantization_config=int8_quantization_config(),
         )
-        # Payload indexes, not just payload: an unindexed filter on 851K points is a
+        # Payload indexes, not just payload: an unindexed filter on 851K+ points is a
         # full scan, and every useful query here filters by symbol or date.
         qc.create_payload_index(COLLECTION, "symbol", qm.PayloadSchemaType.KEYWORD)
         qc.create_payload_index(COLLECTION, "date_int", qm.PayloadSchemaType.INTEGER)
         qc.create_payload_index(COLLECTION, "event_type", qm.PayloadSchemaType.KEYWORD)
-        print(f"created collection {COLLECTION} (dim={VECTOR_DIM}, cosine)")
+        print(f"created collection {COLLECTION} (dim={VECTOR_DIM}, cosine, on_disk, int8)")
+    elif enable_quantization:
+        qc.update_collection(
+            collection_name=COLLECTION,
+            quantization_config=int8_quantization_config(),
+        )
+        print(f"enabled INT8 scalar quantization on {COLLECTION}")
 
 
-def load_checkpoint(reset: bool):
-    if reset or not CHECKPOINT.exists():
+def load_checkpoint(reset: bool, checkpoint_path: Path = CHECKPOINT):
+    if reset or not checkpoint_path.exists():
         return None, set()
     try:
-        data = json.loads(CHECKPOINT.read_text())
+        data = json.loads(checkpoint_path.read_text())
         return data.get("last_id"), set(data.get("seen", []))
     except (json.JSONDecodeError, OSError) as e:
         print(f"checkpoint unreadable ({e}); starting from the beginning")
         return None, set()
 
 
-def save_checkpoint(last_id, seen: set) -> None:
-    tmp = CHECKPOINT.with_suffix(".tmp")
+def save_checkpoint(last_id, seen: set, checkpoint_path: Path = CHECKPOINT) -> None:
+    tmp = checkpoint_path.with_suffix(".tmp")
     tmp.write_text(json.dumps({"last_id": str(last_id), "seen": sorted(seen)}))
-    tmp.replace(CHECKPOINT)
+    tmp.replace(checkpoint_path)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="stop after N source documents")
     ap.add_argument("--reset", action="store_true", help="drop the collection and checkpoint")
+    ap.add_argument("--universe-backfill", action="store_true",
+                    help="Backfill historical origin=universe_backfill articles using a dedicated checkpoint")
+    ap.add_argument("--enable-quantization", action="store_true",
+                    help="Enable INT8 scalar quantization in-place on an existing collection")
     args = ap.parse_args()
 
     try:
@@ -160,20 +183,30 @@ def main() -> None:
         sys.exit(f"embedding endpoint {LM} unreachable: {e}")
 
     qc = QdrantClient(url=QDRANT_URL, timeout=120)
-    ensure_collection(qc, args.reset)
+    ensure_collection(qc, args.reset, enable_quantization=args.enable_quantization)
 
     coll = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)[DB_NAME][SRC_COLL]
-    total = coll.estimated_document_count()
+    checkpoint_path = UNIVERSE_CHECKPOINT if args.universe_backfill else CHECKPOINT
+    base_query: dict = {"company_match_v2.matched": {"$ne": False}}
+    if args.universe_backfill:
+        base_query["origin"] = "universe_backfill"
+        total = coll.count_documents(base_query)
+    else:
+        # 2026-11-10: the 490 universe companies' articles joined the matched collection (origin=universe_backfill).
+        # Incremental daily pipeline enables INDEX_INCLUDE_UNIVERSE=1 once Phase 2 backfill is active.
+        if os.getenv("INDEX_INCLUDE_UNIVERSE", "0") != "1":
+            base_query["origin"] = {"$ne": "universe_backfill"}
+        total = coll.estimated_document_count()
 
-    last_id, seen = load_checkpoint(args.reset)
-    query = {"_id": {"$gt": __import__("bson").ObjectId(last_id)}} if last_id else {}
-    # 2026-11-10: the 490 universe companies' articles joined the matched collection (origin=universe_backfill).
-    # Not embedded unless INDEX_INCLUDE_UNIVERSE=1: ~740k rows, and the eval sets were built on the 102.
-    if os.getenv("INDEX_INCLUDE_UNIVERSE", "0") != "1":
-        query["origin"] = {"$ne": "universe_backfill"}
-    # rows the relevance student rejected stay in the collection marked matched = false: never embedded
-    query["company_match_v2.matched"] = {"$ne": False}
+    last_id, seen = load_checkpoint(args.reset, checkpoint_path)
+    external_seen: set[str] = set()
+    if not args.universe_backfill and os.getenv("INDEX_INCLUDE_UNIVERSE", "0") == "1":
+        _, external_seen = load_checkpoint(False, UNIVERSE_CHECKPOINT)
+        if external_seen:
+            print(f"loaded {len(external_seen):,} external dedupe keys from {UNIVERSE_CHECKPOINT.name}")
+    query = dict(base_query)
     if last_id:
+        query["_id"] = {"$gt": __import__("bson").ObjectId(last_id)}
         print(f"resuming after _id={last_id} ({len(seen)} dedupe keys carried over)")
 
     cursor = coll.find(
@@ -219,7 +252,7 @@ def main() -> None:
         for doc in cursor:
             n_read += 1
             key = dedupe_key(doc)
-            if key in seen:
+            if key in seen or key in external_seen:
                 n_dupe += 1
             else:
                 text = build_text(doc)
@@ -232,6 +265,7 @@ def main() -> None:
                         flush()
 
             if n_read % 5000 == 0:
+                flush()
                 el = time.perf_counter() - t0
                 rate = n_indexed / el if el else 0
                 remain = (total - n_read) / rate / 3600 if rate else 0
@@ -241,14 +275,14 @@ def main() -> None:
                     f"{rate:6.1f} vec/s  eta {remain:5.2f}h",
                     flush=True,
                 )
-                save_checkpoint(doc["_id"], seen)
+                save_checkpoint(doc["_id"], seen, checkpoint_path)
 
             if args.limit and n_read >= args.limit:
                 break
 
         flush()
         if n_read:  # nothing new since the last checkpoint -> keep it as is
-            save_checkpoint(doc["_id"], seen)
+            save_checkpoint(doc["_id"], seen, checkpoint_path)
     except KeyboardInterrupt:
         flush()
         print("\ninterrupted; checkpoint saved, re-run to resume")

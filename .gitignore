@@ -11,6 +11,7 @@ __pycache__/
 
 # R.1 indexing checkpoint — local resume state, carries the dedupe key set
 tools/.index_news_checkpoint.json
+tools/.index_news_universe_checkpoint.json
 
 # Virtual environment
 .venv/
