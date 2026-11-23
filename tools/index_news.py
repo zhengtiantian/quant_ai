@@ -33,6 +33,7 @@ import os
 import sys
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -60,6 +61,8 @@ UNIVERSE_CHECKPOINT = Path(__file__).with_name(".index_news_universe_checkpoint.
 # return, dimensions still match, nothing errors, retrieval is just quietly worse.
 DOC_PREFIX = "search_document: "
 NAMESPACE = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")
+MIN_VALID_DATE_INT = int(os.getenv("NEWS_MIN_VALID_DATE_INT", "20150101"))
+MAX_FUTURE_DAYS = int(os.getenv("NEWS_MAX_FUTURE_DAYS", "1"))
 
 
 def dedupe_key(doc) -> str:
@@ -103,6 +106,22 @@ def to_int_date(v) -> int | None:
     """
     s = str(v or "").strip()
     return int(s[:8]) if len(s) >= 8 and s[:8].isdigit() else None
+
+
+def is_valid_date_int(date_int: int | None, now: datetime | None = None) -> bool:
+    """True when YYYYMMDD int represents a real calendar date in [2015-01-01, today+1d]."""
+    if isinstance(date_int, bool) or not isinstance(date_int, int) or date_int < MIN_VALID_DATE_INT:
+        return False
+    ref = now or datetime.now(timezone.utc)
+    ref_date = (ref.astimezone(timezone.utc) if ref.tzinfo else ref).date()
+    max_int = int((ref_date + timedelta(days=MAX_FUTURE_DAYS)).strftime("%Y%m%d"))
+    if date_int > max_int:
+        return False
+    try:
+        datetime.strptime(str(date_int), "%Y%m%d")
+    except ValueError:
+        return False
+    return True
 
 
 def embed(texts: list[str]) -> list[list[float]]:
@@ -215,7 +234,7 @@ def main() -> None:
          "llm_event_type_a": 1, "llm_sentiment_final": 1, "url": 1},
     ).sort("_id", ASCENDING).batch_size(MONGO_BATCH)
 
-    n_read = n_dupe = n_empty = n_indexed = 0
+    n_read = n_dupe = n_empty = n_bad_date = n_indexed = 0
     pending: list[tuple] = []
     t0 = time.perf_counter()
 
@@ -251,18 +270,21 @@ def main() -> None:
     try:
         for doc in cursor:
             n_read += 1
-            key = dedupe_key(doc)
-            if key in seen or key in external_seen:
-                n_dupe += 1
+            if not is_valid_date_int(to_int_date(doc.get("date"))):
+                n_bad_date += 1
             else:
-                text = build_text(doc)
-                if text is None:
-                    n_empty += 1
+                key = dedupe_key(doc)
+                if key in seen or key in external_seen:
+                    n_dupe += 1
                 else:
-                    seen.add(key)
-                    pending.append((doc, text))
-                    if len(pending) >= EMBED_BATCH:
-                        flush()
+                    text = build_text(doc)
+                    if text is None:
+                        n_empty += 1
+                    else:
+                        seen.add(key)
+                        pending.append((doc, text))
+                        if len(pending) >= EMBED_BATCH:
+                            flush()
 
             if n_read % 5000 == 0:
                 flush()
@@ -271,7 +293,7 @@ def main() -> None:
                 remain = (total - n_read) / rate / 3600 if rate else 0
                 print(
                     f"read {n_read:>7}/{total}  indexed {n_indexed:>7}  "
-                    f"dupe {n_dupe:>6}  empty {n_empty:>5}  "
+                    f"dupe {n_dupe:>6}  empty {n_empty:>5}  bad_date {n_bad_date:>4}  "
                     f"{rate:6.1f} vec/s  eta {remain:5.2f}h",
                     flush=True,
                 )
@@ -290,7 +312,7 @@ def main() -> None:
     el = time.perf_counter() - t0
     print(
         f"\ndone: read {n_read}, indexed {n_indexed}, "
-        f"skipped {n_dupe} duplicates and {n_empty} empty, in {el / 60:.1f} min "
+        f"skipped {n_dupe} duplicates, {n_empty} empty, and {n_bad_date} bad_date, in {el / 60:.1f} min "
         f"({n_indexed / el:.1f} vec/s)"
     )
     print("collection:", qc.get_collection(COLLECTION).points_count, "points")

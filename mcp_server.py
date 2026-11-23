@@ -299,7 +299,9 @@ def get_stock_features(symbol: str) -> str:
         return via_api
     try:
         doc = _db()["daily_symbol_features"].find_one(
-            {"symbol": sym}, {"_id": 0}, sort=[("date", -1)]
+            {"symbol": sym, "trade_date": {"$ne": None}},
+            {"_id": 0},
+            sort=[("date", -1)],
         )
         if not doc:
             return json.dumps({"symbol": sym,
