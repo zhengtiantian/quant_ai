@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,3 +36,29 @@ def test_is_valid_date_int_bounds_and_calendar_validation():
     assert index_news.is_valid_date_int(None, now=FIXED_NOW) is False
     assert index_news.is_valid_date_int(0, now=FIXED_NOW) is False
     assert index_news.is_valid_date_int(True, now=FIXED_NOW) is False
+
+
+def test_dedupe_store_migrates_legacy_checkpoints_and_defaults_wait_true(tmp_path):
+    assert index_news.UPSERT_WAIT is True
+
+    core_cp = tmp_path / ".index_news_checkpoint.json"
+    univ_cp = tmp_path / ".index_news_universe_checkpoint.json"
+    core_cp.write_text(json.dumps({"last_id": "6b050ca4a545ab377214cbb7", "seen": ["k1", "k2"]}), encoding="utf-8")
+    univ_cp.write_text(json.dumps({"last_id": "6b00638e92c3e334c27bf3c9", "seen": ["k2", "k3"]}), encoding="utf-8")
+
+    store = index_news.DedupeStore(tmp_path / ".index_news_dedupe.db")
+    try:
+        res = store.migrate_json_checkpoints([core_cp, univ_cp])
+        assert res[core_cp] == "6b050ca4a545ab377214cbb7"
+        assert res[univ_cp] == "6b00638e92c3e334c27bf3c9"
+        assert store.count() == 3
+        assert store.contains("k1") and store.contains("k2") and store.contains("k3")
+        assert not store.contains("missing")
+        assert json.loads(core_cp.read_text(encoding="utf-8")) == {"last_id": "6b050ca4a545ab377214cbb7"}
+        assert json.loads(univ_cp.read_text(encoding="utf-8")) == {"last_id": "6b00638e92c3e334c27bf3c9"}
+
+        store.add_batch(["k4", "k1"])
+        assert store.count() == 4
+        assert store.contains("k4")
+    finally:
+        store.close()

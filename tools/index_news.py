@@ -30,6 +30,7 @@ import argparse
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 import time
 import uuid
@@ -56,6 +57,8 @@ EMBED_BATCH = 32          # throughput is character-bound; 32 only balances late
 MONGO_BATCH = 500
 CHECKPOINT = Path(__file__).with_name(".index_news_checkpoint.json")
 UNIVERSE_CHECKPOINT = Path(__file__).with_name(".index_news_universe_checkpoint.json")
+DEDUPE_DB = Path(os.getenv("INDEX_DEDUPE_DB", str(Path(__file__).with_name(".index_news_dedupe.db"))))
+UPSERT_WAIT = os.getenv("QDRANT_UPSERT_WAIT", "1") != "0"
 
 # nomic-embed-text is asymmetric. Omitting these prefixes fails silently: vectors still
 # return, dimensions still match, nothing errors, retrieval is just quietly worse.
@@ -169,20 +172,73 @@ def ensure_collection(qc: QdrantClient, reset: bool, enable_quantization: bool =
         print(f"enabled INT8 scalar quantization on {COLLECTION}")
 
 
-def load_checkpoint(reset: bool, checkpoint_path: Path = CHECKPOINT):
-    if reset or not checkpoint_path.exists():
-        return None, set()
+class DedupeStore:
+    """SQLite-backed deduplication store replacing multi-million-entry JSON arrays."""
+
+    def __init__(self, db_path: Path = DEDUPE_DB, reset: bool = False) -> None:
+        self.db_path = Path(db_path)
+        if reset and self.db_path.exists():
+            self.db_path.unlink(missing_ok=True)
+        self.conn = sqlite3.connect(str(self.db_path), timeout=30)
+        self.conn.execute("CREATE TABLE IF NOT EXISTS seen_keys (key TEXT PRIMARY KEY)")
+        self.conn.commit()
+
+    def migrate_json_checkpoints(self, paths: list[Path]) -> dict[Path, str | None]:
+        """Migrate legacy 'seen' arrays from JSON checkpoints into SQLite and compact the JSON."""
+        last_ids: dict[Path, str | None] = {}
+        for p in paths:
+            if not p.exists():
+                last_ids[p] = None
+                continue
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"checkpoint {p.name} unreadable ({e}); skipping migration")
+                last_ids[p] = None
+                continue
+            last_id = data.get("last_id")
+            last_ids[p] = last_id
+            legacy_seen = data.get("seen")
+            if isinstance(legacy_seen, list) and legacy_seen:
+                self.add_batch(legacy_seen)
+                save_checkpoint(last_id, p)
+                print(f"migrated {len(legacy_seen):,} dedupe keys from {p.name} into {self.db_path.name}")
+        return last_ids
+
+    def contains(self, key: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM seen_keys WHERE key = ?", (key,)).fetchone() is not None
+
+    def add_batch(self, keys) -> None:
+        items = [(k,) for k in keys if k]
+        if not items:
+            return
+        self.conn.executemany("INSERT OR IGNORE INTO seen_keys(key) VALUES (?)", items)
+        self.conn.commit()
+
+    def count(self) -> int:
+        return int(self.conn.execute("SELECT COUNT(*) FROM seen_keys").fetchone()[0])
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+def load_checkpoint(reset: bool, checkpoint_path: Path = CHECKPOINT) -> str | None:
+    if reset:
+        checkpoint_path.unlink(missing_ok=True)
+        return None
+    if not checkpoint_path.exists():
+        return None
     try:
-        data = json.loads(checkpoint_path.read_text())
-        return data.get("last_id"), set(data.get("seen", []))
+        data = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        return data.get("last_id")
     except (json.JSONDecodeError, OSError) as e:
         print(f"checkpoint unreadable ({e}); starting from the beginning")
-        return None, set()
+        return None
 
 
-def save_checkpoint(last_id, seen: set, checkpoint_path: Path = CHECKPOINT) -> None:
+def save_checkpoint(last_id, checkpoint_path: Path = CHECKPOINT) -> None:
     tmp = checkpoint_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"last_id": str(last_id), "seen": sorted(seen)}))
+    tmp.write_text(json.dumps({"last_id": str(last_id) if last_id is not None else None}), encoding="utf-8")
     tmp.replace(checkpoint_path)
 
 
@@ -217,16 +273,19 @@ def main() -> None:
             base_query["origin"] = {"$ne": "universe_backfill"}
         total = coll.estimated_document_count()
 
-    last_id, seen = load_checkpoint(args.reset, checkpoint_path)
-    external_seen: set[str] = set()
-    if not args.universe_backfill and os.getenv("INDEX_INCLUDE_UNIVERSE", "0") == "1":
-        _, external_seen = load_checkpoint(False, UNIVERSE_CHECKPOINT)
-        if external_seen:
-            print(f"loaded {len(external_seen):,} external dedupe keys from {UNIVERSE_CHECKPOINT.name}")
+    dedupe = DedupeStore(DEDUPE_DB, reset=args.reset)
+    if args.reset:
+        CHECKPOINT.unlink(missing_ok=True)
+        UNIVERSE_CHECKPOINT.unlink(missing_ok=True)
+        last_id = None
+    else:
+        migrated = dedupe.migrate_json_checkpoints([CHECKPOINT, UNIVERSE_CHECKPOINT])
+        last_id = migrated.get(checkpoint_path) if checkpoint_path in migrated else load_checkpoint(False, checkpoint_path)
+
     query = dict(base_query)
     if last_id:
         query["_id"] = {"$gt": __import__("bson").ObjectId(last_id)}
-        print(f"resuming after _id={last_id} ({len(seen)} dedupe keys carried over)")
+        print(f"resuming after _id={last_id} ({dedupe.count():,} dedupe keys in {dedupe.db_path.name})")
 
     cursor = coll.find(
         query,
@@ -236,10 +295,11 @@ def main() -> None:
 
     n_read = n_dupe = n_empty = n_bad_date = n_indexed = 0
     pending: list[tuple] = []
+    batch_keys: set[str] = set()
     t0 = time.perf_counter()
 
     def flush():
-        nonlocal pending, n_indexed
+        nonlocal pending, batch_keys, n_indexed
         if not pending:
             return
         vectors = embed([p[1] for p in pending])
@@ -262,8 +322,10 @@ def main() -> None:
                 )
                 for (doc, _text), vec in zip(pending, vectors)
             ],
-            wait=False,
+            wait=UPSERT_WAIT,
         )
+        dedupe.add_batch(batch_keys)
+        batch_keys.clear()
         n_indexed += len(pending)
         pending = []
 
@@ -274,14 +336,14 @@ def main() -> None:
                 n_bad_date += 1
             else:
                 key = dedupe_key(doc)
-                if key in seen or key in external_seen:
+                if key in batch_keys or dedupe.contains(key):
                     n_dupe += 1
                 else:
                     text = build_text(doc)
                     if text is None:
                         n_empty += 1
                     else:
-                        seen.add(key)
+                        batch_keys.add(key)
                         pending.append((doc, text))
                         if len(pending) >= EMBED_BATCH:
                             flush()
@@ -297,17 +359,18 @@ def main() -> None:
                     f"{rate:6.1f} vec/s  eta {remain:5.2f}h",
                     flush=True,
                 )
-                save_checkpoint(doc["_id"], seen, checkpoint_path)
+                save_checkpoint(doc["_id"], checkpoint_path)
 
             if args.limit and n_read >= args.limit:
                 break
 
         flush()
         if n_read:  # nothing new since the last checkpoint -> keep it as is
-            save_checkpoint(doc["_id"], seen, checkpoint_path)
+            save_checkpoint(doc["_id"], checkpoint_path)
     except KeyboardInterrupt:
-        flush()
-        print("\ninterrupted; checkpoint saved, re-run to resume")
+        print("\ninterrupted; last committed checkpoint preserved, re-run to resume")
+    finally:
+        dedupe.close()
 
     el = time.perf_counter() - t0
     print(
