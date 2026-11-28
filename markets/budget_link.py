@@ -11,21 +11,29 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .config import DB_PATH, JOB_AGENT_URL
+from .config import JOB_AGENT_URL, connect_db
 
 _fx_cache: Dict[str, Any] = {"rate": None, "at": 0.0}
 
 
 def _meta(path: Optional[Path], key: str, value: Optional[str] = None, write: bool = False) -> Optional[str]:
-    conn = sqlite3.connect(str(path or DB_PATH), timeout=30)
+    conn = connect_db(
+        path,
+        immediate=write,
+        schema_tag="meta",
+        schema_fn=lambda c: c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"),
+    )
     try:
-        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         if write:
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, value))
-            conn.commit()
+            conn.execute("COMMIT")
             return value
         row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return row[0] if row else None
+    except BaseException:
+        if write and conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
 

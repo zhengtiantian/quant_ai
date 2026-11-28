@@ -90,6 +90,15 @@ def metrics(ranking, qid, grades, k, bar):
     return recall, rr, ndcg, precision
 
 
+def unjudged_rate(ranking: list, qid: str, grades: dict, k: int) -> float:
+    """Fraction of top-k ranked documents missing from pooled judgments for `qid`."""
+    top = (ranking or [])[:k]
+    if not top:
+        return 0.0
+    unjudged = sum(1 for key in top if (qid, key) not in grades)
+    return unjudged / len(top)
+
+
 def mean(values):
     vals = [v for v in values if v is not None]
     return sum(vals) / len(vals) if vals else float("nan")
@@ -137,10 +146,14 @@ def main() -> None:
 
     # ---- overall ----
     rows = []
+    unjudged_warnings = []
     per_system_by_challenge: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     for s in systems:
         loose = [metrics(runs[s].get(q, []), q, grades, a.k, 1) for q in qids]
         strict = [metrics(runs[s].get(q, []), q, grades, a.k, 2) for q in qids]
+        unj = mean(unjudged_rate(runs[s].get(q, []), q, grades, a.k) for q in qids)
+        if unj > 0.10:
+            unjudged_warnings.append((s, unj))
         rows.append([
             s,
             f"{mean(r for r, _, _, _ in loose):.3f}",
@@ -149,12 +162,17 @@ def main() -> None:
             f"{mean(rr for _, rr, _, _ in strict):.3f}",
             f"{mean(p for _, _, _, p in strict):.3f}",
             f"{mean(n for _, _, n, _ in loose):.3f}",
+            f"{unj:.1%}",
         ])
         for q, (r, _, n, _), (_, _, _, p) in zip(qids, loose, strict):
             per_system_by_challenge[s][challenge.get(q, "?")].append((r, n, p))
 
     print(table(rows, ["system", f"recall@{a.k}", f"MRR@{a.k}",
-                       f"recall@{a.k} (g=2)", f"MRR@{a.k} (g=2)", f"P@{a.k} (g=2)", f"nDCG@{a.k}"], a.md))
+                       f"recall@{a.k} (g=2)", f"MRR@{a.k} (g=2)", f"P@{a.k} (g=2)",
+                       f"nDCG@{a.k}", f"unjudged@{a.k}"], a.md))
+    for sys_name, unj in unjudged_warnings:
+        print(f"WARNING: {sys_name} has unjudged@{a.k} = {unj:.1%} (>10%); "
+              "unjudged docs are scored 0 and may depress nDCG")
     print()
 
     # ---- per challenge, recall at the loose bar ----

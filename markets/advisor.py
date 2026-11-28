@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 
 from . import events, predictions, strategy
 from . import portfolio as pf
-from .config import DB_PATH
+from .config import DATA_DIR, DB_PATH, connect_db
 
 NEW_YORK = ZoneInfo("America/New_York")
 DUBLIN = ZoneInfo("Europe/Dublin")
@@ -87,15 +87,16 @@ _threshold_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
 _mongo = {"client": None}
 
 
-def _conn(path: Optional[Path] = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(path or DB_PATH), timeout=30)
-    conn.row_factory = sqlite3.Row
+def _ensure_advisor_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     have = {r[1] for r in conn.execute("PRAGMA table_info(advice_orders)")}
     for col in ("parent_id INTEGER", "plan TEXT"):          # added with the strategy engine, 2026-10-25
         if col.split()[0] not in have:
             conn.execute(f"ALTER TABLE advice_orders ADD COLUMN {col}")
-    return conn
+
+
+def _conn(path: Optional[Path] = None) -> sqlite3.Connection:
+    return connect_db(path, schema_tag="advisor", schema_fn=_ensure_advisor_schema)
 
 
 def _us_today(now: Optional[datetime] = None) -> date:

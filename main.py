@@ -19,7 +19,7 @@ from typing import Optional
 
 import numpy as np
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
@@ -295,8 +295,20 @@ class QueryRequest(BaseModel):
 
 
 class AgentRequest(BaseModel):
-    question: str
+    question: str = ""
     max_steps: int = 5
+    symbol: Optional[str] = None
+    lang: str = "zh"
+    scope: str = "auto"
+    save_history: bool = True
+
+
+class PortfolioReviewRequest(BaseModel):
+    mode: str = "real"
+    max_decisions: int = 5
+    lang: str = "zh"
+    save_history: bool = True
+    record_hints: bool = True
 
 
 class NewsQueryRequest(BaseModel):
@@ -306,6 +318,8 @@ class NewsQueryRequest(BaseModel):
     until: Optional[int] = None   # YYYYMMDD
     k: int = 8
     rerank: Optional[bool] = None  # None = server default (NEWS_RERANK); see news_rag.py
+    theme: Optional[str] = None
+    impacted_symbol: Optional[str] = None
 
 
 # =====================================================
@@ -345,9 +359,10 @@ def health():
     }
 
 
-@app.post("/api/ask")
-def ask(request: QueryRequest):
-    """RAG-augmented Q&A about the quant system."""
+def _ask_docs_impl(request: QueryRequest):
+    """RAG-augmented Q&A over the 4 platform architecture markdown files in knowledge/."""
+    from langchain_core.messages import AIMessage
+
     try:
         start = time.time()
         context = retrieve_context(request.question, top_k=3)
@@ -357,18 +372,33 @@ def ask(request: QueryRequest):
             f"Question: {request.question}"
         )
         llm = get_chat_llm(temperature=0.7)
-        answer = llm.invoke([HumanMessage(content=prompt)]).content
+        msgs = [HumanMessage(content=prompt)]
+        if "qwen" in str(getattr(llm, "model_name", getattr(llm, "model", ""))).lower():
+            msgs.append(AIMessage(content="<think>\n\n</think>\n\n"))
+        answer = llm.invoke(msgs).content.strip()
         return {"answer": answer, "elapsed_s": round(time.time() - start, 2)}
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
 
 
+@app.post("/api/ask/docs")
+def ask_docs(request: QueryRequest):
+    """Q&A over the static markdown platform docs in knowledge/ (distinct from /api/ask/news)."""
+    return _ask_docs_impl(request)
+
+
+@app.post("/api/ask")
+def ask(request: QueryRequest):
+    """Deprecated alias for /api/ask/docs (platform docs only; use /api/ask/news for news RAG)."""
+    return _ask_docs_impl(request)
+
+
 @app.post("/api/ask/news")
 def ask_news(request: NewsQueryRequest):
-    """R.10 — answer from the 716K-article news corpus, with checkable citations.
+    """R.10 — answer from the 1.2M-article news corpus, with checkable citations.
 
-    Separate from /api/ask rather than replacing it: the knowledge folder answers
+    Separate from /api/ask/docs rather than replacing it: the knowledge folder answers
     "how does the regime scorer weight factors" and the news corpus answers "what
     happened to NVDA on export controls". Different corpora, different questions.
     """
@@ -387,6 +417,8 @@ def ask_news(request: NewsQueryRequest):
             until=request.until,
             k=max(1, min(request.k, 20)),
             rerank=request.rerank,
+            theme=request.theme,
+            impacted_symbol=request.impacted_symbol,
         )
     except Exception as e:
         traceback.print_exc()
@@ -400,6 +432,8 @@ def retrieve_news(
     from_date: str | None = Query(None, alias="from"),
     to_date: str | None = Query(None, alias="to"),
     limit: int = 20,
+    theme: str | None = None,
+    impacted_symbol: str | None = None,
 ):
     """R.12 — hybrid retrieval only: articles, no generated answer.
 
@@ -410,7 +444,10 @@ def retrieve_news(
     """
     from news_rag import search_articles
     try:
-        return search_articles(q, symbol=symbol, from_date=from_date, to_date=to_date, limit=limit)
+        return search_articles(
+            q, symbol=symbol, from_date=from_date, to_date=to_date, limit=limit,
+            theme=theme, impacted_symbol=impacted_symbol,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -418,47 +455,133 @@ def retrieve_news(
 @app.post("/api/agent/research")
 def agent_research(request: AgentRequest):
     """ReAct tool-calling research agent: LLM autonomously queries platform data tools."""
+    from agent import build_default_question, run_research_agent
+
+    q = (request.question or "").strip()
+    if not q:
+        if request.symbol and request.symbol.strip():
+            q = build_default_question(request.symbol, request.lang)
+        else:
+            raise HTTPException(status_code=400, detail="question or symbol is required")
     try:
-        from agent import run_research_agent
-        return run_research_agent(request.question, max_steps=min(request.max_steps, 8))
+        return run_research_agent(
+            q,
+            max_steps=max(1, min(request.max_steps, 8)),
+            symbol=request.symbol,
+            lang=request.lang,
+            scope=request.scope,
+            save_history=request.save_history,
+        )
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
 
 
 @app.post("/api/agent/portfolio")
-def agent_portfolio_review(max_decisions: int = 5):
-    """Review the rule engine's recent decisions and the current portfolio (F.17).
-
-    Not a research question — it takes no prompt. The agent reads the platform's own
-    state, reviews what the rules decided, and returns a machine-consumable decision
-    table. Portfolio-level checks (weight limits, regime exposure, signal alignment) are
-    computed in code rather than asked of the model, because they are arithmetic.
-    """
+def agent_portfolio_review(
+    max_decisions: int = 5,
+    mode: Optional[str] = None,
+    lang: Optional[str] = None,
+    request: Optional[PortfolioReviewRequest] = Body(default=None),
+):
+    """Review rule & real-portfolio decisions through Schema + Grounding + Business gates (F.17 / F13)."""
     try:
         from portfolio_agent import run_portfolio_review
-        return run_portfolio_review(max_decisions=max(1, min(max_decisions, 10)))
+
+        eff_max = request.max_decisions if request else max_decisions
+        eff_mode = (request.mode if request else mode) or "real"
+        eff_lang = (request.lang if request else lang) or "zh"
+        save_hist = request.save_history if request else True
+        rec_hints = request.record_hints if request else True
+        return run_portfolio_review(
+            max_decisions=max(1, min(eff_max, 10)),
+            mode=eff_mode,
+            lang=eff_lang,
+            save_history=save_hist,
+            record_hints=rec_hints,
+        )
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
 
 
+@app.get("/api/agent/portfolio/history")
+def agent_portfolio_history(mode: Optional[str] = None, limit: int = 20):
+    """List saved portfolio review reports (most recent first)."""
+    from portfolio_agent import list_portfolio_reviews
+
+    items = list_portfolio_reviews(mode=mode, limit=max(1, min(limit, 50)))
+    return {"items": items}
+
+
+@app.get("/api/agent/portfolio/history/{run_id}")
+def agent_portfolio_history_detail(run_id: str):
+    """Fetch full report for one saved portfolio review run."""
+    from portfolio_agent import get_portfolio_review
+
+    doc = get_portfolio_review(run_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="portfolio review not found")
+    return doc
+
+
 @app.post("/api/agent/research/stream")
 def agent_research_stream(request: AgentRequest):
-    """SSE stream of the agent run: one `tool_call` event per executed tool, then `final`."""
+    """SSE stream of the agent run: run_start, step_start, tool_start, tool_call, then final."""
     from fastapi.responses import StreamingResponse
+    from agent import agent_events, build_default_question
+
+    q = (request.question or "").strip()
+    if not q:
+        if request.symbol and request.symbol.strip():
+            q = build_default_question(request.symbol, request.lang)
+        else:
+            raise HTTPException(status_code=400, detail="question or symbol is required")
 
     def gen():
         try:
-            from agent import agent_events
-            for ev in agent_events(request.question, max_steps=min(request.max_steps, 8)):
+            for ev in agent_events(
+                q,
+                max_steps=max(1, min(request.max_steps, 8)),
+                symbol=request.symbol,
+                lang=request.lang,
+                scope=request.scope,
+                save_history=request.save_history,
+            ):
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
         except Exception as e:
             traceback.print_exc()
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache"})
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/agent/research/history")
+def agent_research_history(symbol: Optional[str] = None, limit: int = 20):
+    """List saved ReAct research runs (most recent first)."""
+    from agent import list_research_runs
+
+    items = list_research_runs(symbol=symbol, limit=max(1, min(limit, 50)))
+    return {"items": items}
+
+
+@app.get("/api/agent/research/history/{run_id}")
+def agent_research_history_detail(run_id: str):
+    """Fetch full trace and answer for one saved ReAct research run."""
+    from agent import get_research_run
+
+    doc = get_research_run(run_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="research run not found")
+    return doc
 
 
 if __name__ == "__main__":

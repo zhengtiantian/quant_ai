@@ -30,8 +30,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from . import budget_link, global_markets
-from .config import DB_PATH
+from . import budget_link, global_markets, us_calendar
+from .config import DB_PATH, connect_db, run_schema_once
 
 US_EAST = ZoneInfo("America/New_York")
 EPS = 1e-9
@@ -93,9 +93,7 @@ CREATE TABLE IF NOT EXISTS ref_prices (
 
 
 def _conn(path: Optional[Path] = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(path or DB_PATH), timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_db(path)
 
 
 # Cash available to invest, in USD, entered by hand on the Holdings page (Q.5, 2026-10-25). The
@@ -105,9 +103,9 @@ CASH_MAX = 1e9
 
 
 def get_cash(path: Optional[Path] = None) -> float:
-    conn = _conn(path)
+    conn = connect_db(path, schema_tag="meta",
+                      schema_fn=lambda c: c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"))
     try:
-        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         row = conn.execute("SELECT value FROM meta WHERE key = ?", (CASH_KEY,)).fetchone()
     finally:
         conn.close()
@@ -124,34 +122,41 @@ def set_cash(amount: Any, path: Optional[Path] = None) -> float:
         raise ValueError("cash must be a number")
     if not 0 <= value < CASH_MAX:
         raise ValueError("cash must be between 0 and 1,000,000,000")
-    conn = _conn(path)
+    conn = connect_db(path, immediate=True, schema_tag="meta",
+                      schema_fn=lambda c: c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"))
     try:
-        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (CASH_KEY, str(value)))
-        conn.commit()
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
     return value
 
 
+def _ensure_portfolio_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(SCHEMA)
+    # request_id: the idempotency key of the save that created the row (added 2026-10-20).
+    if "request_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}:
+        conn.execute("ALTER TABLE transactions ADD COLUMN request_id TEXT")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_request ON transactions(request_id)")
+    # budget_sync / budget_entry_id: a sale's profit was pushed to the budget's 股票 item (2026-10-20 to
+    # 2026-10-27); kept so the sale pushed then still shows its →budget mark.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}
+    if "budget_sync" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN budget_sync INTEGER NOT NULL DEFAULT 0")
+    if "budget_entry_id" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN budget_entry_id INTEGER")
+    if "lot_allocations" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN lot_allocations TEXT")
+
+
 def init_db(path: Optional[Path] = None) -> None:
     conn = _conn(path)
     try:
-        conn.executescript(SCHEMA)
-        # request_id: the idempotency key of the save that created the row (added 2026-10-20).
-        if "request_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}:
-            conn.execute("ALTER TABLE transactions ADD COLUMN request_id TEXT")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_request ON transactions(request_id)")
-        # budget_sync / budget_entry_id: a sale's profit was pushed to the budget's 股票 item (2026-10-20 to
-        # 2026-10-27); kept so the sale pushed then still shows its →budget mark.
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}
-        if "budget_sync" not in cols:
-            conn.execute("ALTER TABLE transactions ADD COLUMN budget_sync INTEGER NOT NULL DEFAULT 0")
-        if "budget_entry_id" not in cols:
-            conn.execute("ALTER TABLE transactions ADD COLUMN budget_entry_id INTEGER")
-        if "lot_allocations" not in cols:
-            conn.execute("ALTER TABLE transactions ADD COLUMN lot_allocations TEXT")
-        conn.commit()
+        run_schema_once("portfolio", path, conn, _ensure_portfolio_schema)
     finally:
         conn.close()
 
@@ -160,10 +165,7 @@ def _write_conn(path: Optional[Path] = None) -> sqlite3.Connection:
     """A connection whose transaction starts with BEGIN IMMEDIATE: the write lock is taken
     before the books are read, so two saves cannot both pass the "do you hold enough shares"
     check against the same state. A second writer waits (busy timeout 30 s) instead."""
-    conn = _conn(path)
-    conn.isolation_level = None
-    conn.execute("BEGIN IMMEDIATE")
-    return conn
+    return connect_db(path, immediate=True)
 
 
 # ---------------------------------------------------------------- transactions
@@ -323,23 +325,31 @@ def add_watch(symbol: str, note: str = "", path: Optional[Path] = None) -> str:
     sym = re.sub(r"\s+", "", str(symbol or "")).upper()
     if not re.fullmatch(r"[A-Z][A-Z0-9.\-/]{0,9}", sym):
         raise ValueError("Invalid ticker (e.g. NVDA, VOO)")
-    conn = _conn(path)
+    conn = _write_conn(path)
     try:
         sort = conn.execute("SELECT COALESCE(MAX(sort), 0) + 1 FROM watchlist").fetchone()[0]
         conn.execute("INSERT INTO watchlist(symbol, note, sort, created_at) VALUES (?, ?, ?, ?) "
                      "ON CONFLICT(symbol) DO UPDATE SET note = excluded.note",
                      (sym, str(note or "").strip(), sort, datetime.now().isoformat(sep=" ", timespec="seconds")))
-        conn.commit()
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
     return sym
 
 
 def remove_watch(symbol: str, path: Optional[Path] = None) -> None:
-    conn = _conn(path)
+    conn = _write_conn(path)
     try:
         conn.execute("DELETE FROM watchlist WHERE symbol = ?", (str(symbol or "").upper(),))
-        conn.commit()
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
 
@@ -695,36 +705,38 @@ def _post_close_price(ext: Optional[Dict[str, Any]], primary: Dict[str, Any]) ->
 
 
 def _post_close_cutoff(now: Optional[datetime] = None) -> float:
-    """Epoch seconds of 20:00 ET on the latest trading day (when after-hours closed)."""
+    """Epoch seconds of the end of after-hours (20:00 ET, 17:00 after an early close) on the latest
+    trading day."""
     t = (now or datetime.now(US_EAST)).astimezone(US_EAST)
     d = trading_day(t)
-    return datetime(d.year, d.month, d.day, 20, 0, tzinfo=US_EAST).timestamp()
+    return datetime(d.year, d.month, d.day, us_calendar.post_end_hour(d), 0, tzinfo=US_EAST).timestamp()
 
 
 def session_now(now: Optional[datetime] = None) -> str:
-    """US equity session by the clock (no holiday calendar); Nasdaq's own status wins when known."""
+    """US equity session by the clock and the market calendar (a holiday is closed like a weekend; an
+    early-close day ends at 13:00 ET); Nasdaq's own status wins when known."""
     t = (now or datetime.now(US_EAST)).astimezone(US_EAST)
-    if t.weekday() >= 5:
+    if not us_calendar.is_trading_day(t.date()):
         return "closed"
     hm = t.hour * 60 + t.minute
+    close = us_calendar.close_hour(t.date()) * 60
     if 4 * 60 <= hm < 9 * 60 + 30:
         return "pre"
-    if 9 * 60 + 30 <= hm < 16 * 60:
+    if 9 * 60 + 30 <= hm < close:
         return "regular"
-    if 16 * 60 <= hm < 20 * 60:
+    if close <= hm < close + us_calendar.POST_HOURS * 60:
         return "post"
     return "closed"
 
 
 def seconds_until_next_session(now: Optional[datetime] = None) -> int:
-    """Seconds until the next pre-market open (4:00 ET on a weekday). No holiday calendar:
-    on a holiday the page wakes up, sees Nasdaq report "Closed" and goes back to sleep."""
+    """Seconds until the next pre-market open (4:00 ET on a trading day)."""
     from datetime import timedelta
     t = (now or datetime.now(US_EAST)).astimezone(US_EAST)
     nxt = t.replace(hour=4, minute=0, second=0, microsecond=0)
     if nxt <= t:
         nxt += timedelta(days=1)
-    while nxt.weekday() >= 5:
+    while not us_calendar.is_trading_day(nxt.date()):
         nxt += timedelta(days=1)
     return max(60, int((nxt - t).total_seconds()))
 
@@ -1343,8 +1355,13 @@ def get_chart(symbol: str, rng: str = "1d", path: Optional[Path] = None) -> Dict
                 candles = get_daily()
                 if not candles:
                     continue
-                reg = [c for c in intraday["candles"] if c["session"] == "regular"]
+                from datetime import timezone
                 today = datetime.now(US_EAST).date().isoformat()
+                # Today's candle, while it trades: the intraday bars must be today's. Before the open, on a
+                # weekend or a holiday they are the last session's, already the last daily bar (until
+                # 2026-11-26 they were added again under today's date, a second bar for the same session).
+                reg = [c for c in intraday["candles"] if c["session"] == "regular"
+                       and datetime.fromtimestamp(c["time"], timezone.utc).date().isoformat() == today]
                 if reg and candles[-1]["time"] < today:
                     candles.append({"time": today, "open": reg[0]["open"], "high": max(c["high"] for c in reg),
                                     "low": min(c["low"] for c in reg), "close": reg[-1]["close"],
@@ -1419,16 +1436,13 @@ REF_RETRY_SECONDS = 600
 
 
 def trading_day(now: Optional[datetime] = None) -> date:
-    """The trading day the clock is in: today from 04:00 ET on a weekday, otherwise the weekday before."""
-    from datetime import timedelta
+    """The trading day the clock is in: today from 04:00 ET on a trading day, otherwise the trading day
+    before (on a holiday or a weekend, the last one)."""
     t = (now or datetime.now(US_EAST)).astimezone(US_EAST)
     d = t.date()
-    if t.weekday() < 5 and t.hour >= 4:
+    if us_calendar.is_trading_day(d) and t.hour >= 4:
         return d
-    d -= timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
+    return us_calendar.previous_trading_day(d)
 
 
 def _post_end_price(symbol: str, day: date) -> Optional[Dict[str, Any]]:

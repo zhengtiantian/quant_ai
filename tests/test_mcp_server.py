@@ -28,6 +28,11 @@ EXPECTED_TOOLS = {
     "get_my_transactions",
     "get_performance",
     "list_symbols",
+    "get_market_weather",
+    "get_catalysts",
+    "get_daily_action",
+    "get_lot_advice",
+    "get_pipeline_health",
     # R.4: relevance judging over MCP, the server's first write tools
     "get_eval_batch",
     "submit_judgment",
@@ -44,6 +49,10 @@ CALL_CHECKS = [
     # Answers with totals even when the user has recorded no trades yet.
     ("get_my_holdings", {}, "totals"),
     ("get_my_transactions", {}, "["),
+    ("get_market_weather", {}, "macrogroups"),
+    ("get_catalysts", {"days": 14}, "perstock"),
+    ("get_daily_action", {}, "actions"),
+    ("get_pipeline_health", {}, "stages"),
     # R.12: hybrid by default — each article says which retrieval leg found it.
     ("search_news", {"query": "earnings", "symbol": "AAPL", "limit": 3}, "foundby"),
     # Keyword mode is still the weighted text index: relevance ranking proves it is used.
@@ -71,7 +80,7 @@ async def _drive_server():
     # QUANT_API and friends never reach the server unless forwarded explicitly. Without
     # this the test can only ever exercise the default endpoint.
     env = get_default_environment()
-    for key in ("QUANT_API", "LOCAL_MONGO_URI", "FEATURE_DB_NAME", "QUANT_MCP_TIMEOUT"):
+    for key in ("QUANT_API", "MARKETS_URL", "LOCAL_MONGO_URI", "FEATURE_DB_NAME", "QUANT_MCP_TIMEOUT"):
         if os.getenv(key):
             env[key] = os.environ[key]
 

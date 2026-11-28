@@ -135,6 +135,40 @@ def embed(texts: list[str]) -> list[list[float]]:
     return [d["embedding"] for d in r.json()["data"]]
 
 
+def extract_themes(doc: dict) -> list[str]:
+    """Extract normalized GD1 v3 themes from canonical llm_themes or student_gd1.themes."""
+    raw = doc.get("llm_themes")
+    if not raw:
+        raw = (doc.get("student_gd1") or {}).get("themes")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(t).strip() for t in raw if t and str(t).strip()]
+
+
+def extract_impacted_symbols(doc: dict) -> list[str]:
+    """Extract sorted non-zero impacted peer tickers from llm_impacts or student_gd1.impacts."""
+    raw = doc.get("llm_impacts")
+    if not isinstance(raw, dict):
+        raw = (doc.get("student_gd1") or {}).get("impacts")
+    if not isinstance(raw, dict):
+        return []
+    own = str(doc.get("symbol") or "").strip().upper()
+    out = set()
+    for k, v in raw.items():
+        sym = str(k or "").strip().upper()
+        if not sym or sym == own:
+            continue
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v != 0:
+            out.add(sym)
+    return sorted(out)
+
+
+def ensure_gd1_payload_indexes(qc: QdrantClient) -> None:
+    """Idempotently ensure KEYWORD payload indexes for GD1 themes and impacted_symbols."""
+    qc.create_payload_index(COLLECTION, "themes", qm.PayloadSchemaType.KEYWORD)
+    qc.create_payload_index(COLLECTION, "impacted_symbols", qm.PayloadSchemaType.KEYWORD)
+
+
 def int8_quantization_config() -> qm.ScalarQuantization:
     return qm.ScalarQuantization(
         scalar=qm.ScalarQuantizationConfig(
@@ -163,6 +197,7 @@ def ensure_collection(qc: QdrantClient, reset: bool, enable_quantization: bool =
         qc.create_payload_index(COLLECTION, "symbol", qm.PayloadSchemaType.KEYWORD)
         qc.create_payload_index(COLLECTION, "date_int", qm.PayloadSchemaType.INTEGER)
         qc.create_payload_index(COLLECTION, "event_type", qm.PayloadSchemaType.KEYWORD)
+        ensure_gd1_payload_indexes(qc)
         print(f"created collection {COLLECTION} (dim={VECTOR_DIM}, cosine, on_disk, int8)")
     elif enable_quantization:
         qc.update_collection(
@@ -242,6 +277,73 @@ def save_checkpoint(last_id, checkpoint_path: Path = CHECKPOINT) -> None:
     tmp.replace(checkpoint_path)
 
 
+def backfill_gd1_payload(qc: QdrantClient, coll, limit: int = 0, batch_size: int = 500) -> None:
+    """Backfill themes and impacted_symbols onto existing Qdrant news_v1 points without re-embedding."""
+    ensure_gd1_payload_indexes(qc)
+    q = {
+        "company_match_v2.matched": {"$ne": False},
+        "$or": [
+            {"llm_themes.0": {"$exists": True}},
+            {"student_gd1.themes.0": {"$exists": True}},
+            {"llm_impacts": {"$type": "object"}},
+            {"student_gd1.impacts": {"$type": "object"}},
+        ],
+    }
+    proj = {
+        "_id": 1, "symbol": 1,
+        "llm_themes": 1, "llm_impacts": 1,
+        "student_gd1.themes": 1, "student_gd1.impacts": 1,
+    }
+    cursor = coll.find(q, proj).sort("_id", ASCENDING).batch_size(batch_size)
+    t0 = time.perf_counter()
+    n_seen = n_with_gd1 = n_updated = n_missing = 0
+    buf: list[tuple[str, list[str], list[str]]] = []
+
+    def _flush() -> None:
+        nonlocal buf, n_updated, n_missing
+        if not buf:
+            return
+        pids = [item[0] for item in buf]
+        existing = {
+            str(p.id)
+            for p in qc.retrieve(COLLECTION, ids=pids, with_payload=False, with_vectors=False)
+        }
+        ops = []
+        for pid, themes, impacted in buf:
+            if pid not in existing:
+                n_missing += 1
+                continue
+            ops.append(qm.SetPayloadOperation(
+                set_payload=qm.SetPayload(
+                    payload={"themes": themes, "impacted_symbols": impacted},
+                    points=[pid],
+                )
+            ))
+        if ops:
+            qc.batch_update_points(collection_name=COLLECTION, update_operations=ops, wait=False)
+            n_updated += len(ops)
+        buf = []
+
+    for doc in cursor:
+        n_seen += 1
+        themes = extract_themes(doc)
+        impacted = extract_impacted_symbols(doc)
+        if themes or impacted:
+            n_with_gd1 += 1
+            buf.append((str(uuid.uuid5(NAMESPACE, str(doc["_id"]))), themes, impacted))
+            if len(buf) >= batch_size:
+                _flush()
+        if n_seen % 50000 == 0:
+            _flush()
+            el = time.perf_counter() - t0
+            print(f"gd1-backfill seen={n_seen:,} with_gd1={n_with_gd1:,} updated={n_updated:,} missing={n_missing:,} ({n_seen / max(el, 1e-6):.0f} docs/s)", flush=True)
+        if limit and n_seen >= limit:
+            break
+    _flush()
+    el = time.perf_counter() - t0
+    print(f"DONE gd1-backfill: seen={n_seen:,} with_gd1={n_with_gd1:,} updated={n_updated:,} missing={n_missing:,} in {el:.1f}s", flush=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="stop after N source documents")
@@ -250,14 +352,21 @@ def main() -> None:
                     help="Backfill historical origin=universe_backfill articles using a dedicated checkpoint")
     ap.add_argument("--enable-quantization", action="store_true",
                     help="Enable INT8 scalar quantization in-place on an existing collection")
+    ap.add_argument("--backfill-gd1-payload", action="store_true",
+                    help="Backfill themes & impacted_symbols onto existing Qdrant points without re-embedding")
     args = ap.parse_args()
+
+    qc = QdrantClient(url=QDRANT_URL, timeout=120)
+    if args.backfill_gd1_payload:
+        coll = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)[DB_NAME][SRC_COLL]
+        backfill_gd1_payload(qc, coll, limit=args.limit)
+        return
 
     try:
         requests.get(f"{LM}/models", timeout=8).raise_for_status()
     except requests.RequestException as e:
         sys.exit(f"embedding endpoint {LM} unreachable: {e}")
 
-    qc = QdrantClient(url=QDRANT_URL, timeout=120)
     ensure_collection(qc, args.reset, enable_quantization=args.enable_quantization)
 
     coll = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)[DB_NAME][SRC_COLL]
@@ -290,7 +399,8 @@ def main() -> None:
     cursor = coll.find(
         query,
         {"title": 1, "content": 1, "symbol": 1, "date": 1,
-         "llm_event_type_a": 1, "llm_sentiment_final": 1, "url": 1},
+         "llm_event_type_a": 1, "llm_sentiment_final": 1, "url": 1,
+         "llm_themes": 1, "llm_impacts": 1, "student_gd1.themes": 1, "student_gd1.impacts": 1},
     ).sort("_id", ASCENDING).batch_size(MONGO_BATCH)
 
     n_read = n_dupe = n_empty = n_bad_date = n_indexed = 0
@@ -318,6 +428,8 @@ def main() -> None:
                         "url": doc.get("url"),
                         "event_type": doc.get("llm_event_type_a"),
                         "sentiment": doc.get("llm_sentiment_final"),
+                        "themes": extract_themes(doc),
+                        "impacted_symbols": extract_impacted_symbols(doc),
                     },
                 )
                 for (doc, _text), vec in zip(pending, vectors)

@@ -120,9 +120,16 @@ def render(sym: str, holding: Dict[str, Any], stats: Dict[str, Any], lowest_lot:
                        "text": {"en": f"Buy {n} @ ${price:.2f} (10% more)", "zh": f"买 {n} 股 @ ${price:.2f}（加 10%）"}})
 
     # why it fell: the news behind the recent large drops
+    driver_tags = {
+        "company_specific": ("[Company] ", "【公司事件】"),
+        "peer_spillover": ("[Peer spillover] ", "【同行传导】"),
+        "sector_macro": ("[Sector/Macro] ", "【板块共振】"),
+    }
     events = m.get("events") or []
     for e in reversed(events):
-        note("why", f"{e['date'][5:]} {e['ret_pct']:+.1f}%: {e['cause_en']}", f"{e['date'][5:]} {e['ret_pct']:+.1f}%：{e['cause_zh']}")
+        en_tag, zh_tag = driver_tags.get(e.get("driver_type"), ("", ""))
+        note("why", f"{e['date'][5:]} {e['ret_pct']:+.1f}%: {en_tag}{e['cause_en']}",
+             f"{e['date'][5:]} {e['ret_pct']:+.1f}%：{zh_tag}{e['cause_zh']}")
         if e.get("sources"):
             note("why", "Sources: " + " | ".join(x["title"] for x in e["sources"][:2]),
                  "来源：" + " | ".join(x["title"] for x in e["sources"][:2]), key=False)

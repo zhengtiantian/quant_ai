@@ -15,17 +15,17 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from . import config
 from . import portfolio as pf
+from . import us_calendar
 
 MONTH_SESSIONS = 21
 YEAR_SESSIONS = 252
 BAR_DAYS = 400                      # calendar days fetched: a year of sessions with room to spare
-SESSION_CLOSE_HOUR = 16             # ET: a session's bar is complete after the close
 STATS_FILE = Path(os.getenv("VOLUME_STATS_FILE", str(config.DATA_DIR / "volume_stats.json")))
 WORKERS = 3
 
@@ -34,16 +34,13 @@ _running = {"on": False}
 
 
 def last_complete_session(now: Optional[datetime] = None) -> date:
-    """The latest US session whose daily bar is final: today after 16:00 ET on a weekday, otherwise
-    the weekday before (no holiday calendar: a holiday's missing bar only shifts the windows by one)."""
+    """The latest US session whose daily bar is final: today after the close (16:00 ET, 13:00 on an
+    early-close day) on a trading day, otherwise the trading day before."""
     t = (now or datetime.now(pf.US_EAST)).astimezone(pf.US_EAST)
     d = t.date()
-    if t.weekday() < 5 and t.hour >= SESSION_CLOSE_HOUR:
+    if us_calendar.is_trading_day(d) and t.hour >= us_calendar.close_hour(d):
         return d
-    d -= timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
+    return us_calendar.previous_trading_day(d)
 
 
 def tracked_symbols(path: Optional[Path] = None) -> Dict[str, List[str]]:

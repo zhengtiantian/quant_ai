@@ -33,6 +33,19 @@ class SplitTest(unittest.TestCase):
         s = ge.split_sentences("- Nvidia rose [1].\n- AMD fell [2].")
         self.assertEqual(len(s), 2)
 
+    def test_chinese_sentences_keep_citations_and_split_cleanly(self):
+        a = "英伟达三季度数据中心营收同比增长35%[1]。不过出口管制仍限制部分高端芯片对华出货[2][3]！请问这是否影响明年指引？"
+        s = ge.split_sentences(a)
+        self.assertEqual(len(s), 3)
+        self.assertEqual(ge.sentence_cites(s[0]), [1])
+        self.assertEqual(ge.sentence_cites(s[1]), [2, 3])
+        self.assertEqual(ge.sentence_cites(s[2]), [])
+
+    def test_chinese_citation_after_period_stays_attached(self):
+        s = ge.split_sentences("存储芯片价格回升 12%。[2] 美光资本开支维持谨慎 [4]。")
+        self.assertEqual(len(s), 2)
+        self.assertEqual([ge.sentence_cites(x) for x in s], [[2], [4]])
+
 
 class NumbersTest(unittest.TestCase):
     def test_rounding_at_the_answers_precision(self):
@@ -57,6 +70,12 @@ class RefusalTest(unittest.TestCase):
         self.assertTrue(ge.is_refusal("The excerpts do not mention Apple's 2031 event."))
         self.assertTrue(ge.is_refusal("anything", refused_flag=True))
         self.assertFalse(ge.is_refusal("Apple launched a phone [1]. The excerpts do not mention prices."))
+
+    def test_chinese_refusal_and_decline_detection(self):
+        self.assertTrue(ge.is_refusal("新闻摘录中未提及苹果 2031 年发布会的相关信息。"))
+        self.assertTrue(ge.declines("现有新闻报道中没有提到黄仁勋最喜欢的私人餐厅。另外，摘录提到英伟达在 Palo Alto 举行过活动 [1]。"))
+        self.assertTrue(ge.declines("提供的新闻 excerpts 中没有任何关于黄仁勋最喜欢的私人餐厅名称或人均消费的信息。"))
+        self.assertFalse(ge.declines("英伟达股价上涨 5% [1]。新闻摘录中未提及微软。"))
 
 
 class MetricsTest(unittest.TestCase):
@@ -92,6 +111,11 @@ class StatsTest(unittest.TestCase):
     def test_kappa(self):
         self.assertAlmostEqual(ge.cohen_kappa([("a", "a"), ("b", "b")]), 1.0)
         self.assertAlmostEqual(ge.cohen_kappa([("a", "b"), ("b", "a")]), -1.0)
+
+    def test_percentile_for_latency(self):
+        self.assertIsNone(ge._percentile([], 0.5))
+        self.assertEqual(ge._percentile([1000.0, 2000.0, 5000.0, 10000.0], 0.5), 5000)
+        self.assertEqual(ge._percentile([1000.0, 2000.0, 5000.0, 10000.0], 0.9), 10000)
 
     def test_paired_diff(self):
         a = {"q1": 0.5, "q2": 0.5, "q3": None}

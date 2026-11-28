@@ -42,14 +42,17 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "tools"))
 
-from hybrid_search import RRF_K, search  # noqa: E402
+from hybrid_search import RRF_K, _get_mongo_coll, search, search_with_meta  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).parent))
 from injection_guard import check_answer, screen  # noqa: E402
+
+_ORIG_SEARCH = search
 
 MAX_SNIPPET = 700
 DEFAULT_K = 8
@@ -91,7 +94,153 @@ Rules, in order of importance:
 3. If the excerpts disagree, say so and cite both sides rather than picking one.
 4. Note the date of what you are reporting. These are historical articles; "recently"
    means relative to the article, not to today.
-5. Be brief. Three or four sentences unless the question genuinely needs more."""
+5. Be brief. Three or four sentences unless the question genuinely needs more.
+6. Answer in the same language as the user's Question (Chinese if asked in Chinese, English if asked in English)."""
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_ZH_GLOSSARY: tuple[tuple[str, str], ...] = (
+    ("英伟达", "NVDA Nvidia"),
+    ("台积电", "TSM TSMC"),
+    ("美光", "MU Micron"),
+    ("英特尔", "INTC Intel"),
+    ("希捷", "STX Seagate"),
+    ("海力士", "SK Hynix SKHY"),
+    ("西部数据", "WDC Western Digital"),
+    ("博通", "AVGO Broadcom"),
+    ("阿斯麦", "ASML"),
+    ("超微", "AMD"),
+    ("高通", "QCOM Qualcomm"),
+    ("应用材料", "AMAT Applied Materials"),
+    ("泛林", "LRCX Lam Research"),
+    ("苹果", "AAPL Apple"),
+    ("微软", "MSFT Microsoft"),
+    ("亚马逊", "AMZN Amazon"),
+    ("谷歌", "GOOGL Alphabet"),
+    ("特斯拉", "TSLA Tesla"),
+    ("出口管制", "export controls"),
+    ("制裁", "sanctions restrictions"),
+    ("关税", "tariffs trade"),
+    ("存储芯片", "memory chip DRAM HBM NAND"),
+    ("内存", "memory DRAM HBM"),
+    ("闪存", "NAND flash storage"),
+    ("半导体", "semiconductor chip"),
+    ("芯片", "chip semiconductor"),
+    ("人工智能", "AI"),
+    ("资本开支", "AI capex spending"),
+    ("数据中心", "data center"),
+    ("财报", "earnings results"),
+    ("业绩", "earnings revenue"),
+    ("指引", "guidance outlook"),
+    ("暴跌", "plunge selloff"),
+    ("大跌", "drop plunge selloff"),
+    ("抛售", "selloff plunge"),
+    ("上涨", "rally rise gain"),
+    ("涨价", "price hike pricing"),
+    ("降价", "price cut oversupply"),
+    ("过剩", "oversupply glut"),
+    ("需求", "demand"),
+    ("降级", "downgrade"),
+    ("下调", "cut downgrade"),
+    ("上调", "upgrade raise"),
+    ("美联储", "Fed Federal Reserve rates"),
+    ("利率", "interest rates"),
+    ("通胀", "inflation CPI"),
+    ("原油", "crude oil Brent"),
+    ("日元", "yen carry trade"),
+    ("微软", "Microsoft"),
+)
+
+
+def _infer_relative_dates(question: str, since: int | None, until: int | None,
+                          now: datetime | None = None) -> tuple[int | None, int | None, int | None]:
+    """Infer YYYYMMDD `since` from Chinese/English relative time phrases when caller omitted `since`."""
+    if since is not None:
+        return since, until, None
+    ref = (now or datetime.now(timezone.utc)).date()
+    q = question or ""
+    days: int | None = None
+    m_zh = re.search(r"(?:最近|近)\s*(\d+)\s*(?:天|日)", q)
+    m_en = re.search(r"(?:last|past)\s+(\d+)\s+days?", q, re.I)
+    if m_zh:
+        days = max(1, int(m_zh.group(1)))
+    elif m_en:
+        days = max(1, int(m_en.group(1)))
+    elif re.search(r"(?:最近|近|这|本)\s*一?\s*周|past week|last week", q, re.I):
+        days = 7
+    elif re.search(r"(?:最近|近|这|本)\s*(?:一|1)?\s*个月|近一月|past month|last month", q, re.I):
+        days = 30
+    elif re.search(r"(?:最近|近)\s*(?:三|3)\s*个月|近一季|past (?:quarter|3 months)|last 3 months", q, re.I):
+        days = 90
+    elif re.search(r"(?:昨天|昨日|yesterday)", q, re.I):
+        days = 1
+    elif re.search(r"(?:今年|年初至今|this year|\bytd\b)", q, re.I):
+        inferred = int(f"{ref.year}0101")
+        return inferred, until, inferred
+    if days is None:
+        return since, until, None
+    inferred = int((ref - timedelta(days=days)).strftime("%Y%m%d"))
+    return inferred, until, inferred
+
+
+def _glossary_expand_zh(question: str) -> str:
+    """Deterministic Chinese -> English financial keyword expansion fallback."""
+    parts: list[str] = re.findall(r"[A-Za-z0-9.\-]{2,}", question or "")
+    for zh, en in _ZH_GLOSSARY:
+        if zh in (question or ""):
+            parts.append(en)
+    # Deduplicate preserving token order
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for chunk in parts:
+        for tok in chunk.split():
+            tl = tok.lower()
+            if tl not in seen:
+                seen.add(tl)
+                tokens.append(tok)
+    return " ".join(tokens)
+
+
+def prepare_query(question: str, since: int | None = None, until: int | None = None,
+                  llm=None, now: datetime | None = None) -> tuple[str, int | None, int | None, dict]:
+    """Expand CJK queries to English search keywords and extract relative date filters."""
+    eff_since, eff_until, inferred_since = _infer_relative_dates(question, since, until, now=now)
+    q = (question or "").strip()
+    has_cjk = bool(_CJK_RE.search(q))
+    rewritten_query = q
+    rewrite_mode = "none"
+
+    if has_cjk:
+        glossary = _glossary_expand_zh(q)
+        if llm is not None and os.getenv("NEWS_QUERY_REWRITE", "1") == "1":
+            try:
+                from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+                msgs = [
+                    SystemMessage(content=(
+                        "Translate the user's financial news question into 4-12 concise English search "
+                        "keywords (preserve stock tickers and company names, output keywords only, one line)."
+                    )),
+                    HumanMessage(content=q),
+                ]
+                if "qwen" in str(getattr(llm, "model_name", getattr(llm, "model", ""))).lower():
+                    msgs.append(AIMessage(content=THINK_PREFILL))
+                raw = str(llm.invoke(msgs).content or "").strip()
+                raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip().splitlines()[0].strip(" \"'`")
+                if raw and not _CJK_RE.search(raw):
+                    rewritten_query = raw
+                    rewrite_mode = "llm"
+            except Exception:  # noqa: BLE001
+                pass
+        if rewrite_mode == "none" and glossary:
+            rewritten_query = glossary
+            rewrite_mode = "glossary"
+
+    return rewritten_query, eff_since, eff_until, {
+        "original": q,
+        "retrieval_query": rewritten_query,
+        "rewritten": rewritten_query != q,
+        "rewrite_mode": rewrite_mode,
+        "inferred_since": inferred_since,
+    }
 
 
 def _fetch_bodies(hits, coll) -> dict:
@@ -119,39 +268,25 @@ def _fetch_bodies(hits, coll) -> dict:
     cursor = coll.find(
         {"_id": {"$in": ids}},
         {"content": 1, "url": 1, "date": 1, "name": 1, "llm_sentiment_final": 1, "llm_event_type_a": 1,
-         "llm_signal_strength_a": 1, "llm_disagreement": 1},
+         "llm_signal_strength_a": 1, "llm_disagreement": 1, "llm_themes": 1, "llm_impacts": 1, "student_gd1": 1},
     )
     return {str(d["_id"]): d for d in cursor}
 
 
-def build_context(hits, coll) -> tuple[str, list[dict]]:
-    """Assemble the excerpts, sanitised and explicitly delimited (S.1).
-
-    The `<excerpt>` markers are not decoration. Retrieved text is untrusted and this is
-    the layer that decides whether the model can tell data from instruction: every
-    article body sits inside a named boundary, in a user message, and the system prompt
-    states that nothing inside can change the rules. Interpolating this text into the
-    system prompt instead — which is the natural way to write it — would hand every
-    scraped article the same authority as the operator.
-
-    Titles are sanitised too. They are shorter and easier to overlook, and a title is
-    the one field that reaches the model even for the 17.9% of articles with no body.
-    """
-    bodies = _fetch_bodies(hits, coll)
+def build_context(hits, coll, preloaded_bodies: dict | None = None) -> tuple[str, list[dict]]:
+    """Assemble the excerpts, sanitised and explicitly delimited (S.1)."""
+    bodies = preloaded_bodies if preloaded_bodies is not None else _fetch_bodies(hits, coll)
 
     blocks, sources = [], []
     for i, h in enumerate(hits, 1):
         doc = bodies.get(h.mongo_id) or {}
+        gd1 = doc.get("student_gd1") if isinstance(doc.get("student_gd1"), dict) else {}
         body_screen = screen((doc.get("content") or "").strip())
         title_screen = screen((h.title or "").strip())
         flags = sorted(set(body_screen.flags) | set(title_screen.flags))
 
         body = body_screen.text
         excerpt = body[:MAX_SNIPPET] if body else "(headline only — no body text)"
-        # The model is told which excerpts tripped the scanner. It is advisory on both
-        # sides: the scanner cannot be trusted to catch everything, and a flag is not
-        # grounds to withhold the article — dropping documents on a regex match would
-        # let anyone suppress coverage of a company by publishing one sentence.
         warn = f" untrusted-content-flags=\"{','.join(flags)}\"" if flags else ""
         blocks.append(
             f'<excerpt id="{i}" symbol="{h.symbol}" date="{h.date}"{warn}>\n'
@@ -165,8 +300,10 @@ def build_context(hits, coll) -> tuple[str, list[dict]]:
             "date": h.date,
             "title": title_screen.text,
             "url": doc.get("url") or h.url,
-            "event_type": doc.get("llm_event_type_a"),
-            "sentiment": doc.get("llm_sentiment_final"),
+            "event_type": doc.get("llm_event_type_a") or gd1.get("event_type"),
+            "sentiment": doc.get("llm_sentiment_final") if doc.get("llm_sentiment_final") is not None else gd1.get("sentiment"),
+            "themes": doc.get("llm_themes") or gd1.get("themes") or [],
+            "impacts": doc.get("llm_impacts") or gd1.get("impacts") or {},
             "dense_rank": h.dense_rank,
             "sparse_rank": h.sparse_rank,
             "rrf": round(h.rrf, 5),
@@ -175,6 +312,9 @@ def build_context(hits, coll) -> tuple[str, list[dict]]:
             "chars_sanitised": body_screen.removed_chars + title_screen.removed_chars,
         })
     return "\n\n".join(blocks), sources
+
+
+_ORIG_BUILD_CONTEXT = build_context
 
 
 ARTICLE_EXCERPT = 400  # same bound as quant_api's NewsSearchService
@@ -214,7 +354,8 @@ def _cutoff(before) -> str | None:
 
 
 def search_articles(query: str, symbol: str | None = None, from_date=None, to_date=None,
-                    limit: int = 20, coll=None, rrf_k: int = RRF_K, before=None) -> dict:
+                    limit: int = 20, coll=None, rrf_k: int = RRF_K, before=None,
+                    theme: str | None = None, impacted_symbol: str | None = None) -> dict:
     """R.12 — hybrid retrieval returned as articles, not as an answer.
 
     The same payload shape as quant_api's `/api/news/search`, so every consumer of
@@ -231,31 +372,46 @@ def search_articles(query: str, symbol: str | None = None, from_date=None, to_da
     articles published before it are returned (see hybrid_search.before_ok).
     """
     if coll is None:
-        from pymongo import MongoClient
-        from hybrid_search import DB_NAME, MONGO_URI, SRC_COLL
-        coll = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)[DB_NAME][SRC_COLL]
+        coll = _get_mongo_coll()
     sym = symbol.upper().strip() if symbol and symbol.strip() else None
     k = max(1, min(int(limit), 50))
 
     t0 = time.perf_counter()
-    dense, sparse, fused = search(query, k=k, symbol=sym, since=_date_int(from_date),
-                                  until=_date_int(to_date), rrf_k=rrf_k, before=_cutoff(before))
+    meta: dict = {}
+    if search is _ORIG_SEARCH:
+        dense, sparse, fused, meta = search_with_meta(
+            query, k=k, symbol=sym, since=_date_int(from_date),
+            until=_date_int(to_date), rrf_k=rrf_k, before=_cutoff(before),
+            theme=theme, impacted_symbol=impacted_symbol, coll=coll,
+        )
+    else:
+        dense, sparse, fused = search(
+            query, k=k, symbol=sym, since=_date_int(from_date),
+            until=_date_int(to_date), rrf_k=rrf_k, before=_cutoff(before),
+            theme=theme, impacted_symbol=impacted_symbol,
+        )
     retrieval_ms = (time.perf_counter() - t0) * 1000
     bodies = _fetch_bodies(fused, coll)
 
     articles = []
     for h in fused:
         doc = bodies.get(h.mongo_id) or {}
+        gd1 = doc.get("student_gd1") if isinstance(doc.get("student_gd1"), dict) else {}
+        sent = doc.get("llm_sentiment_final")
+        if sent is None:
+            sent = gd1.get("sentiment")
         articles.append({
             "symbol": h.symbol,
             "company": doc.get("name"),
             "date": doc.get("date") or h.date,
             "title": h.title,
             "excerpt": _excerpt(doc.get("content")),
-            "sentiment": doc.get("llm_sentiment_final"),
+            "sentiment": sent,
             "modelDisagreement": doc.get("llm_disagreement"),
-            "eventType": doc.get("llm_event_type_a"),
-            "signalStrength": doc.get("llm_signal_strength_a"),
+            "eventType": doc.get("llm_event_type_a") or gd1.get("event_type"),
+            "signalStrength": doc.get("llm_signal_strength_a") or gd1.get("signal_strength"),
+            "themes": doc.get("llm_themes") or gd1.get("themes") or [],
+            "impacts": doc.get("llm_impacts") or gd1.get("impacts") or {},
             "url": doc.get("url") or h.url,
             "foundBy": list(h.legs),
             "denseRank": h.dense_rank,
@@ -267,8 +423,10 @@ def search_articles(query: str, symbol: str | None = None, from_date=None, to_da
         "count": len(articles),
         "rankedBy": f"hybrid: semantic + keyword, fused by RRF (k={rrf_k})",
         "articles": articles,
-        "retrieval": {"mode": "hybrid", "dense_candidates": len(dense), "keyword_candidates": len(sparse),
-                      "ms": round(retrieval_ms, 1)},
+        "retrieval": {
+            "mode": "hybrid", "dense_candidates": len(dense), "keyword_candidates": len(sparse),
+            "ms": round(retrieval_ms, 1), "weights": meta.get("weights"), "degraded": meta.get("degraded"),
+        },
     }
 
 
@@ -302,23 +460,44 @@ def answer_from_news(
     rrf_k: int = RRF_K,
     rerank: bool | None = None,
     reasoning: bool | None = None,
+    theme: str | None = None,
+    impacted_symbol: str | None = None,
 ) -> dict:
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
     use_rerank = RERANK_ENABLED if rerank is None else rerank
     use_reasoning = REASONING_ENABLED if reasoning is None else reasoning
-    t0 = time.perf_counter()
-    dense, sparse, fused = search(
-        question, k=max(k, RERANK_CANDIDATES) if use_rerank else k,
-        symbol=symbol, since=since, until=until, rrf_k=rrf_k
+    retrieval_query, eff_since, eff_until, query_info = prepare_query(
+        question, since=since, until=until, llm=llm,
     )
+
+    t0 = time.perf_counter()
+    cand_k = max(k, RERANK_CANDIDATES) if use_rerank else k
+    search_meta: dict = {}
+    if search is _ORIG_SEARCH:
+        dense, sparse, fused, search_meta = search_with_meta(
+            retrieval_query, k=cand_k, symbol=symbol, since=eff_since, until=eff_until,
+            rrf_k=rrf_k, theme=theme, impacted_symbol=impacted_symbol, coll=coll,
+        )
+    else:
+        dense, sparse, fused = search(
+            retrieval_query, k=cand_k, symbol=symbol, since=eff_since, until=eff_until, rrf_k=rrf_k,
+        )
     t_retrieve = time.perf_counter() - t0
+
+    # Fetch Mongo bodies once and reuse them across rerank + build_context when coll is live.
+    body_docs = _fetch_bodies(fused, coll) if (coll is not None and fused) else None
 
     rerank_info = {"enabled": use_rerank}
     if use_rerank and fused:
         try:
             from rerank import fetch_bodies, rerank as cross_rerank
-            fused, spent = cross_rerank(question, fused, fetch_bodies(coll, fused), k, RERANK_MAX_LEN)
+            raw_bodies = (
+                {mid: d.get("content") or "" for mid, d in body_docs.items()}
+                if body_docs is not None
+                else fetch_bodies(coll, fused)
+            )
+            fused, spent = cross_rerank(retrieval_query, fused, raw_bodies, k, RERANK_MAX_LEN)
             rerank_info.update(candidates=RERANK_CANDIDATES, max_len=RERANK_MAX_LEN, ms=round(spent * 1000, 1))
         except Exception as e:  # noqa: BLE001 - a missing model must not take the answer down
             fused = fused[:k]
@@ -332,11 +511,16 @@ def answer_from_news(
             "refused": True,
             "sources": [],
             "cited": [],
+            "query_info": query_info,
+            "degraded": search_meta.get("degraded") or {},
             "retrieval_ms": round(t_retrieve * 1000, 1),
             "generation_ms": 0.0,
         }
 
-    context, sources = build_context(fused, coll)
+    if build_context is _ORIG_BUILD_CONTEXT and body_docs is not None:
+        context, sources = build_context(fused, coll, preloaded_bodies=body_docs)
+    else:
+        context, sources = build_context(fused, coll)
 
     t1 = time.perf_counter()
     messages = [
@@ -356,16 +540,13 @@ def answer_from_news(
         "refused": False,
         "sources": sources,
         "cited": cited,
-        # S.1 observability. Surfaced rather than acted on: a caller that never sees a
-        # flag cannot notice the day the corpus starts getting poisoned, and silently
-        # dropping the answer would give an attacker a denial-of-service instead.
+        "query_info": query_info,
+        "degraded": search_meta.get("degraded") or {},
         "security": {
             "flagged_sources": flagged,
             "answer_problems": check_answer(answer, len(sources), cited),
             "chars_sanitised": sum(s["chars_sanitised"] for s in sources),
         },
-        # Split, not totalled: the two halves have different fixes, and "the answer took
-        # 9 seconds" is not actionable while "8.6s of it was generation" is.
         "retrieval_ms": round(t_retrieve * 1000, 1),
         "generation_ms": round(t_gen * 1000, 1),
         "legs": {"dense": len(dense), "sparse": len(sparse), "fused": len(fused)},

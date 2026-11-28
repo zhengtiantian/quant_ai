@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from .config import DB_PATH
+from .config import DB_PATH, connect_db
 
 DUBLIN = ZoneInfo("Europe/Dublin")
 PAUSE = 1.5                      # seconds between two stocks in a pass
@@ -55,11 +55,9 @@ _started = threading.Event()
 _paused_until = {"t": 0.0}
 
 
-def _conn(path: Optional[Path] = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(path or DB_PATH), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
-    return conn
+def _conn(path: Optional[Path] = None, *, immediate: bool = False) -> sqlite3.Connection:
+    return connect_db(path, immediate=immediate, schema_tag="analysts",
+                      schema_fn=lambda c: c.executescript(SCHEMA))
 
 
 # ------------------------------------------------------------------ ratings in plain words
@@ -192,7 +190,7 @@ def fetch(symbol: str) -> Dict[str, Any]:
 def store(symbol: str, data: Dict[str, Any], path: Optional[Path] = None) -> int:
     """Write a fetch; returns how many changes were not stored before."""
     now = time.time()
-    conn = _conn(path)
+    conn = _conn(path, immediate=True)
     try:
         before = conn.execute("SELECT COUNT(*) FROM analyst_actions WHERE symbol = ?", (symbol,)).fetchone()[0]
         conn.executemany(
@@ -206,20 +204,28 @@ def store(symbol: str, data: Dict[str, Any], path: Optional[Path] = None) -> int
         conn.execute("INSERT INTO analyst_summary(symbol, data, fetched_at, error, error_at) VALUES (?, ?, ?, NULL, NULL) "
                      "ON CONFLICT(symbol) DO UPDATE SET data = excluded.data, fetched_at = excluded.fetched_at, "
                      "error = NULL, error_at = NULL", (symbol, json.dumps(data["summary"]), now))
-        conn.commit()
         after = conn.execute("SELECT COUNT(*) FROM analyst_actions WHERE symbol = ?", (symbol,)).fetchone()[0]
+        conn.execute("COMMIT")
+        return after - before
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
-    return after - before
 
 
 def _store_error(symbol: str, message: str, path: Optional[Path] = None) -> None:
-    conn = _conn(path)
+    conn = _conn(path, immediate=True)
     try:
         conn.execute("INSERT INTO analyst_summary(symbol, error, error_at) VALUES (?, ?, ?) "
                      "ON CONFLICT(symbol) DO UPDATE SET error = excluded.error, error_at = excluded.error_at",
                      (symbol, message[:300], time.time()))
-        conn.commit()
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
 

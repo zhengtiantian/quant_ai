@@ -31,7 +31,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from . import global_markets, portfolio as pf
-from .config import DB_PATH
+from .config import DB_PATH, connect_db
 
 BARS_URL = "https://ts-api.cnbc.com/harmony/app/bars/{sym}/1D/{start}000000/{end}235959/adjusted/EST5EDT.json"
 OPS = (">=", "<=", "abs>=", "abs<=")
@@ -51,10 +51,7 @@ CREATE INDEX IF NOT EXISTS idx_pred_brief ON predictions(brief_id);
 
 
 def _conn(path: Optional[Path] = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(path or DB_PATH), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
-    return conn
+    return connect_db(path, schema_tag="predictions", schema_fn=lambda c: c.executescript(SCHEMA))
 
 
 # ---------------------------------------------------------------- what may be predicted

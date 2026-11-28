@@ -29,7 +29,7 @@ from .lot_advisor import SEMI_MEMORY_CLUSTER
 MAX_SYMBOL_PCT = float(os.getenv("RISK_MAX_SYMBOL_PCT", "30"))
 MAX_CLUSTER_PCT = float(os.getenv("RISK_MAX_CLUSTER_PCT", "70"))
 MIN_CASH_PCT = float(os.getenv("RISK_MIN_CASH_PCT", "10"))
-MIN_SPACING_ATR, EVENT_SPACING_ATR = 1.5, 2.0
+MIN_SPACING_ATR, EVENT_SPACING_ATR, PANIC_SPACING_ATR = 1.5, 2.0, 3.0
 
 
 def exposure(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -52,7 +52,8 @@ def trim_shares(quantity: float, mv: float, total: float, cap_pct: float = MAX_S
 
 
 def gate(order: Dict[str, Any], ex: Dict[str, Any], held: float = 0.0, atr: Optional[float] = None,
-         lowest_lot: Optional[float] = None, stabilized: Optional[bool] = None, event_7d: bool = False) -> Dict[str, Any]:
+         lowest_lot: Optional[float] = None, stabilized: Optional[bool] = None, event_7d: bool = False,
+         market_panic: bool = False, panic_reason: str = "", panic_reason_zh: str = "") -> Dict[str, Any]:
     """order {symbol, side, shares, limit}. Returns the order as the portfolio can take it: allowed,
     shares (possibly fewer), blocked_by (rule codes) and notes (one line each, shown to the user)."""
     sym, side, limit = order["symbol"], order["side"], float(order["limit"])
@@ -66,12 +67,16 @@ def gate(order: Dict[str, Any], ex: Dict[str, Any], held: float = 0.0, atr: Opti
             blocked.append("shares")
         return {**order, "shares": shares, "allowed": not blocked, "blocked_by": blocked, "notes": notes, "notes_zh": notes_zh}
 
+    if market_panic:
+        blocked.append("market_panic")
+        notes.append("Market panic / sector stress active: dip-adds paused" + (f" ({panic_reason})" if panic_reason else ""))
+        notes_zh.append("市场恐慌 / 板块踩踏压力中，暂缓抄底补仓" + (f"（{panic_reason_zh}）" if panic_reason_zh else ""))
     if stabilized is False:
         blocked.append("falling")
         notes.append("Not stabilised after a large drop: no buys yet")
         notes_zh.append("大跌后尚未企稳，暂不买入")
     if atr and lowest_lot:
-        need = EVENT_SPACING_ATR if event_7d else MIN_SPACING_ATR
+        need = PANIC_SPACING_ATR if market_panic else (EVENT_SPACING_ATR if event_7d else MIN_SPACING_ATR)
         ceiling = round(lowest_lot - need * atr, 2)
         if limit > ceiling:
             blocked.append("spacing")

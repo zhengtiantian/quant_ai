@@ -43,7 +43,7 @@ from zoneinfo import ZoneInfo
 
 from . import advisor, events
 from . import portfolio as pf
-from .config import DB_PATH
+from .config import DATA_DIR, DB_PATH, connect_db
 
 NEW_YORK = ZoneInfo("America/New_York")
 DUBLIN = ZoneInfo("Europe/Dublin")
@@ -376,10 +376,7 @@ _collecting: Dict[str, bool] = {"l2": False, "l3": False}
 
 def _conn(path: Optional[Path] = None) -> sqlite3.Connection:
     pf.init_db(path)
-    conn = sqlite3.connect(str(path or DB_PATH), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
-    return conn
+    return connect_db(path, schema_tag="catalysts", schema_fn=lambda c: c.executescript(SCHEMA))
 
 
 def _us_today() -> date:
@@ -800,7 +797,10 @@ def collect_l2_extracted(days: int = 45, path: Optional[Path] = None, today: Opt
         for sym in stock_syms:
             per_sym = 0
             for item in (rss_map.get(sym) or []) + (mongo_map.get(sym) or []) + (sec_map.get(sym) or []):
-                title = screen((item.get("title") or "").strip()).text
+                sc = screen((item.get("title") or "").strip())
+                if sc.flags:
+                    print(f"[catalysts] L2 injection flags={sc.flags} symbol={sym}")
+                title = sc.text
                 t_key = f"{sym}:{title[:60].lower()}"
                 if not title or t_key in seen_titles:
                     continue
@@ -998,7 +998,10 @@ def _collect_l3_thematic_web_fallback(
     for sub_l in nested:
         for it in sub_l:
             u = it.get("url") or ""
-            t = screen((it.get("title") or "").strip()).text
+            sc = screen((it.get("title") or "").strip())
+            if sc.flags:
+                print(f"[catalysts] L3 injection flags={sc.flags} url={u[:80]}")
+            t = sc.text
             if not t or not u or u in seen_u or LAW_FIRM_AD_RE.search(t):
                 continue
             seen_u.add(u)

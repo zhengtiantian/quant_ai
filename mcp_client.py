@@ -28,6 +28,40 @@ QUANT_MCP_SERVER = os.getenv(
 STARTUP_TIMEOUT = float(os.getenv("QUANT_MCP_STARTUP_TIMEOUT", "30"))
 CALL_TIMEOUT = float(os.getenv("QUANT_MCP_CALL_TIMEOUT", "60"))
 
+FORWARDED_ENV_KEYS: tuple[str, ...] = (
+    "QUANT_API",
+    "MARKETS_URL",
+    "LOCAL_MONGO_URI",
+    "FEATURE_DB_NAME",
+    "QUANT_MCP_TIMEOUT",
+    "QDRANT_URL",
+    "LM_STUDIO_URL",
+    "NEWS_RERANK",
+    "KEYCLOAK_URL",
+    "KEYCLOAK_REALM",
+    "QUANT_AI_CLIENT_ID",
+    "QUANT_AI_CLIENT_SECRET",
+    "QUANT_AI_TOKEN_TIMEOUT",
+    "QUANT_MCP_ALLOWED_JUDGES",
+)
+
+# Eval-only / write tools are hidden from autonomous research agents by default.
+EVAL_ONLY_TOOLS: frozenset[str] = frozenset({"get_eval_batch", "submit_judgment"})
+
+
+def _build_subprocess_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Build subprocess environment forwarding platform & auth configuration."""
+    if base_env is None:
+        from mcp.client.stdio import get_default_environment
+        env = get_default_environment()
+    else:
+        env = dict(base_env)
+    for key in FORWARDED_ENV_KEYS:
+        value = os.getenv(key)
+        if value:
+            env[key] = value
+    return env
+
 
 class MCPToolClient:
     """Owns one long-lived MCP session on a private event loop thread."""
@@ -44,26 +78,56 @@ class MCPToolClient:
 
     # -- lifecycle ----------------------------------------------------------
 
-    def start(self) -> None:
-        """Spawn the server and complete the handshake. Idempotent."""
-        with self._lock:
-            if self._thread is not None:
-                self._ready.wait(STARTUP_TIMEOUT)
-                if self._error:
-                    raise RuntimeError(f"MCP session failed: {self._error}")
-                return
-            self._thread = threading.Thread(
-                target=self._run, name="mcp-client", daemon=True
-            )
-            self._thread.start()
+    def _reset_locked(self) -> None:
+        self._stop.set()
+        self._thread = None
+        self._loop = None
+        self._session = None
+        self._error = None
+        self._ready.clear()
+        self._stop.clear()
 
-        if not self._ready.wait(STARTUP_TIMEOUT):
+    def _is_dead_locked(self) -> bool:
+        if self._thread is None:
+            return False
+        if not self._thread.is_alive():
+            return True
+        if self._error is not None:
+            return True
+        if self._loop is not None and self._loop.is_closed():
+            return True
+        return False
+
+    def start(self) -> None:
+        """Spawn the server and complete the handshake. Idempotent & self-healing."""
+        with self._lock:
+            if self._is_dead_locked():
+                self._reset_locked()
+            if self._thread is not None:
+                thread_ready = self._ready
+                err = self._error
+                t = self._thread
+            else:
+                self._thread = threading.Thread(
+                    target=self._run, name="mcp-client", daemon=True
+                )
+                self._thread.start()
+                thread_ready = self._ready
+                t = self._thread
+                err = None
+
+        if not thread_ready.wait(STARTUP_TIMEOUT):
+            with self._lock:
+                self._reset_locked()
             raise RuntimeError(
                 f"MCP server did not become ready within {STARTUP_TIMEOUT}s "
                 f"({QUANT_MCP_PYTHON} {QUANT_MCP_SERVER})"
             )
-        if self._error:
-            raise RuntimeError(f"MCP session failed: {self._error}")
+        if err or self._error or not t.is_alive():
+            detail = err or self._error or "subprocess exited unexpectedly"
+            with self._lock:
+                self._reset_locked()
+            raise RuntimeError(f"MCP session failed: {detail}")
 
     def _run(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -78,18 +142,9 @@ class MCPToolClient:
 
     async def _serve(self) -> None:
         from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import get_default_environment, stdio_client
+        from mcp.client.stdio import stdio_client
 
-        # stdio_client hands the subprocess only a safe subset of the environment, so our
-        # own configuration has to be forwarded by name. Without this the server silently
-        # falls back to its defaults — which happen to match ours, so a misconfigured
-        # QUANT_API would look like it worked while reading the wrong instance.
-        env = get_default_environment()
-        for key in ("QUANT_API", "LOCAL_MONGO_URI", "FEATURE_DB_NAME", "QUANT_MCP_TIMEOUT"):
-            value = os.getenv(key)
-            if value:
-                env[key] = value
-
+        env = _build_subprocess_env()
         params = StdioServerParameters(
             command=QUANT_MCP_PYTHON, args=[QUANT_MCP_SERVER], env=env
         )
@@ -97,17 +152,19 @@ class MCPToolClient:
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 listed = await session.list_tools()
-                self._tools = [
-                    {
+                tools_out = []
+                for t in listed.tools:
+                    ann = getattr(t, "annotations", None)
+                    ro_hint = getattr(ann, "readOnlyHint", None) if ann is not None else None
+                    tools_out.append({
                         "name": t.name,
                         "description": (t.description or "").strip(),
                         "input_schema": t.inputSchema or {"type": "object", "properties": {}},
-                    }
-                    for t in listed.tools
-                ]
+                        "read_only": True if ro_hint is None else bool(ro_hint),
+                    })
+                self._tools = tools_out
                 self._session = session
                 self._ready.set()
-                # Hold the session open until shutdown.
                 while not self._stop.is_set():
                     await asyncio.sleep(0.2)
 
@@ -120,24 +177,29 @@ class MCPToolClient:
         self.start()
         return list(self._tools)
 
-    def openai_tools(self) -> list[dict]:
-        """MCP tool defs rendered as OpenAI-compatible function tools."""
-        return [
-            {
+    def openai_tools(self, include_eval: bool = False) -> list[dict]:
+        """MCP tool defs rendered as OpenAI-compatible function tools.
+
+        Excludes eval/write tools by default so autonomous research agents stay strictly read-only.
+        """
+        tools = []
+        for t in self.list_tools():
+            if not include_eval:
+                if t["name"] in EVAL_ONLY_TOOLS or t.get("read_only") is False:
+                    continue
+            tools.append({
                 "type": "function",
                 "function": {
                     "name": t["name"],
                     "description": t["description"],
                     "parameters": t["input_schema"],
                 },
-            }
-            for t in self.list_tools()
-        ]
+            })
+        return tools
 
-    def call_tool(self, name: str, args: dict) -> str:
-        """Invoke a tool and return its text content (blocking)."""
+    def _invoke_once(self, name: str, args: dict) -> str:
         self.start()
-        if self._loop is None or self._session is None:
+        if self._loop is None or self._session is None or self._loop.is_closed():
             raise RuntimeError("MCP session is not running")
         future = asyncio.run_coroutine_threadsafe(
             self._session.call_tool(name, args), self._loop
@@ -149,6 +211,15 @@ class MCPToolClient:
             if getattr(block, "type", None) == "text"
         ]
         return "\n".join(parts) if parts else ""
+
+    def call_tool(self, name: str, args: dict) -> str:
+        """Invoke a tool and return its text content (blocking), reconnecting once on dead pipe."""
+        try:
+            return self._invoke_once(name, args)
+        except Exception:  # noqa: BLE001 - retry once after clean reset if session died
+            with self._lock:
+                self._reset_locked()
+            return self._invoke_once(name, args)
 
 
 _client: MCPToolClient | None = None

@@ -110,6 +110,18 @@ class ModelAdviceTest(unittest.TestCase):
         add_b = [n["zh"] for n in b["notes"] if n["section"] == "add"]
         self.assertTrue(any("$43.86 或更低" in n and "3 倍 ATR" in n for n in add_b))
 
+    def test_driver_type_tags_on_drop_causes(self):
+        f = forecast(reliable=False)
+        f["symbols"]["INTC"]["events"] = [
+            {"date": "2026-11-20", "ret_pct": -6.8, "driver_type": "sector_macro",
+             "cause_en": "No company-specific catalyst; fell with chip peers.",
+             "cause_zh": "无公司特定消息，随半导体板块共振下跌。", "sources": []},
+        ]
+        a = model_advice.render("INTC", HOLD, STATS, 64.44, 0.0, f)
+        why = [n for n in a["notes"] if n["section"] == "why"]
+        self.assertIn("[Sector/Macro]", why[0]["en"])
+        self.assertIn("【板块共振】", why[0]["zh"])
+
 
 if __name__ == "__main__":
     unittest.main()

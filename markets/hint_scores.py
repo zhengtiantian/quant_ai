@@ -25,13 +25,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from .config import DB_PATH
+from .config import DB_PATH, connect_db
 
 NY = ZoneInfo("America/New_York")
 HORIZONS = (5, 20, 60)                 # sessions
 PROBE_AFTER = (16, 10)                 # New York time; the close is in
 SCORE_EVERY = 3600                     # seconds between scoring passes
-CODES = ("falling", "spacing", "size")  # risk_rules.gate's refusals
+CODES = ("falling", "spacing", "size", "market_panic")  # risk_rules.gate's refusals
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS hint_log (
@@ -55,10 +55,7 @@ _state: Dict[str, Any] = {"probed_day": None, "scored_at": 0.0}
 
 
 def _conn(path: Optional[Path] = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(path or DB_PATH), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
-    return conn
+    return connect_db(path, schema_tag="hint_scores", schema_fn=lambda c: c.executescript(SCHEMA))
 
 
 def record(kind: str, symbol: str, day: str, held: bool, ref_price: Optional[float], codes: List[str],
@@ -106,13 +103,37 @@ def _session_day(chart_fn: Callable[..., Dict[str, Any]], now: datetime) -> Opti
 def probe(state: Dict[str, Any], path: Optional[Path] = None,
           analyze: Optional[Callable[..., Dict[str, Any]]] = None,
           stats_fn: Optional[Callable[..., Dict[str, Any]]] = None,
-          catalysts_fn: Optional[Callable[..., List[Dict[str, Any]]]] = None) -> List[Dict[str, Any]]:
+          catalysts_fn: Optional[Callable[..., List[Dict[str, Any]]]] = None,
+          market_state: Optional[Dict[str, Any]] = None,
+          market_fn: Optional[Callable[[], Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """The buy gate for one unit of every held and watched stock at its current price, as daily_action
     asks it for its pilot. Returns one entry per stock: symbol, held, price, allowed, codes, notes."""
     from . import lot_advisor, risk_rules
+    is_default_prod = analyze is None and stats_fn is None
     analyze = analyze or lot_advisor.analyze_symbol
     stats_fn = stats_fn or lot_advisor._bar_stats
     catalysts_fn = catalysts_fn or lot_advisor._upcoming_7d_catalysts
+
+    mkt: Dict[str, Any] = {}
+    if market_state is not None:
+        mkt = market_state
+    elif market_fn is not None:
+        try:
+            mkt = market_fn() or {}
+        except Exception:  # noqa: BLE001
+            mkt = {}
+    elif is_default_prod:
+        try:
+            from . import risk_budget
+            mkt = risk_budget.market_state(path=path) or {}
+        except Exception:  # noqa: BLE001
+            mkt = {}
+
+    panic = bool(mkt.get("tighten_buys"))
+    panic_en = str(mkt.get("headline_en") or "")
+    panic_zh = str(mkt.get("headline_zh") or "")
+    vix_val = (mkt.get("vix") or {}).get("price") if isinstance(mkt.get("vix"), dict) else mkt.get("vix_level")
+
     ex = risk_rules.exposure(state)
     out = []
     held = {h["symbol"]: h for h in state.get("holdings") or []}
@@ -130,9 +151,11 @@ def probe(state: Dict[str, Any], path: Optional[Path] = None,
         events = [c for c in advice.get("catalysts_7d") or [] if c.get("impact") == "high"]
         g = risk_rules.gate({"symbol": sym, "side": "buy", "shares": 1, "limit": price}, ex, held=float(h.get("quantity") or 0.0),
                             atr=stats.get("atr14"), lowest_lot=(advice.get("dip_guardrail") or {}).get("anchor_cost"),
-                            stabilized=stats.get("stabilized"), event_7d=bool(events))
+                            stabilized=stats.get("stabilized"), event_7d=bool(events),
+                            market_panic=panic, panic_reason=panic_en, panic_reason_zh=panic_zh)
         out.append({"symbol": sym, "held": True, "price": price, "allowed": g["allowed"], "codes": g["blocked_by"],
-                    "notes": g["notes"], "notes_zh": g.get("notes_zh") or g["notes"], "stats": stats})
+                    "notes": g["notes"], "notes_zh": g.get("notes_zh") or g["notes"], "stats": stats,
+                    "market_panic": panic, "vix": vix_val})
     for w in watched:
         sym = w["symbol"]
         price = float((w.get("quote") or {}).get("price") or 0.0)
@@ -145,9 +168,11 @@ def probe(state: Dict[str, Any], path: Optional[Path] = None,
             out.append({"symbol": sym, "held": False, "price": price, "allowed": None, "error": f"{type(e).__name__}: {e}"})
             continue
         g = risk_rules.gate({"symbol": sym, "side": "buy", "shares": 1, "limit": price}, ex, held=0.0, atr=stats.get("atr14"),
-                            lowest_lot=None, stabilized=stats.get("stabilized"), event_7d=bool(events))
+                            lowest_lot=None, stabilized=stats.get("stabilized"), event_7d=bool(events),
+                            market_panic=panic, panic_reason=panic_en, panic_reason_zh=panic_zh)
         out.append({"symbol": sym, "held": False, "price": price, "allowed": g["allowed"], "codes": g["blocked_by"],
-                    "notes": g["notes"], "notes_zh": g.get("notes_zh") or g["notes"], "stats": stats})
+                    "notes": g["notes"], "notes_zh": g.get("notes_zh") or g["notes"], "stats": stats,
+                    "market_panic": panic, "vix": vix_val})
     return out
 
 
@@ -162,7 +187,8 @@ def record_probe(day: str, results: List[Dict[str, Any]], path: Optional[Path] =
             continue
         stats = r.get("stats") or {}
         detail = {"notes": r.get("notes"), "notes_zh": r.get("notes_zh"),
-                  "atr14": stats.get("atr14"), "drop_1d_atr": stats.get("drop_1d_atr"), "stabilized": stats.get("stabilized")}
+                  "atr14": stats.get("atr14"), "drop_1d_atr": stats.get("drop_1d_atr"), "stabilized": stats.get("stabilized"),
+                  "market_panic": r.get("market_panic"), "vix": r.get("vix")}
         added = record("add_block", r["symbol"], day, r["held"], r["price"], r.get("codes") or [], detail, path)
         if added and r["held"] and prev is not None and not blocked_on(r["symbol"], prev, path=path):
             newly.append(r["symbol"])
@@ -227,17 +253,26 @@ def _side(values: List[float]) -> Dict[str, Any]:
             "net": round(-sum(values) / len(values), 2) if values else None}
 
 
-def summary(path: Optional[Path] = None) -> Dict[str, Any]:
+def summary(path: Optional[Path] = None, held_only: bool = False) -> Dict[str, Any]:
     """Per kind and refusal: how often the stock fell or rose afterwards and by how much on average."""
     conn = _conn(path)
     try:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM hint_log").fetchall()]
+        sql = "SELECT * FROM hint_log" + (" WHERE held = 1" if held_only else "")
+        rows = [dict(r) for r in conn.execute(sql).fetchall()]
     finally:
         conn.close()
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for r in rows:
         codes = json.loads(r["codes"] or "[]")
         keys = [r["kind"]] + ([f"{r['kind']}:{c}" for c in codes] if r["kind"] == "add_block" else [])
+        if r["kind"] == "devils_advocate":
+            try:
+                det = json.loads(r.get("detail") or "{}")
+            except (TypeError, ValueError):
+                det = {}
+            strength = det.get("strength") if isinstance(det, dict) else None
+            if strength in ("strong", "moderate", "weak"):
+                keys.append(f"devils_advocate:{strength}")
         for k in keys:
             groups.setdefault(k, []).append(r)
     out = {}
@@ -246,7 +281,7 @@ def summary(path: Optional[Path] = None) -> Dict[str, Any]:
                   "horizons": {str(h): {"own": _side([r[f"r{h}"] for r in rs if r[f"r{h}"] is not None]),
                                         "vs_spy": _side([r[f"x{h}"] for r in rs if r[f"x{h}"] is not None])}
                                for h in HORIZONS}}
-    return {"groups": out, "labels": LABELS}
+    return {"groups": out, "labels": LABELS, "held_only": bool(held_only), "total_rows": len(rows)}
 
 
 # The page's fixed words in both languages, so the front end carries no Chinese of its own.
@@ -259,8 +294,17 @@ LABELS = {
     "add_block:falling": {"en": "Not stabilised after a drop", "zh": "大跌后未企稳"},
     "add_block:spacing": {"en": "Too close to the cheapest lot", "zh": "离最便宜的一批太近"},
     "add_block:size": {"en": "No cash or room under a cap", "zh": "现金或仓位上限不够"},
+    "add_block:market_panic": {"en": "Market panic / sector stress", "zh": "市场恐慌 / 板块踩踏暂停补仓"},
     "devils_advocate": {"en": "Devil's advocate", "zh": "反方审讯"},
+    "devils_advocate:strong": {"en": "Devil's advocate (strong)", "zh": "反方审讯（强）"},
+    "devils_advocate:moderate": {"en": "Devil's advocate (moderate)", "zh": "反方审讯（中）"},
+    "devils_advocate:weak": {"en": "Devil's advocate (weak)", "zh": "反方审讯（弱）"},
+    "portfolio_review_flag": {"en": "Portfolio review agent (flagged)", "zh": "组合复核标疑（第二意见）"},
     "filing_change": {"en": "Risk factors rewritten (10-K / 10-Q)", "zh": "风险因素大改（10-K / 10-Q）"},
+    "all_rows": {"en": "All (held + watch)", "zh": "全部（持仓+自选）"},
+    "held_only": {"en": "Held only", "zh": "仅看持仓"},
+    "metric_own": {"en": "Absolute return", "zh": "绝对涨跌"},
+    "metric_spy": {"en": "vs SPY excess", "zh": "相对 SPY 超额"},
     "fired": {"en": "fired", "zh": "次"},
     "loss_avoided": {"en": "loss avoided", "zh": "少亏"},
     "gain_missed": {"en": "gain missed", "zh": "错过的涨幅"},
@@ -288,7 +332,12 @@ def run_due(now: Optional[datetime] = None, path: Optional[Path] = None,
             _state["probed_day"] = now.date().isoformat()
             if day:
                 st = pf.get_state(path=path, cached_quotes=True)
-                newly = record_probe(day, probe(st, path), path)
+                try:
+                    from . import risk_budget
+                    mkt = risk_budget.market_state(path=path) or {}
+                except Exception:  # noqa: BLE001
+                    mkt = {}
+                newly = record_probe(day, probe(st, path, market_state=mkt), path)
                 did["probed"], did["newly_blocked"] = day, newly
                 if newly:
                     from . import devils_advocate

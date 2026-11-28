@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from .config import DB_PATH
+from .config import DB_PATH, connect_db
 
 NY = ZoneInfo("America/New_York")
 AUTO_PER_DAY = 6
@@ -64,7 +64,8 @@ NEWS_DRIFTS = [
     "after a fall of 5% or more with bad news: -0.66% over 20 sessions (t -1.2, not significant)",
 ]
 GATE_WORDS = {"falling": "not stabilised after a large drop", "spacing": "too close to the cheapest lot already held",
-              "size": "no cash or room under a position cap"}
+              "size": "no cash or room under a position cap",
+              "market_panic": "market panic / sector stress active"}
 
 SYSTEM = (
     "You are the devil's advocate an investor consults before buying more of a stock that is falling. "
@@ -118,6 +119,7 @@ LABELS = {
     "manual": {"en": "asked on the page", "zh": "手动生成"},
     "big_drop": {"en": "after a drop of 2 x ATR or more", "zh": "大跌 ≥2 倍 ATR 后自动生成"},
     "add_block": {"en": "when the buy gate began refusing an add", "zh": "补仓开始被拦截时自动生成"},
+    "local_fallback": {"en": "Local 9B fallback", "zh": "本地模型降级生成"},
     "hint": {"en": "A hint: the action and the advice are unchanged.", "zh": "仅作提示：操作建议不变。"},
 }
 
@@ -128,10 +130,7 @@ _watch: Dict[str, Any] = {"at": 0.0}
 
 
 def _conn(path: Optional[Path] = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(path or DB_PATH), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(TABLE)
-    return conn
+    return connect_db(path, schema_tag="devils_advocate", schema_fn=lambda c: c.executescript(TABLE))
 
 
 def _today() -> str:
@@ -217,7 +216,8 @@ def _finish(rid: int, status: str, path: Optional[Path], **cols: Any) -> None:
 # ------------------------------------------------------------------ the packet
 
 def packet(symbol: str, path: Optional[Path] = None, state: Optional[Dict[str, Any]] = None,
-           news_fn=None, analysts_fn=None, judgment_fn=None, release_fn=None, filing_fn=None) -> Tuple[str, Dict[str, Dict[str, Any]], Dict[str, Any]]:
+           news_fn=None, analysts_fn=None, judgment_fn=None, release_fn=None, filing_fn=None,
+           market_fn=None) -> Tuple[str, Dict[str, Dict[str, Any]], Dict[str, Any]]:
     """The text Claude reads, the citable ids behind it, and the facts kept with the answer."""
     from . import daily_action, lot_advisor, risk_rules
     from . import portfolio as pf
@@ -236,6 +236,22 @@ def packet(symbol: str, path: Optional[Path] = None, state: Optional[Dict[str, A
         ids[k] = {"text": text}
         facts.append(f"{k} {text}")
 
+    mkt: Dict[str, Any] = {}
+    if market_fn is not None:
+        try:
+            mkt = market_fn() or {}
+        except Exception:  # noqa: BLE001
+            mkt = {}
+    elif state is None:
+        try:
+            from . import risk_budget
+            mkt = risk_budget.market_state(path=path) or {}
+        except Exception:  # noqa: BLE001
+            mkt = {}
+    elif isinstance(st.get("market"), dict):
+        mkt = st["market"]
+    market_panic = bool(mkt.get("tighten_buys"))
+
     lines = [f"STOCK {symbol} ({quote.get('name') or ''}); {'held' if holding else 'watched, not held'}"]
     stats: Dict[str, Any] = {}
     gate_words: List[str] = []
@@ -250,10 +266,19 @@ def packet(symbol: str, path: Optional[Path] = None, state: Optional[Dict[str, A
         if price:
             g = risk_rules.gate({"symbol": symbol, "side": "buy", "shares": 1, "limit": price}, risk_rules.exposure(st),
                                 held=float((holding or {}).get("quantity") or 0.0), atr=stats.get("atr14"), lowest_lot=anchor,
-                                stabilized=stats.get("stabilized"), event_7d=any(c.get("impact") == "high" for c in cats))
+                                stabilized=stats.get("stabilized"), event_7d=any(c.get("impact") == "high" for c in cats),
+                                market_panic=market_panic, panic_reason=str(mkt.get("headline_en") or ""),
+                                panic_reason_zh=str(mkt.get("headline_zh") or ""))
             gate_words = [GATE_WORDS.get(c, c) for c in g["blocked_by"]]
     except Exception as e:  # noqa: BLE001 - the packet goes without bars rather than not at all
         lines.append(f"(price bars unavailable: {type(e).__name__})")
+    if mkt and any(k in mkt for k in ("vix", "vix_level", "sox_1d_pct", "tighten_buys", "headline_en", "severity")):
+        vix_val = (mkt.get("vix") or {}).get("price") if isinstance(mkt.get("vix"), dict) else mkt.get("vix_level")
+        sox_1d = mkt.get("sox_1d_pct")
+        fact(
+            f"Market weather ({mkt.get('severity') or 'info'}, tighten_buys={market_panic}): "
+            f"VIX={vix_val}, SOX_1D={sox_1d}%, {mkt.get('headline_en') or ''}."
+        )
     if stats:
         lines.append(f"TODAY: move vs the previous close {stats.get('drop_1d_pct')}%, {stats.get('drop_1d_atr')} x ATR14 down "
                      f"(ATR14 = {stats.get('atr14_pct')}% of the price); 3 sessions {stats.get('drop_3d_pct')}%; "
@@ -406,22 +431,80 @@ def _news(symbol: str) -> List[Dict[str, Any]]:
 
 # ------------------------------------------------------------------ Claude
 
+def _local_schema_error(obj: Any) -> Optional[str]:
+    if not isinstance(obj, dict):
+        return "response must be a JSON object"
+    for key in ("summary", "base_rate", "would_weaken"):
+        val = obj.get(key)
+        if not isinstance(val, dict) or not str(val.get("zh") or "").strip() or not str(val.get("en") or "").strip():
+            return f"`{key}` must have non-empty `zh` and `en` strings"
+    pts = obj.get("points")
+    if not isinstance(pts, list) or not (1 <= len(pts) <= 3):
+        return "`points` must be a list of 1..3 items"
+    for i, p in enumerate(pts):
+        if not isinstance(p, dict) or not str(p.get("zh") or "").strip() or not str(p.get("en") or "").strip():
+            return f"points[{i}] must have `zh` and `en` strings"
+        if not isinstance(p.get("cites"), list) or not p["cites"]:
+            return f"points[{i}].cites must be a non-empty list of IDs"
+    if obj.get("strength") not in ("strong", "moderate", "weak"):
+        return "`strength` must be strong, moderate, or weak"
+    return None
+
+
+def _ask_local_fallback(prompt: str) -> Dict[str, Any]:
+    """Falls back to local Qwen via shared grounding.run_structured_gate when Claude CLI fails."""
+    import grounding
+    from agent import _chat, _content
+
+    sys_p = (
+        SYSTEM
+        + "\nReply with valid JSON matching this schema: "
+        '{"summary":{"zh":"...","en":"..."},"base_rate":{"zh":"...","en":"..."},'
+        '"points":[{"zh":"...","en":"...","cites":["F1","A1"]}],'
+        '"would_weaken":{"zh":"...","en":"..."},"strength":"strong|moderate|weak"}. '
+        "JSON only."
+    )
+    messages = [{"role": "system", "content": sys_p}, {"role": "user", "content": prompt}]
+    parsed, err = grounding.run_structured_gate(
+        messages,
+        _chat,
+        _content,
+        _local_schema_error,
+        max_repairs=1,
+        assistant_prefill="<think>\n\n</think>\n\n",
+    )
+    if parsed is None:
+        raise RuntimeError(f"local fallback failed: {err}")
+    return {"structured_output": parsed, "engine": "local_fallback"}
+
+
 def ask(prompt: str) -> Dict[str, Any]:
-    """One `claude -p` call on the subscription, no tools, answer in SCHEMA."""
+    """One `claude -p` call on the subscription, with automatic local-LLM fallback if unavailable."""
     from .briefs import find_claude
     binary = find_claude()
-    if not binary:
-        raise RuntimeError("claude CLI not found (set CLAUDE_BIN)")
-    env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
-    cmd = [binary, "-p", "--output-format", "json", "--json-schema", json.dumps(SCHEMA), "--tools", "",
-           "--strict-mcp-config", "--no-session-persistence", "--system-prompt", SYSTEM]
-    if MODEL:
-        cmd += ["--model", MODEL]
-    with tempfile.TemporaryDirectory(prefix="devils-advocate-") as cwd:
-        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=TIMEOUT_S, cwd=cwd, env=env)
-    if r.returncode != 0:
-        raise RuntimeError(f"claude exited {r.returncode}: {(r.stderr or r.stdout)[:300]}")
-    return json.loads(r.stdout)
+    claude_err: Optional[str] = None
+    if binary:
+        env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+        cmd = [binary, "-p", "--output-format", "json", "--json-schema", json.dumps(SCHEMA), "--tools", "",
+               "--strict-mcp-config", "--no-session-persistence", "--system-prompt", SYSTEM]
+        if MODEL:
+            cmd += ["--model", MODEL]
+        try:
+            with tempfile.TemporaryDirectory(prefix="devils-advocate-") as cwd:
+                r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=TIMEOUT_S, cwd=cwd, env=env)
+            if r.returncode == 0:
+                out = json.loads(r.stdout)
+                out.setdefault("engine", "claude")
+                return out
+            claude_err = f"claude exited {r.returncode}: {(r.stderr or r.stdout)[:300]}"
+        except Exception as e:  # noqa: BLE001
+            claude_err = f"{type(e).__name__}: {e}"
+    else:
+        claude_err = "claude CLI not found (set CLAUDE_BIN)"
+
+    if os.getenv("DEVILS_ADVOCATE_LOCAL_FALLBACK", "1").strip() != "0":
+        return _ask_local_fallback(prompt)
+    raise RuntimeError(claude_err or "claude CLI unavailable")
 
 
 def _answer(res: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -441,13 +524,24 @@ def check(ans: Optional[Dict[str, Any]], ids: Dict[str, Any]) -> List[str]:
     points = ans.get("points") or []
     if not points:
         problems.append("no points")
+    texts: List[str] = []
+    for k in ("summary", "base_rate", "would_weaken"):
+        if isinstance(ans.get(k), dict):
+            texts.extend([str(ans[k].get("en") or ""), str(ans[k].get("zh") or "")])
     for p in points:
         cites = p.get("cites") or []
         if not cites:
             problems.append("a point without citations")
         problems += [f"unknown citation {c}" for c in cites if c not in ids]
+        texts.extend([str(p.get("en") or ""), str(p.get("zh") or "")])
     if ans.get("strength") not in ("strong", "moderate", "weak"):
         problems.append("strength out of range")
+    try:
+        from injection_guard import check_answer
+        sec = [x for x in check_answer("\n".join(texts), n_sources=0, cited=[]) if x != "no_citations"]
+        problems.extend(sec)
+    except Exception:  # noqa: BLE001
+        pass
     return problems
 
 
@@ -463,20 +557,25 @@ def run(rid: int, path: Optional[Path] = None, ask_fn=None, **packet_kw: Any) ->
     if row is None:
         return {}
     text, ids, keep = packet(row["symbol"], path, **packet_kw)
-    ans = _answer(ask_fn(text))
+    raw_res = ask_fn(text)
+    engine = (raw_res or {}).get("engine") or "claude"
+    ans = _answer(raw_res)
     problems, tries = check(ans, ids), 1
     if problems:
-        ans = _answer(ask_fn(text + "\n\nYour previous answer was rejected: " + "; ".join(problems) + ". Answer again in the schema."))
+        raw_res = ask_fn(text + "\n\nYour previous answer was rejected: " + "; ".join(problems) + ". Answer again in the schema.")
+        engine = (raw_res or {}).get("engine") or engine
+        ans = _answer(raw_res)
         problems, tries = check(ans, ids), 2
-    cited = {c: ids[c] for p in (ans or {}).get("points") or [] for c in p.get("cites") or [] if c in ids}
+    cited: Dict[str, Any] = {c: ids[c] for p in (ans or {}).get("points") or [] for c in p.get("cites") or [] if c in ids}
+    cited["_meta"] = {"engine": engine}
     status = "invalid" if problems else "done"
     _finish(rid, status, path, price=keep.get("price"), answer=json.dumps(ans, ensure_ascii=False), cited=json.dumps(cited, ensure_ascii=False),
             problems=json.dumps(problems), packet_chars=len(text), tries=tries)
     if status == "done":
         from . import hint_scores
         hint_scores.record("devils_advocate", row["symbol"], row["day"], bool(keep.get("held")), keep.get("price"), [row["trigger"]],
-                           {"id": rid, "strength": (ans or {}).get("strength"), "gate": keep.get("gate")}, path)
-    return {"id": rid, "status": status, "problems": problems}
+                           {"id": rid, "strength": (ans or {}).get("strength"), "gate": keep.get("gate"), "engine": engine}, path)
+    return {"id": rid, "status": status, "problems": problems, "engine": engine}
 
 
 # ------------------------------------------------------------------ reading and the background check
@@ -484,11 +583,13 @@ def run(rid: int, path: Optional[Path] = None, ask_fn=None, **packet_kw: Any) ->
 def _public(r: sqlite3.Row) -> Dict[str, Any]:
     ans = json.loads(r["answer"]) if r["answer"] else None
     cited = json.loads(r["cited"]) if r["cited"] else {}
+    engine = (cited.get("_meta") or {}).get("engine") or "claude"
     return {"id": r["id"], "symbol": r["symbol"], "day": r["day"], "trigger": r["trigger"], "status": r["status"],
             "requested_at": r["requested_at"], "finished_at": r["finished_at"], "price": r["price"],
             "answer": ans if r["status"] == "done" else None,
             "sources": [{"id": k, **v} for k, v in cited.items() if k.startswith("A")],
             "facts": [{"id": k, **v} for k, v in cited.items() if k.startswith("F")],
+            "engine": engine,
             "error": r["error"]}
 
 

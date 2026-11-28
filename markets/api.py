@@ -127,11 +127,11 @@ def portfolio_filing_changes():
 
 
 @router.get("/portfolio/hint-scores")
-def portfolio_hint_scores():
+def portfolio_hint_scores(held_only: bool = False):
     """Blocked buys and cases against adding, scored against having bought at that session's close (Q.17.0)."""
     from . import hint_scores
     try:
-        return {"status": "success", **hint_scores.summary()}
+        return {"status": "success", **hint_scores.summary(held_only=held_only)}
     except Exception as e:  # noqa: BLE001
         return _error(e, 500)
 

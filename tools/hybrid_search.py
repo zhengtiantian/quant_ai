@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import requests
@@ -52,24 +54,59 @@ SRC_COLL = "news_articles_company_matched_v2"
 
 QUERY_PREFIX = "search_query: "   # pairs with search_document: at index time
 
-# Fusion parameters, left as parameters on purpose.
-#
-# The published default (RRF_K=60, deep candidate lists, equal legs) measurably
-# underperforms *both* single legs on some queries here. RRF scores consensus, and
-# consensus is not relevance: two mediocre ranks beat one excellent one, since
-# 1/(60+60) + 1/(60+36) = 0.0187 against 1/(60+1) = 0.0164. On "memory glut pressures
-# chip makers" that promotes an article about chip factories and Trump over the three
-# sparse hits actually about a memory glut; on the bare ticker "LRCX" both legs rank
-# content-free stub pages ("Lam Research (Nasdaq:LRCX)") consistently, so consensus
-# floats them to the top and hybrid finishes behind dense alone.
-#
-# A smaller RRF_K sharpens the advantage of a top rank; a shallower candidate list
-# stops tail agreement from accumulating; unequal weights let one leg lead. Which
-# combination wins is R.4's question, not something to settle by taste here.
 RRF_K = int(os.getenv("RRF_K", "60"))
 CANDIDATES = int(os.getenv("RRF_CANDIDATES", "100"))   # per leg, before fusion
 W_DENSE = float(os.getenv("RRF_W_DENSE", "1.0"))
 W_SPARSE = float(os.getenv("RRF_W_SPARSE", "1.0"))
+
+_QDRANT_CLIENT = None
+_MONGO_COLL = None
+_STUB_RE = re.compile(
+    r"^\s*[\w\s.,&'/-]{2,50}\(\s*(?:NASDAQ|NYSE|NYSEARCA|AMEX)\s*:\s*[A-Z.\-]{1,8}\s*\)\s*$",
+    re.I,
+)
+
+
+def _get_qdrant_client() -> QdrantClient:
+    global _QDRANT_CLIENT
+    if _QDRANT_CLIENT is None:
+        _QDRANT_CLIENT = QdrantClient(url=QDRANT_URL, timeout=60)
+    return _QDRANT_CLIENT
+
+
+def _get_mongo_coll():
+    global _MONGO_COLL
+    if _MONGO_COLL is None:
+        _MONGO_COLL = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)[DB_NAME][SRC_COLL]
+    return _MONGO_COLL
+
+
+def auto_weights(query: str, w_dense: float | None = None, w_sparse: float | None = None) -> tuple[float, float]:
+    """Adjust dense vs sparse leg weights when callers do not pass explicit weights."""
+    if w_dense is not None and w_sparse is not None:
+        return float(w_dense), float(w_sparse)
+    q = (query or "").strip()
+    tokens = q.split()
+    has_quote = '"' in q
+    has_ticker = any(re.fullmatch(r"[A-Z]{2,5}(?:\.[A-Z])?", t.strip(".,?!()")) for t in tokens)
+    has_digits = any(any(ch.isdigit() for ch in t) for t in tokens)
+    if has_quote or (len(tokens) <= 2 and (has_ticker or has_digits)):
+        wd, ws = 0.85, 1.35
+    elif len(tokens) >= 4:
+        wd, ws = 1.25, 0.85
+    else:
+        wd, ws = W_DENSE, W_SPARSE
+    return (
+        float(w_dense) if w_dense is not None else wd,
+        float(w_sparse) if w_sparse is not None else ws,
+    )
+
+
+def _is_stub_title(title: str | None) -> bool:
+    t = (title or "").strip()
+    if not t:
+        return False
+    return len(t) < 16 or bool(_STUB_RE.match(t))
 
 
 @dataclass
@@ -131,13 +168,18 @@ def _until_for(until, before):
     return day if until is None else (until if day is None else min(until, day))
 
 
-def dense_leg(qc, query, symbol, since, until, limit, before: str | None = None) -> list[Hit]:
+def dense_leg(qc, query, symbol, since, until, limit, before: str | None = None,
+              theme: str | None = None, impacted_symbol: str | None = None) -> list[Hit]:
     until = _until_for(until, before)
     must = []
     if symbol:
         must.append(qm.FieldCondition(key="symbol", match=qm.MatchValue(value=symbol)))
     if since or until:
         must.append(qm.FieldCondition(key="date_int", range=qm.Range(gte=since, lte=until)))
+    if theme:
+        must.append(qm.FieldCondition(key="themes", match=qm.MatchValue(value=theme)))
+    if impacted_symbol:
+        must.append(qm.FieldCondition(key="impacted_symbols", match=qm.MatchValue(value=impacted_symbol.upper())))
     pts = qc.query_points(
         collection_name=COLLECTION,
         query=embed_query(query),
@@ -161,11 +203,23 @@ def dense_leg(qc, query, symbol, since, until, limit, before: str | None = None)
     return out
 
 
-def sparse_leg(coll, query, symbol, since, until, limit, before: str | None = None) -> list[Hit]:
+def sparse_leg(coll, query, symbol, since, until, limit, before: str | None = None,
+               theme: str | None = None, impacted_symbol: str | None = None) -> list[Hit]:
     until = _until_for(until, before)
     q: dict = {"$text": {"$search": query}}
     if symbol:
         q["symbol"] = symbol
+    and_clauses = []
+    if theme:
+        and_clauses.append({"$or": [{"llm_themes": theme}, {"student_gd1.themes": theme}]})
+    if impacted_symbol:
+        sym_u = impacted_symbol.upper()
+        and_clauses.append({"$or": [
+            {f"student_gd1.impacts.{sym_u}": {"$in": [-2, -1, 1, 2]}},
+            {f"llm_impacts.{sym_u}": {"$in": [-2, -1, 1, 2]}},
+        ]})
+    if and_clauses:
+        q["$and"] = and_clauses
 
     # The date window goes into the query, not into a Python loop afterwards.
     #
@@ -265,18 +319,60 @@ def rrf_fuse(dense: list[Hit], sparse: list[Hit], k: int,
         for key, rank in best_rank.items():
             merged[key].rrf += weight / (rrf_k + rank)
 
+    for hit in merged.values():
+        if _is_stub_title(hit.title):
+            hit.rrf *= 0.5
+
     ranked = sorted(merged.values(), key=lambda h: h.rrf, reverse=True)
     return ranked[:k]
 
 
+def search_with_meta(query, k=10, symbol=None, since=None, until=None, candidates=CANDIDATES,
+                     rrf_k=RRF_K, w_dense: float | None = None, w_sparse: float | None = None,
+                     before: str | None = None, theme: str | None = None,
+                     impacted_symbol: str | None = None, qc=None, coll=None) -> tuple[list[Hit], list[Hit], list[Hit], dict]:
+    """Run dense and sparse legs in parallel with auto-weights and single-leg degradation."""
+    qc = qc if qc is not None else _get_qdrant_client()
+    coll = coll if coll is not None else _get_mongo_coll()
+    wd, ws = auto_weights(query, w_dense=w_dense, w_sparse=w_sparse)
+    degraded: dict[str, str] = {}
+    dense: list[Hit] = []
+    sparse: list[Hit] = []
+    dense_err: Exception | None = None
+    sparse_err: Exception | None = None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_dense = pool.submit(dense_leg, qc, query, symbol, since, until, candidates, before,
+                              theme=theme, impacted_symbol=impacted_symbol)
+        f_sparse = pool.submit(sparse_leg, coll, query, symbol, since, until, candidates, before,
+                               theme=theme, impacted_symbol=impacted_symbol)
+        try:
+            dense = f_dense.result()
+        except Exception as e:  # noqa: BLE001
+            dense_err = e
+            degraded["dense_error"] = str(e)[:200]
+        try:
+            sparse = f_sparse.result()
+        except Exception as e:  # noqa: BLE001
+            sparse_err = e
+            degraded["sparse_error"] = str(e)[:200]
+
+    if dense_err is not None and sparse_err is not None:
+        raise dense_err
+    fused = rrf_fuse(dense, sparse, k, rrf_k, wd, ws)
+    return dense, sparse, fused, {"weights": {"dense": wd, "sparse": ws}, "degraded": degraded}
+
+
 def search(query, k=10, symbol=None, since=None, until=None, candidates=CANDIDATES,
-           rrf_k=RRF_K, w_dense=W_DENSE, w_sparse=W_SPARSE, before: str | None = None):
+           rrf_k=RRF_K, w_dense=None, w_sparse=None, before: str | None = None,
+           theme: str | None = None, impacted_symbol: str | None = None):
     """`before` (YYYYMMDDHHMMSS, UTC) keeps only articles published before that moment, in both legs."""
-    qc = QdrantClient(url=QDRANT_URL, timeout=60)
-    coll = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)[DB_NAME][SRC_COLL]
-    dense = dense_leg(qc, query, symbol, since, until, candidates, before)
-    sparse = sparse_leg(coll, query, symbol, since, until, candidates, before)
-    return dense, sparse, rrf_fuse(dense, sparse, k, rrf_k, w_dense, w_sparse)
+    dense, sparse, fused, _ = search_with_meta(
+        query, k=k, symbol=symbol, since=since, until=until, candidates=candidates,
+        rrf_k=rrf_k, w_dense=w_dense, w_sparse=w_sparse, before=before,
+        theme=theme, impacted_symbol=impacted_symbol,
+    )
+    return dense, sparse, fused
 
 
 def _show(label: str, hits: list[Hit], explain: bool) -> None:
@@ -304,11 +400,14 @@ def main() -> None:
     ap.add_argument("--candidates", type=int, default=CANDIDATES)
     ap.add_argument("--w-dense", type=float, default=W_DENSE)
     ap.add_argument("--w-sparse", type=float, default=W_SPARSE)
+    ap.add_argument("--theme")
+    ap.add_argument("--impacted-symbol")
     args = ap.parse_args()
 
     dense, sparse, fused = search(args.query, args.k, args.symbol, args.since,
                                   args.until, args.candidates, args.rrf_k,
-                                  args.w_dense, args.w_sparse)
+                                  args.w_dense, args.w_sparse,
+                                  theme=args.theme, impacted_symbol=args.impacted_symbol)
     print(f'query: "{args.query}"'
           + (f"  symbol={args.symbol}" if args.symbol else "")
           + (f"  since={args.since}" if args.since else ""))

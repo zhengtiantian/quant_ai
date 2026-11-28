@@ -242,6 +242,24 @@ class PortfolioTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             pf.get_chart("NVDA", "10y", self.db)
 
+    def test_chart_daily_adds_no_bar_from_the_last_sessions_minutes(self):
+        # Before the open, on a weekend or a holiday the intraday bars are the last session's, which the
+        # daily bars already end with: no second bar under today's date.
+        from datetime import datetime, timedelta, timezone
+        last = datetime.now(pf.US_EAST).date() - timedelta(days=1)
+        base = int(datetime(last.year, last.month, last.day, tzinfo=timezone.utc).timestamp())
+        minutes = {"chart": [{"x": (base + 10 * 3600 + m * 60) * 1000, "y": 100.0 + m, "w": 100} for m in (0, 6)],
+                   "chartPrevClose": "98.50"}
+        hist = {"tradesTable": {"rows": [{"date": last.strftime("%m/%d/%Y"), "open": "$100", "high": "$106",
+                                          "low": "$99", "close": "$106", "volume": "1,000"}]}}
+
+        def fake_nasdaq(symbol, endpoint, cls):
+            return minutes if endpoint == "chart" else hist if endpoint == "historical" else None
+        with mock.patch.object(pf, "_nasdaq", side_effect=fake_nasdaq):
+            daily = pf.get_chart("NVDA", "1y", self.db)
+        self.assertEqual([c["time"] for c in daily["candles"]], [last.isoformat()])
+        self.assertFalse(daily["candles"][-1].get("partial"))
+
     def test_regular_session_uses_one_batch_request_and_falls_back_per_symbol(self):
         reply = {"status": {"rCode": 200}, "data": [
             {"symbol": "NVDA", "companyName": "NVIDIA", "lastSalePrice": "$213.50", "netChange": "-3.59",

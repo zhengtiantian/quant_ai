@@ -414,13 +414,24 @@ def get(path: Optional[Path] = None, force: bool = False) -> Dict[str, Any]:
 
 def _keep(out: Dict[str, Any], path: Optional[Path]) -> None:
     """The day's latest answer per symbol, for scoring against doing nothing later."""
-    conn = sqlite3.connect(str(path or DB_PATH), timeout=30)
+    from .config import connect_db
+    conn = connect_db(
+        path,
+        immediate=True,
+        schema_tag="daily_actions",
+        schema_fn=lambda c: c.execute(
+            "CREATE TABLE IF NOT EXISTS daily_actions (day TEXT, symbol TEXT, action TEXT, payload TEXT, "
+            "created_at TEXT, PRIMARY KEY (day, symbol))"
+        ),
+    )
     try:
-        conn.execute("CREATE TABLE IF NOT EXISTS daily_actions (day TEXT, symbol TEXT, action TEXT, payload TEXT, "
-                     "created_at TEXT, PRIMARY KEY (day, symbol))")
         day = datetime.now(NY).date().isoformat()
         conn.executemany("INSERT OR REPLACE INTO daily_actions VALUES (?, ?, ?, ?, ?)",
                          [(day, a["symbol"], a["action"], json.dumps(a, default=str), out["generated_at"]) for a in out["actions"]])
-        conn.commit()
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()

@@ -99,9 +99,11 @@ def split_sentences(answer: str) -> list[str]:
         if not block:
             continue
         # Mark the boundaries first, then split, so citations that follow the period
-        # ("...fell 7%. [2] Next") stay with the sentence they belong to.
-        block = re.sub(r"([.!?])\s*((?:\[\d+\])+)\s+(?=[A-Z\"'(0-9$])", "\\1\\2\x00", block)
-        block = re.sub(r"([.!?])\s+(?=[A-Z\"'(\[0-9$])", "\\1\x00", block)
+        # ("...fell 7%. [2] Next" or "...下跌 7%。[2] 下一句") stay with the sentence they belong to.
+        block = re.sub(r"([。！？][”’」』》）)]*)\s*((?:\[\d+\])+)\s*", "\\1\\2\x00", block)
+        block = re.sub(r"([。！？][”’」』》）)]*)(?!\s*\[\d+\])\s*", "\\1\x00", block)
+        block = re.sub(r"([.!?])\s*((?:\[\d+\])+)\s+(?=[A-Z\"'(0-9$\u4e00-\u9fff])", "\\1\\2\x00", block)
+        block = re.sub(r"([.!?])\s+(?=[A-Z\"'(\[0-9$\u4e00-\u9fff])", "\\1\x00", block)
         parts += [p.strip() for p in block.split("\x00") if p.strip()]
     # re-attach citations the split left at the start of the next part
     out: list[str] = []
@@ -166,7 +168,9 @@ REFUSAL_MARKERS = re.compile(
     r"(do(?:es)? not (?:contain|mention|include|say|state|specify|identify|provide|address|report)|no (?:information|mention|excerpt)|"
     r"there is no specific|"
     r"not (?:in|covered by|mentioned in) the (?:excerpts|articles)|could not find|cannot (?:answer|determine)|"
-    r"nothing to answer|unable to (?:answer|find|determine))", re.I)
+    r"nothing to answer|unable to (?:answer|find|determine)|"
+    r"未提及|未包含|未提供|未找到|未发现|(?:没有|并没有)(?:找到|提供|提到|提及|相关|具体|任何)|"
+    r"无法(?:回答|确定|判断)|不足以回答|(?:摘录|新闻摘录|新闻报道|报道|文章|excerpts?)中(?:没有|并没有|未))", re.I)
 
 
 def declines(answer: str, refused_flag: bool = False) -> bool:
@@ -858,6 +862,93 @@ def kappa(a: str, b: str) -> dict:
     return res
 
 
+def _percentile(values: list[float], pct: float) -> int | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(len(ordered) * pct)))
+    return round(ordered[idx])
+
+
+def sample_drift_keys(run: str, n: int = 20, seed: int = 7) -> list[str]:
+    """Stratified sample of up to `n` claim sentences across challenges for judge drift spot-checking."""
+    db = _db()
+    rows = list(db[SENT_COLL].find({"run": run}, {"_key": 1, "challenge": 1, "cites": 1}))
+    if not rows:
+        return []
+    rng = random.Random(seed)
+    groups: dict[tuple, list[dict]] = {}
+    for r in rows:
+        groups.setdefault((r.get("challenge") or "?", bool(r.get("cites"))), []).append(r)
+    for g in groups.values():
+        rng.shuffle(g)
+    picked: list[str] = []
+    while len(picked) < n and any(groups.values()):
+        for k in sorted(groups):
+            if groups[k] and len(picked) < n:
+                picked.append(groups[k].pop()["_key"])
+    return picked
+
+
+def drift_check(run: str, local_source: str = JUDGE_SOURCE, claude_source: str = "reference_claude",
+                sample_n: int = 20, seed: int = 7) -> dict:
+    """Run Claude reference labelling on up to `sample_n` stratified sentences of `run`,
+    then compute Cohen's kappa vs `local_source`."""
+    sys.path.insert(0, str(ROOT))
+    from markets.briefs import find_claude
+
+    keys = sample_drift_keys(run, n=sample_n, seed=seed)
+    if not keys:
+        raise SystemExit(f"no sentences found for run={run!r}")
+    db = _db()
+    runs = {(r["run"], r["question_id"]): r for r in db[RUNS_COLL].find({"run": run, "error": None})}
+    have = {d["key"] for d in db[LABEL_COLL].find(
+        {"source": claude_source, "level": "sentence", "error": None, "key": {"$in": keys}}, {"key": 1})}
+    todo = [s for s in db[SENT_COLL].find({"_key": {"$in": keys}}) if s["_key"] not in have and (s["run"], s["question_id"]) in runs]
+    if todo:
+        binary = find_claude()
+        if not binary:
+            raise SystemExit("claude CLI not found")
+        print(f"[drift_check] labelling {len(todo)} unlabelled sentences via {binary}")
+        for i in range(0, len(todo), 10):
+            batch = todo[i:i + 10]
+            items = []
+            for j, s in enumerate(batch):
+                r = runs[(s["run"], s["question_id"])]
+                items.append(f"### ITEM {j}\n{SENT_PROMPT.format(excerpts=_excerpt_block(r['excerpts']), question=r['question'], sentence=s['text'])}")
+            prompt = ("Label each ITEM below independently, exactly as its instructions say. Reply with one JSON object "
+                      "per line, in order, each with an extra field \"item\": <number>. No other text.\n\n" + "\n\n".join(items))
+            text = _claude(prompt, binary)
+            got = {}
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        obj = json.loads(line)
+                        got[int(obj.get("item"))] = line
+                    except (ValueError, TypeError):
+                        pass
+            for j, s in enumerate(batch):
+                _save_label(db, claude_source, "sentence", s["_key"], parse_sentence_label(got.get(j, "")), "claude")
+
+    la = {d["key"]: d for d in db[LABEL_COLL].find(
+        {"source": claude_source, "level": "sentence", "error": None, "key": {"$in": keys}})}
+    lb = {d["key"]: d for d in db[LABEL_COLL].find(
+        {"source": local_source, "level": "sentence", "error": None, "key": {"$in": keys}})}
+    overlap = sorted(set(la) & set(lb))
+    cls = lambda d: "meta" if d["kind"] == "meta" else d["verdict"]
+    four = [(cls(la[k]), cls(lb[k])) for k in overlap]
+    binary = [("ok" if x in ("supported", "meta") else "bad", "ok" if y in ("supported", "meta") else "bad") for x, y in four]
+    res = {
+        "run": run, "sampled": len(keys), "pairs": len(overlap),
+        "exact": round(sum(x == y for x, y in four) / len(overlap), 3) if overlap else None,
+        "kappa_4class": round(cohen_kappa(four), 3) if overlap else None,
+        "kappa_supported_vs_not": round(cohen_kappa(binary), 3) if overlap else None,
+    }
+    print(json.dumps(res, indent=1))
+    return res
+
+
 def score(source: str = JUDGE_SOURCE, compare: list[str] | None = None) -> dict:
     db = _db()
     labels = {d["key"]: d for d in db[LABEL_COLL].find({"source": source, "error": None})}
@@ -871,6 +962,7 @@ def score(source: str = JUDGE_SOURCE, compare: list[str] | None = None) -> dict:
         m["refused"] = is_refusal(r.get("answer") or "", r.get("refused", False))
         m["declined"] = declines(r.get("answer") or "", r.get("refused", False))
         m["answerable"] = r.get("answerable")
+        m["generation_ms"] = r.get("generation_ms")
         by_run.setdefault(r["run"], {})[r["question_id"]] = m
     report = {}
     for run, qs in sorted(by_run.items()):
@@ -885,6 +977,9 @@ def score(source: str = JUDGE_SOURCE, compare: list[str] | None = None) -> dict:
         row["numeric_grounding"] = f"{nok}/{nall}" + (f" = {nok / nall:.3f}" if nall else "")
         rels = [v["relevance"] for v in ans.values() if v.get("relevance") is not None]
         row["relevance_mean_0_2"] = round(sum(rels) / len(rels), 3) if rels else None
+        lats = [float(v["generation_ms"]) for v in qs.values() if v.get("generation_ms") is not None]
+        row["latency_ms_p50"] = _percentile(lats, 0.50)
+        row["latency_ms_p90"] = _percentile(lats, 0.90)
         row["refused_when_unanswerable"] = f"{sum(v['refused'] for v in una.values())}/{len(una)}"
         row["refused_when_answerable"] = f"{sum(v['refused'] for v in ans.values())}/{len(ans)}"
         row["declined_when_unanswerable"] = f"{sum(v['declined'] for v in una.values())}/{len(una)}"
@@ -919,6 +1014,8 @@ def main() -> None:
     ap.add_argument("--evidence-report", action="store_true")
     ap.add_argument("--sample", type=int, default=100)
     ap.add_argument("--kappa", nargs=2, metavar=("A", "B"))
+    ap.add_argument("--drift-check", action="store_true", help="spot-check judge drift with Claude on a 20-sentence sample of --run")
+    ap.add_argument("--drift-sample", type=int, default=20)
     ap.add_argument("--score", action="store_true")
     ap.add_argument("--compare", nargs=2, metavar=("RUN_A", "RUN_B"))
     ap.add_argument("--limit", type=int, default=None)
@@ -942,6 +1039,10 @@ def main() -> None:
         claude_judge(a.source if a.source != JUDGE_SOURCE else "judge_claude", a.run, a.parallel, a.limit)
     if a.kappa:
         kappa(*a.kappa)
+    if a.drift_check:
+        if not a.run:
+            ap.error("--drift-check needs --run")
+        drift_check(a.run, local_source=a.source, sample_n=a.drift_sample)
     if a.score:
         score(a.source, a.compare)
 
